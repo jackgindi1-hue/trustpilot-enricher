@@ -6,7 +6,7 @@ Sections J, K, L: Phone priority, Email priority, Overall confidence
 import json
 import re
 import phonenumbers
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Literal
 from .logging_utils import setup_logger
 
 logger = setup_logger(__name__)
