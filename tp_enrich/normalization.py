@@ -3,6 +3,7 @@ Business name normalization logic - Section B
 """
 
 import re
+import pandas as pd
 from typing import Tuple
 from .logging_utils import setup_logger
 
@@ -92,3 +93,43 @@ def normalize_business_name(display_name: str) -> Tuple[str, str]:
     normalized_key = create_company_normalized_key(search_name)
 
     return search_name, normalized_key
+
+
+def ensure_company_search_name(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure company_search_name is populated for business rows
+
+    If a row is classified as "business" but company_search_name is empty,
+    copy the value from raw_display_name.
+
+    This fixes the bug where business rows don't get enriched because
+    company_search_name is missing.
+
+    Args:
+        df: DataFrame with name_classification and raw_display_name columns
+
+    Returns:
+        DataFrame with company_search_name populated for business rows
+    """
+    if "company_search_name" not in df.columns:
+        df["company_search_name"] = pd.NA
+
+    if "raw_display_name" not in df.columns:
+        return df
+
+    name_class = df.get("name_classification")
+    if name_class is None:
+        return df
+
+    mask_business = name_class.eq("business")
+    company_col = df["company_search_name"].astype("string")
+    mask_empty = company_col.isna() | (company_col.str.strip() == "")
+
+    raw_col = df["raw_display_name"].astype("string")
+    mask_raw_ok = raw_col.notna() & (raw_col.str.strip() != "")
+
+    mask_update = mask_business & mask_empty & mask_raw_ok
+
+    df.loc[mask_update, "company_search_name"] = raw_col[mask_update].str.strip()
+
+    return df

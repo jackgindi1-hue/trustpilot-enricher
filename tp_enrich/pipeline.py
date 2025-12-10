@@ -10,7 +10,7 @@ from typing import Dict, Optional
 from .logging_utils import setup_logger
 from .io_utils import load_input_csv, write_output_csv, get_output_schema
 from .classification import classify_name
-from .normalization import normalize_business_name
+from .normalization import normalize_business_name, ensure_company_search_name
 from .dedupe import identify_unique_businesses, get_enrichment_context
 from .cache import EnrichmentCache
 from .domain_enrichment import discover_domain
@@ -140,6 +140,22 @@ def run_pipeline(
     business_mask = df['name_classification'] == 'business'
     df.loc[business_mask, ['company_search_name', 'company_normalized_key']] = df.loc[business_mask, 'raw_display_name'].apply(
         lambda x: pd.Series(normalize_business_name(x))
+    )
+
+    # Ensure company_search_name is populated for all business rows
+    df = ensure_company_search_name(df)
+
+    # Debug logging
+    logger.info(
+        "Post-normalization: business rows=%s, business with company_search_name=%s",
+        int((df["name_classification"] == "business").sum()),
+        int(
+            (
+                (df["name_classification"] == "business")
+                & df["company_search_name"].notna()
+                & (df["company_search_name"].astype("string").str.strip() != "")
+            ).sum()
+        ),
     )
 
     # Dedup by company_normalized_key
