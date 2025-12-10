@@ -187,6 +187,30 @@ def run_pipeline(
     # Save cache
     cache.save_cache()
 
+    # Calculate enrichment statistics
+    logger.info("="*60)
+    logger.info("ENRICHMENT SUMMARY")
+    logger.info("="*60)
+    logger.info(f"  Total unique businesses processed: {len(enrichment_results)}")
+
+    # Count results with domains, phones, emails
+    with_domain = sum(1 for r in enrichment_results.values() if r.get('company_domain'))
+    with_phone = sum(1 for r in enrichment_results.values() if r.get('primary_phone'))
+    with_email = sum(1 for r in enrichment_results.values() if r.get('primary_email'))
+
+    logger.info(f"  Businesses with domain: {with_domain}/{len(enrichment_results)}")
+    logger.info(f"  Businesses with phone: {with_phone}/{len(enrichment_results)}")
+    logger.info(f"  Businesses with email: {with_email}/{len(enrichment_results)}")
+
+    # Count by confidence
+    conf_counts = {}
+    for r in enrichment_results.values():
+        conf = r.get('overall_lead_confidence', 'unknown')
+        conf_counts[conf] = conf_counts.get(conf, 0) + 1
+
+    logger.info(f"  Confidence breakdown: {conf_counts}")
+    logger.info("="*60)
+
     # Merge back to rows
     logger.info("Step 6: Merging enrichment results back to rows...")
 

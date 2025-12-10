@@ -72,11 +72,14 @@ def enrich_from_hunter(domain: str, api_key: Optional[str]) -> List[Dict]:
     """
     emails = []
 
+    logger.info(f"  Calling Hunter.io for domain='{domain}' (key_present={api_key is not None})")
+
     if not api_key:
-        logger.debug("Hunter.io API key not provided, skipping")
+        logger.warning("  Hunter.io API key not provided, skipping")
         return emails
 
     if not domain:
+        logger.warning("  Hunter.io: Domain is empty, skipping")
         return emails
 
     try:
@@ -87,9 +90,9 @@ def enrich_from_hunter(domain: str, api_key: Optional[str]) -> List[Dict]:
             'api_key': api_key
         }
 
-        logger.debug(f"Querying Hunter.io for domain: {domain}")
-
         response = requests.get(url, params=params, timeout=10)
+
+        logger.info(f"  Hunter.io HTTP status: {response.status_code}")
 
         if response.status_code == 200:
             data = response.json()
@@ -111,15 +114,25 @@ def enrich_from_hunter(domain: str, api_key: Optional[str]) -> List[Dict]:
                             'confidence': confidence
                         })
 
-                logger.debug(f"Hunter.io found {len(emails)} emails for {domain}")
+                logger.info(f"  ✓ Hunter.io found {len(emails)} emails for '{domain}'")
+                # Log email types breakdown
+                types_count = {}
+                for e in emails:
+                    t = e['type']
+                    types_count[t] = types_count.get(t, 0) + 1
+                logger.info(f"    Email types: {types_count}")
+            else:
+                logger.warning(f"  ✗ Hunter.io: No data returned for '{domain}'")
 
         elif response.status_code == 401:
-            logger.warning("Hunter.io: Invalid API key")
+            logger.error("  ✗ Hunter.io: Invalid API key")
         elif response.status_code == 429:
-            logger.warning("Hunter.io: Rate limit exceeded")
+            logger.error("  ✗ Hunter.io: Rate limit exceeded")
+        else:
+            logger.warning(f"  ✗ Hunter.io: Non-200 status: {response.status_code}")
 
     except Exception as e:
-        logger.warning(f"Hunter.io API error: {e}")
+        logger.error(f"  ✗ Hunter.io API error: {e}", exc_info=True)
 
     return emails
 
@@ -137,11 +150,14 @@ def enrich_from_snov(domain: str, api_key: Optional[str]) -> List[Dict]:
     """
     emails = []
 
+    logger.info(f"  Calling Snov.io for domain='{domain}' (key_present={api_key is not None})")
+
     if not api_key:
-        logger.debug("Snov.io API key not provided, skipping")
+        logger.warning("  Snov.io API key not provided, skipping")
         return emails
 
     if not domain:
+        logger.warning("  Snov.io: Domain is empty, skipping")
         return emails
 
     try:
@@ -152,7 +168,7 @@ def enrich_from_snov(domain: str, api_key: Optional[str]) -> List[Dict]:
         if ':' in api_key:
             user_id, key = api_key.split(':', 1)
         else:
-            logger.warning("Snov.io API key format should be 'user_id:api_key'")
+            logger.error("  ✗ Snov.io API key format should be 'user_id:api_key'")
             return emails
 
         params = {
@@ -161,9 +177,9 @@ def enrich_from_snov(domain: str, api_key: Optional[str]) -> List[Dict]:
             'api_key': key
         }
 
-        logger.debug(f"Querying Snov.io for domain: {domain}")
-
         response = requests.post(url, json=params, timeout=10)
+
+        logger.info(f"  Snov.io HTTP status: {response.status_code}")
 
         if response.status_code == 200:
             data = response.json()
@@ -185,10 +201,20 @@ def enrich_from_snov(domain: str, api_key: Optional[str]) -> List[Dict]:
                             'confidence': 50
                         })
 
-                logger.debug(f"Snov.io found {len(emails)} emails for {domain}")
+                logger.info(f"  ✓ Snov.io found {len(emails)} emails for '{domain}'")
+                # Log email types breakdown
+                types_count = {}
+                for e in emails:
+                    t = e['type']
+                    types_count[t] = types_count.get(t, 0) + 1
+                logger.info(f"    Email types: {types_count}")
+            else:
+                logger.warning(f"  ✗ Snov.io: No success or no emails for '{domain}'")
+        else:
+            logger.warning(f"  ✗ Snov.io: Non-200 status: {response.status_code}")
 
     except Exception as e:
-        logger.warning(f"Snov.io API error: {e}")
+        logger.error(f"  ✗ Snov.io API error: {e}", exc_info=True)
 
     return emails
 
@@ -203,6 +229,8 @@ def enrich_emails(domain: Optional[str]) -> Dict:
     Returns:
         Dict with categorized emails and primary email selection
     """
+    logger.info(f"========== EMAIL ENRICHMENT START: domain='{domain}' ==========")
+
     result = {
         'generic_emails': [],
         'person_emails': [],
@@ -213,21 +241,25 @@ def enrich_emails(domain: Optional[str]) -> Dict:
         'primary_email_confidence': 'none'
     }
 
-    if not domain:
-        logger.debug("No domain provided for email enrichment")
+    if not domain or str(domain).strip() == '':
+        logger.warning("========== SKIPPING email enrichment: domain is missing or empty ==========")
         return result
 
     all_emails = []
 
     # Hunter.io
     hunter_key = os.getenv('HUNTER_API_KEY')
+    logger.info(f"  Hunter.io key present: {hunter_key is not None}")
     hunter_emails = enrich_from_hunter(domain, hunter_key)
     all_emails.extend(hunter_emails)
 
     # Snov.io
     snov_key = os.getenv('SNOV_API_KEY')
+    logger.info(f"  Snov.io key present: {snov_key is not None}")
     snov_emails = enrich_from_snov(domain, snov_key)
     all_emails.extend(snov_emails)
+
+    logger.info(f"  Total emails found: {len(all_emails)}")
 
     # Categorize emails
     for email_info in all_emails:

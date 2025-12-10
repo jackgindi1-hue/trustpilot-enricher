@@ -137,8 +137,10 @@ def enrich_from_fullenrich(company_name: str, region: Optional[str], api_key: Op
     Returns:
         Tuple of (domain, confidence)
     """
+    logger.info(f"Calling FullEnrich for '{company_name}' (key_present={api_key is not None})")
+
     if not api_key:
-        logger.debug("FullEnrich API key not provided, skipping")
+        logger.warning("FullEnrich API key not provided, skipping")
         return None, "none"
 
     try:
@@ -157,32 +159,48 @@ def enrich_from_fullenrich(company_name: str, region: Optional[str], api_key: Op
         if region:
             payload["location"] = region
 
-        logger.debug(f"Querying FullEnrich for company: {company_name}")
+        logger.info(f"  FullEnrich request payload: {payload}")
 
         response = requests.post(url, json=payload, headers=headers, timeout=10)
+
+        logger.info(f"  FullEnrich HTTP status: {response.status_code}")
 
         if response.status_code == 200:
             data = response.json()
 
             # Extract candidate company
+            companies_found = len(data.get('companies', []))
+            logger.info(f"  FullEnrich returned {companies_found} companies")
+
             if data.get('companies') and len(data['companies']) > 0:
                 candidate = data['companies'][0]
                 candidate_name = candidate.get('name', '')
                 candidate_website = candidate.get('website', '')
 
+                logger.info(f"  FullEnrich top candidate: '{candidate_name}', website='{candidate_website}'")
+
                 # Check token overlap
                 overlap = calculate_token_overlap(candidate_name, company_name)
+                logger.info(f"  FullEnrich name overlap: {overlap:.2f}")
 
                 if overlap >= 0.7 and candidate_website:
                     domain = extract_domain(candidate_website)
                     if domain:
-                        logger.debug(f"FullEnrich found domain: {domain} (overlap: {overlap:.2f})")
+                        logger.info(f"  ✓ FullEnrich found domain: '{domain}' (confidence: high)")
                         return domain, "high"
+                    else:
+                        logger.warning(f"  ✗ FullEnrich: Could not extract domain from '{candidate_website}'")
+                else:
+                    logger.warning(f"  ✗ FullEnrich: Overlap {overlap:.2f} < 0.7 or no website")
+            else:
+                logger.warning(f"  ✗ FullEnrich: No companies returned")
+        else:
+            logger.warning(f"  ✗ FullEnrich: Non-200 status: {response.status_code}")
 
-        logger.debug(f"FullEnrich: No matching company found for {company_name}")
+        logger.info(f"  FullEnrich: No matching company found for '{company_name}'")
 
     except Exception as e:
-        logger.warning(f"FullEnrich API error: {e}")
+        logger.error(f"  ✗ FullEnrich API error: {e}", exc_info=True)
 
     return None, "none"
 
@@ -199,8 +217,10 @@ def enrich_from_apollo(company_name: str, region: Optional[str], api_key: Option
     Returns:
         Tuple of (domain, confidence)
     """
+    logger.info(f"Calling Apollo for '{company_name}' (key_present={api_key is not None})")
+
     if not api_key:
-        logger.debug("Apollo API key not provided, skipping")
+        logger.warning("Apollo API key not provided, skipping")
         return None, "none"
 
     try:
@@ -218,35 +238,52 @@ def enrich_from_apollo(company_name: str, region: Optional[str], api_key: Option
             "per_page": 5
         }
 
-        logger.debug(f"Querying Apollo for company: {company_name}")
+        logger.info(f"  Apollo request payload: {payload}")
 
         response = requests.post(url, json=payload, headers=headers, timeout=10)
+
+        logger.info(f"  Apollo HTTP status: {response.status_code}")
 
         if response.status_code == 200:
             data = response.json()
 
             # Extract candidates
             organizations = data.get('organizations', [])
+            logger.info(f"  Apollo returned {len(organizations)} organizations")
 
-            for org in organizations:
+            for idx, org in enumerate(organizations):
                 org_name = org.get('name', '')
                 org_website = org.get('website_url', '') or org.get('primary_domain', '')
 
+                logger.info(f"  Apollo candidate {idx+1}: '{org_name}', website='{org_website}'")
+
                 # Check token overlap
                 overlap = calculate_token_overlap(org_name, company_name)
+                logger.info(f"  Apollo name overlap: {overlap:.2f}")
 
                 if overlap >= 0.7 and org_website:
                     domain = extract_domain(org_website)
 
                     if domain and not is_generic_domain(domain):
                         confidence = "high" if overlap >= 0.85 else "medium"
-                        logger.debug(f"Apollo found domain: {domain} (overlap: {overlap:.2f})")
+                        logger.info(f"  ✓ Apollo found domain: '{domain}' (confidence: {confidence})")
                         return domain, confidence
+                    else:
+                        if not domain:
+                            logger.warning(f"  ✗ Apollo: Could not extract domain from '{org_website}'")
+                        else:
+                            logger.warning(f"  ✗ Apollo: Domain '{domain}' is generic, skipping")
+                else:
+                    logger.warning(f"  ✗ Apollo: Overlap {overlap:.2f} < 0.7 or no website")
 
-        logger.debug(f"Apollo: No matching company found for {company_name}")
+            logger.warning(f"  ✗ Apollo: No acceptable match found among {len(organizations)} candidates")
+        else:
+            logger.warning(f"  ✗ Apollo: Non-200 status: {response.status_code}")
+
+        logger.info(f"  Apollo: No matching company found for '{company_name}'")
 
     except Exception as e:
-        logger.warning(f"Apollo API error: {e}")
+        logger.error(f"  ✗ Apollo API error: {e}", exc_info=True)
 
     return None, "none"
 
@@ -268,25 +305,31 @@ def discover_domain(company_name: str, context: Dict, input_website: Optional[st
     Returns:
         Tuple of (domain, confidence)
     """
+    logger.info(f"========== DOMAIN ENRICHMENT START: '{company_name}' ==========")
+    logger.info(f"  Context: region={context.get('state') or context.get('region')}, input_website={input_website}")
+
     region = context.get('state') or context.get('region')
 
     # Try input website first
     domain, confidence = enrich_from_input_website(input_website, company_name)
     if domain and confidence in ["high", "medium"]:
+        logger.info(f"========== DOMAIN FOUND from input website: '{domain}' (confidence: {confidence}) ==========")
         return domain, confidence
 
     # Try FullEnrich
     fullenrich_key = os.getenv('FULLENRICH_API_KEY')
     domain, confidence = enrich_from_fullenrich(company_name, region, fullenrich_key)
     if domain and confidence == "high":
+        logger.info(f"========== DOMAIN FOUND from FullEnrich: '{domain}' (confidence: {confidence}) ==========")
         return domain, confidence
 
     # Try Apollo
     apollo_key = os.getenv('APOLLO_API_KEY')
     domain, confidence = enrich_from_apollo(company_name, region, apollo_key)
     if domain and confidence in ["high", "medium"]:
+        logger.info(f"========== DOMAIN FOUND from Apollo: '{domain}' (confidence: {confidence}) ==========")
         return domain, confidence
 
     # No domain found
-    logger.debug(f"No domain found for company: {company_name}")
+    logger.warning(f"========== NO DOMAIN FOUND for '{company_name}' ==========")
     return None, "none"
