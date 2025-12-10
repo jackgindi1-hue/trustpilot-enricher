@@ -127,7 +127,17 @@ def enrich_from_input_website(website: Optional[str], company_name: str) -> Tupl
 
 def enrich_from_fullenrich(company_name: str, region: Optional[str], api_key: Optional[str]) -> Tuple[Optional[str], DomainConfidence]:
     """
-    Section C.2: FullEnrich company search
+    TEMPORARY STUB: FullEnrich API is asynchronous and not compatible with
+    our current synchronous "upload → get CSV" pipeline.
+
+    FullEnrich's actual API uses /api/v1/contact/enrich/bulk with webhooks/polling,
+    not a synchronous "company search" endpoint like we were trying to use.
+
+    For now, this function is intentionally DISABLED to avoid broken network calls
+    to api.fullenrich.com. It returns (None, "none") so the enrichment waterfall
+    continues to Apollo and other providers.
+
+    TODO: Implement proper async FullEnrich integration in the future.
 
     Args:
         company_name: Company search name
@@ -135,73 +145,16 @@ def enrich_from_fullenrich(company_name: str, region: Optional[str], api_key: Op
         api_key: FullEnrich API key
 
     Returns:
-        Tuple of (domain, confidence)
+        Tuple of (None, "none") - always returns no domain
     """
-    logger.info(f"Calling FullEnrich for '{company_name}' (key_present={api_key is not None})")
-
     if not api_key:
-        logger.warning("FullEnrich API key not provided, skipping")
+        logger.info("FullEnrich disabled: API key not provided.")
         return None, "none"
 
-    try:
-        # FullEnrich company search endpoint
-        url = "https://api.fullenrich.com/v1/company/search"
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "name": company_name,
-        }
-
-        if region:
-            payload["location"] = region
-
-        logger.info(f"  FullEnrich request payload: {payload}")
-
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-
-        logger.info(f"  FullEnrich HTTP status: {response.status_code}")
-
-        if response.status_code == 200:
-            data = response.json()
-
-            # Extract candidate company
-            companies_found = len(data.get('companies', []))
-            logger.info(f"  FullEnrich returned {companies_found} companies")
-
-            if data.get('companies') and len(data['companies']) > 0:
-                candidate = data['companies'][0]
-                candidate_name = candidate.get('name', '')
-                candidate_website = candidate.get('website', '')
-
-                logger.info(f"  FullEnrich top candidate: '{candidate_name}', website='{candidate_website}'")
-
-                # Check token overlap
-                overlap = calculate_token_overlap(candidate_name, company_name)
-                logger.info(f"  FullEnrich name overlap: {overlap:.2f}")
-
-                if overlap >= 0.7 and candidate_website:
-                    domain = extract_domain(candidate_website)
-                    if domain:
-                        logger.info(f"  ✓ FullEnrich found domain: '{domain}' (confidence: high)")
-                        return domain, "high"
-                    else:
-                        logger.warning(f"  ✗ FullEnrich: Could not extract domain from '{candidate_website}'")
-                else:
-                    logger.warning(f"  ✗ FullEnrich: Overlap {overlap:.2f} < 0.7 or no website")
-            else:
-                logger.warning(f"  ✗ FullEnrich: No companies returned")
-        else:
-            logger.warning(f"  ✗ FullEnrich: Non-200 status: {response.status_code}")
-
-        logger.info(f"  FullEnrich: No matching company found for '{company_name}'")
-
-    except Exception as e:
-        logger.error(f"  ✗ FullEnrich API error: {e}", exc_info=True)
-
+    logger.info(
+        "FullEnrich disabled in synchronous pipeline. Skipping FullEnrich call for '%s'.",
+        company_name
+    )
     return None, "none"
 
 

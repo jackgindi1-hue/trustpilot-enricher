@@ -6,7 +6,7 @@ Sections J, K, L: Phone priority, Email priority, Overall confidence
 import json
 import re
 import phonenumbers
-from typing import Dict, List, Tuple, Optional, Literal
+from typing import Dict, List, Optional, Literal
 from .logging_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -86,7 +86,7 @@ def aggregate_phones(enrichment_data: Dict) -> List[Dict]:
     """
     all_phones = []
 
-    # Google Maps phones (Priority #1)
+    # Google Places phones (Priority #1 for SMB phone numbers)
     maps_phone_main = enrichment_data.get('maps_phone_main')
     maps_confidence = enrichment_data.get('maps_match_confidence', 'none')
 
@@ -96,7 +96,7 @@ def aggregate_phones(enrichment_data: Dict) -> List[Dict]:
             all_phones.append({
                 'number_normalized': normalized,
                 'display': format_phone_display(maps_phone_main),
-                'source': 'google_maps',
+                'source': 'google_places',
                 'confidence': maps_confidence,
                 'type': 'main'
             })
@@ -195,9 +195,9 @@ def select_primary_phone(all_phones: List[Dict]) -> Dict:
     Section J: Choose primary phone by exact priority
 
     Priority:
-    1) maps_phone_main (if maps_match_confidence = high)
-    2) yelp_phone with high confidence
-    3) yellowpages/BBB phone
+    1) Google Places (TOP PRIORITY - best for SMB phone numbers)
+    2) Yelp (with high confidence)
+    3) YellowPages/BBB
     4) Apollo/FullEnrich company phone
     5) Website/social phones
 
@@ -218,8 +218,9 @@ def select_primary_phone(all_phones: List[Dict]) -> Dict:
         return result
 
     # Define source priority order
+    # Google Places is #1 priority for phone numbers
     source_priority = {
-        'google_maps': 1,
+        'google_places': 1,
         'yelp': 2,
         'yellowpages': 3,
         'bbb': 3,
