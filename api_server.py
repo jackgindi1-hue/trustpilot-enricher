@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -117,11 +117,17 @@ async def enrich_csv(
             if not output_path.exists():
                 raise HTTPException(status_code=500, detail="Enrichment failed to produce output file")
 
-            # Return enriched CSV as download
-            return FileResponse(
-                path=str(output_path),
+            # Read enriched CSV into memory BEFORE temp directory cleanup
+            logger.info(f"Reading enriched CSV from: {output_path}")
+            with open(output_path, 'rb') as f:
+                csv_bytes = f.read()
+
+            logger.info(f"Returning enriched CSV ({len(csv_bytes)} bytes)")
+
+            # Return enriched CSV as streaming response from memory
+            return StreamingResponse(
+                iter([csv_bytes]),
                 media_type='text/csv',
-                filename='enriched.csv',
                 headers={
                     'Content-Disposition': 'attachment; filename="enriched.csv"'
                 }
