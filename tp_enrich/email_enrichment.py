@@ -6,7 +6,7 @@ Hunter.io and Snov.io for domain-based email discovery
 import os
 import re
 import requests
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 from .logging_utils import setup_logger
 
 logger = setup_logger(__name__)
