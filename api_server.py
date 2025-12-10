@@ -29,18 +29,23 @@ app = FastAPI(
 )
 
 # Configure CORS
-# Allow all origins for simplicity - can be restricted via FRONTEND_ORIGIN env var
-allowed_origins = os.getenv('FRONTEND_ORIGIN', '*')
+# Allow frontend origin from env var, plus localhost for dev
+allowed_origins = os.getenv('FRONTEND_ORIGIN', 'https://same-ds94u6p1ays-latest.netlify.app')
 if allowed_origins == '*':
+    # Wildcard mode - no credentials
     origins = ["*"]
+    allow_credentials = False
 else:
+    # Specific origins - split by comma and add localhost for dev
     origins = [origin.strip() for origin in allowed_origins.split(',')]
+    origins.extend(['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:3000'])
+    allow_credentials = False  # Don't need credentials for this API
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=allow_credentials,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
