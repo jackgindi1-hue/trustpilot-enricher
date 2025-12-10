@@ -129,7 +129,7 @@ def run_pipeline(
 
     # Classify each row
     logger.info("Step 2: Classifying display names...")
-    df['raw_display_name'] = df.get('displayname', df.get('display_name', ''))
+    # Note: raw_display_name is already mapped in load_input_csv()
     df['name_classification'] = df['raw_display_name'].apply(classify_name)
 
     classification_counts = df['name_classification'].value_counts()
