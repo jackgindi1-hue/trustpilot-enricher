@@ -1,4 +1,4 @@
-"""
+"""" 
 Local business enrichment logic - Sections D, E, F
 Google Maps, Yelp Fusion, YellowPages/BBB
 """
@@ -14,6 +14,10 @@ from .domain_enrichment import extract_domain
 logger = setup_logger(__name__)
 
 MatchConfidence = Literal["none", "low", "medium", "high"]
+
+# Read environment variables for local enrichment
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+YELP_API_KEY = os.getenv("YELP_API_KEY")
 
 
 def calculate_name_similarity(name1: str, name2: str) -> float:
@@ -297,4 +301,224 @@ def enrich_local_sources(company_name: str, context: Dict) -> Dict:
     yp_bbb_data = enrich_from_yellowpages_bbb(company_name, context)
     result.update(yp_bbb_data)
 
+    return result
+
+
+def enrich_local_business(name: str, region: Optional[str] = None) -> Dict:
+    """
+    Perform unified local enrichment (Google Places + Yelp).
+
+    Priority:
+    1. Try Google Places first
+    2. Fall back to Yelp if Google Places fails or returns nothing
+
+    Returns a unified dict with phone/address/website information.
+
+    Args:
+        name: Company name to search
+        region: Optional region/location info
+
+    Returns:
+        Dict with unified local enrichment data
+    """
+    result = {
+        "phone": None,
+        "phone_source": None,
+        "address": None,
+        "city": None,
+        "state_region": None,
+        "postal_code": None,
+        "country": None,
+        "website": None,
+    }
+
+    if not name:
+        return result
+
+    # Build context for search
+    context = {}
+    if region:
+        # Try to parse region as "City, State" or just "State"
+        parts = region.split(',')
+        if len(parts) >= 2:
+            context['city'] = parts[0].strip()
+            context['state'] = parts[1].strip()
+        elif len(parts) == 1:
+            context['state'] = parts[0].strip()
+
+    # 1) Try Google Places first
+    gp_data = None
+    if GOOGLE_PLACES_API_KEY and name:
+        logger.info(f"Trying Google Places for local enrichment: '{name}'")
+        try:
+            gmaps = googlemaps.Client(key=GOOGLE_PLACES_API_KEY)
+
+            # Build query
+            city = context.get('city', '')
+            state = context.get('state', '')
+
+            if city or state:
+                query = f"{name} {city} {state}".strip()
+            else:
+                query = name
+
+            logger.debug(f"Google Places query: {query}")
+
+            # Text search
+            places_result = gmaps.places(query=query)
+
+            if places_result.get('results'):
+                candidates = places_result['results']
+
+                # Choose best candidate by name similarity
+                best_candidate = None
+                best_similarity = 0.0
+
+                for candidate in candidates[:5]:  # Check top 5
+                    candidate_name = candidate.get('name', '')
+                    similarity = calculate_name_similarity(candidate_name, name)
+
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_candidate = candidate
+
+                if best_candidate and best_similarity >= 0.6:
+                    place_id = best_candidate.get('place_id')
+
+                    # Get place details
+                    details = gmaps.place(place_id=place_id, fields=[
+                        'formatted_phone_number',
+                        'formatted_address',
+                        'address_components',
+                        'website'
+                    ])
+
+                    if details.get('result'):
+                        place = details['result']
+
+                        # Extract structured address components
+                        address_components = place.get('address_components', [])
+                        city_val = None
+                        state_val = None
+                        postal_val = None
+                        country_val = None
+
+                        for component in address_components:
+                            types = component.get('types', [])
+                            if 'locality' in types:
+                                city_val = component.get('long_name')
+                            elif 'administrative_area_level_1' in types:
+                                state_val = component.get('short_name')
+                            elif 'postal_code' in types:
+                                postal_val = component.get('long_name')
+                            elif 'country' in types:
+                                country_val = component.get('long_name')
+
+                        gp_data = {
+                            "phone": place.get('formatted_phone_number'),
+                            "address": place.get('formatted_address'),
+                            "city": city_val,
+                            "state_region": state_val,
+                            "postal_code": postal_val,
+                            "country": country_val,
+                            "website": place.get('website'),
+                        }
+
+                        logger.info(f"✓ Google Places found data for '{name}' (similarity: {best_similarity:.2f})")
+        except Exception as e:
+            logger.warning(f"Google Places API error: {e}")
+            gp_data = None
+
+    if gp_data and gp_data.get("phone"):
+        # Success with Google Places
+        result.update({
+            "phone": gp_data.get("phone"),
+            "phone_source": "google_places",
+            "address": gp_data.get("address"),
+            "city": gp_data.get("city"),
+            "state_region": gp_data.get("state_region"),
+            "postal_code": gp_data.get("postal_code"),
+            "country": gp_data.get("country"),
+            "website": gp_data.get("website"),
+        })
+        return result
+
+    # 2) Fallback to Yelp if Places failed or returned nothing
+    yelp_data = None
+    if YELP_API_KEY and name:
+        logger.info(f"Falling back to Yelp for local enrichment: '{name}'")
+        try:
+            url = "https://api.yelp.com/v3/businesses/search"
+
+            headers = {
+                "Authorization": f"Bearer {YELP_API_KEY}"
+            }
+
+            params = {
+                "term": name,
+                "limit": 5
+            }
+
+            # Add location if available
+            city = context.get('city', '')
+            state = context.get('state', '')
+
+            if city or state:
+                params["location"] = f"{city}, {state}".strip(', ')
+
+            logger.debug(f"Yelp query: {params}")
+
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                businesses = data.get('businesses', [])
+
+                if businesses:
+                    # Choose best candidate by name similarity
+                    best_business = None
+                    best_similarity = 0.0
+
+                    for business in businesses:
+                        business_name = business.get('name', '')
+                        similarity = calculate_name_similarity(business_name, name)
+
+                        if similarity > best_similarity:
+                            best_similarity = similarity
+                            best_business = business
+
+                    if best_business and best_similarity >= 0.6:
+                        # Extract data
+                        location = best_business.get('location', {})
+
+                        yelp_data = {
+                            "phone": best_business.get('display_phone'),
+                            "address": ', '.join(location.get('display_address', [])) if location.get('display_address') else None,
+                            "city": location.get('city'),
+                            "state_region": location.get('state'),
+                            "postal_code": location.get('zip_code'),
+                            "country": location.get('country'),
+                            "website": None,  # Yelp doesn't provide business website in search results
+                        }
+
+                        logger.info(f"✓ Yelp found data for '{name}' (similarity: {best_similarity:.2f})")
+        except Exception as e:
+            logger.warning(f"Yelp API error: {e}")
+            yelp_data = None
+
+    if yelp_data and yelp_data.get("phone"):
+        result.update({
+            "phone": yelp_data.get("phone"),
+            "phone_source": "yelp",
+            "address": yelp_data.get("address"),
+            "city": yelp_data.get("city"),
+            "state_region": yelp_data.get("state_region"),
+            "postal_code": yelp_data.get("postal_code"),
+            "country": yelp_data.get("country"),
+            "website": yelp_data.get("website"),
+        })
+        return result
+
+    # No data from either source
+    logger.warning(f"No local enrichment data found for '{name}'")
     return result
