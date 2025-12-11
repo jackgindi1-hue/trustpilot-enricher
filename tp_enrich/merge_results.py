@@ -6,7 +6,7 @@ Sections J, K, L: Phone priority, Email priority, Overall confidence
 import json
 import re
 import phonenumbers
-from typing import Dict, List, Optional, Literal
+from typing import Dict, List, Optional, Literal, Tuple
 from .logging_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -444,6 +444,3 @@ def merge_enrichment_results(enrichment_data: Dict) -> Dict:
     result['enrichment_notes'] = status
 
     return result
-
-
-from typing import Tuple
