@@ -11,11 +11,9 @@ from .classification import classify_name
 from .normalization import normalize_business_name, ensure_company_search_name
 from .dedupe import identify_unique_businesses, get_enrichment_context
 from .cache import EnrichmentCache
-from .domain_enrichment import discover_domain
+from .domain_enrichment import extract_domain_from_website
 from .local_enrichment import enrich_local_business
-from .legal_enrichment import enrich_from_opencorporates
-from .email_enrichment import enrich_emails
-from .social_enrichment import enrich_from_social
+from .email_enrichment import enrich_emails_with_waterfall
 from .merge_results import merge_enrichment_results
 logger = setup_logger(__name__)
 def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
@@ -36,40 +34,46 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
         return cache.get(normalized_key)
     # Get enrichment context
     context = get_enrichment_context(business_info)
-    enrichment_data = {
-        'company_search_name': company_name,
-        'company_normalized_key': normalized_key
-    }
-    # LOCAL ENRICHMENT FIRST (Google Places -> Yelp waterfall)
+
+    # 1) LOCAL ENRICHMENT FIRST (Google Places -> Yelp waterfall)
     # This is our primary source for phone/address/website
-    logger.debug(f"  -> Local enrichment for {company_name}")
+    logger.info(f"  -> Local enrichment for {company_name}")
     region_str = context.get('state') or context.get('region')
     local_business_data = enrich_local_business(company_name, region=region_str)
-    enrichment_data['local_enrichment'] = local_business_data
 
-    # Domain enrichment (use website from local enrichment if available)
-    logger.debug(f"  -> Domain enrichment for {company_name}")
-    input_website = local_business_data.get('website')
-    domain, domain_confidence = discover_domain(company_name, context, input_website=input_website)
-    enrichment_data['company_domain'] = domain
-    enrichment_data['domain_confidence'] = domain_confidence
-    # Legal enrichment (OpenCorporates)
-    logger.debug(f"  -> Legal enrichment for {company_name}")
-    legal_data = enrich_from_opencorporates(company_name, context)
-    enrichment_data.update(legal_data)
-    # Email enrichment
-    logger.debug(f"  -> Email enrichment for {company_name}")
-    email_data = enrich_emails(domain)
-    enrichment_data.update(email_data)
-    # Social enrichment
-    logger.debug(f"  -> Social enrichment for {company_name}")
-    website_urls = [
-        local_business_data.get('website'),
-        
-        enrichment_data.get('company_domain')
-    ]
-    social_data = enrich_from_social(website_urls)
-    enrichment_data.update(social_data)
+    # 2) Extract domain from website (if present)
+    logger.info(f"  -> Extracting domain from website")
+    domain = extract_domain_from_website(local_business_data.get('website'))
+    logger.info(f"  -> Domain extracted: {domain}")
+
+    # 3) Email enrichment waterfall: Hunter → Snov → Apollo (ALL domain-based)
+    logger.info(f"  -> Email waterfall for {company_name}")
+    hunter_api_key = os.getenv('HUNTER_API_KEY')
+    snov_api_key = os.getenv('SNOV_API_KEY')
+    apollo_api_key = os.getenv('APOLLO_API_KEY')
+
+    email_data = enrich_emails_with_waterfall(
+        domain=domain,
+        hunter_api_key=hunter_api_key,
+        snov_api_key=snov_api_key,
+        apollo_api_key=apollo_api_key,
+    )
+
+    # Build enrichment data for merge_results
+    enrichment_data = {
+        'company_search_name': company_name,
+        'company_normalized_key': normalized_key,
+        'local_enrichment': local_business_data,
+        'company_domain': domain,
+        'domain_confidence': 'high' if domain else 'none',
+        'generic_emails': email_data.get('generic_emails', []),
+        'person_emails': email_data.get('person_emails', []),
+        'catchall_emails': email_data.get('catchall_emails', []),
+        'primary_email': email_data.get('primary_email'),
+        'primary_email_type': email_data.get('primary_email_type'),
+        'primary_email_source': email_data.get('primary_email_source'),
+        'primary_email_confidence': email_data.get('primary_email_confidence', 'none'),
+    }
     # Merge results and apply priority rules
     logger.debug(f"  -> Merging results for {company_name}")
     final_result = merge_enrichment_results(enrichment_data)

@@ -8,12 +8,55 @@ import re
 import requests
 import tldextract
 from typing import Dict, Optional, Tuple, Literal
+from urllib.parse import urlparse
 from Levenshtein import ratio
 from .logging_utils import setup_logger
 
 logger = setup_logger(__name__)
 
 DomainConfidence = Literal["none", "low", "medium", "high"]
+
+
+def extract_domain_from_website(website: Optional[str]) -> Optional[str]:
+    """
+    Extract clean domain from website URL.
+
+    Args:
+        website: Website URL (can be with or without scheme)
+
+    Returns:
+        Clean domain (e.g., "example.com") or None
+    """
+    if not website:
+        return None
+
+    website = website.strip()
+    if not website:
+        return None
+
+    # Ensure scheme for parsing
+    if not website.startswith("http://") and not website.startswith("https://"):
+        website = "https://" + website
+
+    parsed = urlparse(website)
+
+    host = parsed.netloc or parsed.path
+    host = host.lower().strip()
+
+    # strip credentials or port if any (just in case)
+    if "@" in host:
+        host = host.split("@", 1)[-1]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+
+    # strip leading www.
+    if host.startswith("www."):
+        host = host[4:]
+
+    # strip any leftover slashes
+    host = host.split("/")[0]
+
+    return host or None
 
 
 def extract_domain(url: str) -> Optional[str]:
