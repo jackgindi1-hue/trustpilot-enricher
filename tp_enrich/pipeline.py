@@ -13,7 +13,7 @@ from .dedupe import identify_unique_businesses, get_enrichment_context
 from .cache import EnrichmentCache
 from .domain_enrichment import extract_domain_from_website
 from .local_enrichment import enrich_local_business
-from .email_enrichment import enrich_emails_with_waterfall
+from .email_enrichment import enrich_emails_minimal
 from .merge_results import merge_enrichment_results
 logger = setup_logger(__name__)
 def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
@@ -35,35 +35,26 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
     # Get enrichment context
     context = get_enrichment_context(business_info)
 
-    # 1) LOCAL ENRICHMENT FIRST (Google Places -> Yelp waterfall)
-    # This is our primary source for phone/address/website
-    logger.info(f"  -> Local enrichment for {company_name}")
-    region_str = context.get('state') or context.get('region')
-    local_business_data = enrich_local_business(company_name, region=region_str)
+    # MINIMAL MVP PATH:
+    # 1) Google Places ONLY for local enrichment
+    logger.info(f"  -> Local enrichment (Google Places only) for {company_name}")
+    local_data = enrich_local_business(company_name, region=None)
 
-    # 2) Extract domain from website (if present)
+    # 2) Extract domain from website
     logger.info(f"  -> Extracting domain from website")
-    domain = extract_domain_from_website(local_business_data.get('website'))
+    domain = extract_domain_from_website(local_data.get('website'))
     logger.info(f"  -> Domain extracted: {domain}")
 
-    # 3) Email enrichment waterfall: Hunter → Snov → Apollo (ALL domain-based)
-    logger.info(f"  -> Email waterfall for {company_name}")
+    # 3) Hunter ONLY for email enrichment (domain required)
+    logger.info(f"  -> Email enrichment (Hunter only) for {company_name}")
     hunter_api_key = os.getenv('HUNTER_API_KEY')
-    snov_api_key = os.getenv('SNOV_API_KEY')
-    apollo_api_key = os.getenv('APOLLO_API_KEY')
-
-    email_data = enrich_emails_with_waterfall(
-        domain=domain,
-        hunter_api_key=hunter_api_key,
-        snov_api_key=snov_api_key,
-        apollo_api_key=apollo_api_key,
-    )
+    email_data = enrich_emails_minimal(domain, hunter_api_key)
 
     # Build enrichment data for merge_results
     enrichment_data = {
         'company_search_name': company_name,
         'company_normalized_key': normalized_key,
-        'local_enrichment': local_business_data,
+        'local_enrichment': local_data,
         'company_domain': domain,
         'domain_confidence': 'high' if domain else 'none',
         'generic_emails': email_data.get('generic_emails', []),
