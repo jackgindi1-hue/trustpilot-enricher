@@ -12,7 +12,7 @@ from .normalization import normalize_business_name, ensure_company_search_name
 from .dedupe import identify_unique_businesses, get_enrichment_context
 from .cache import EnrichmentCache
 from .domain_enrichment import discover_domain
-from .local_enrichment import enrich_local_sources, enrich_local_business
+from .local_enrichment import enrich_local_business
 from .legal_enrichment import enrich_from_opencorporates
 from .email_enrichment import enrich_emails
 from .social_enrichment import enrich_from_social
@@ -40,19 +40,19 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
         'company_search_name': company_name,
         'company_normalized_key': normalized_key
     }
-    # Domain enrichment
-    logger.debug(f"  -> Domain enrichment for {company_name}")
-    domain, domain_confidence = discover_domain(company_name, context)
-    enrichment_data['company_domain'] = domain
-    enrichment_data['domain_confidence'] = domain_confidence
-    # Local enrichment (Google Maps, Yelp, YP/BBB)
+    # LOCAL ENRICHMENT FIRST (Google Places -> Yelp waterfall)
+    # This is our primary source for phone/address/website
     logger.debug(f"  -> Local enrichment for {company_name}")
-    local_data = enrich_local_sources(company_name, context)
-    enrichment_data.update(local_data)
-    # Unified local business enrichment (Google Places -> Yelp waterfall)
     region_str = context.get('state') or context.get('region')
     local_business_data = enrich_local_business(company_name, region=region_str)
     enrichment_data['local_enrichment'] = local_business_data
+
+    # Domain enrichment (use website from local enrichment if available)
+    logger.debug(f"  -> Domain enrichment for {company_name}")
+    input_website = local_business_data.get('website')
+    domain, domain_confidence = discover_domain(company_name, context, input_website=input_website)
+    enrichment_data['company_domain'] = domain
+    enrichment_data['domain_confidence'] = domain_confidence
     # Legal enrichment (OpenCorporates)
     logger.debug(f"  -> Legal enrichment for {company_name}")
     legal_data = enrich_from_opencorporates(company_name, context)
@@ -64,8 +64,8 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
     # Social enrichment
     logger.debug(f"  -> Social enrichment for {company_name}")
     website_urls = [
-        enrichment_data.get('maps_website'),
-        enrichment_data.get('yelp_website'),
+        local_business_data.get('website'),
+        
         enrichment_data.get('company_domain')
     ]
     social_data = enrich_from_social(website_urls)
