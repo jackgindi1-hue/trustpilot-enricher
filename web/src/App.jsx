@@ -5,9 +5,10 @@ import './App.css'
 function App() {
   const [file, setFile] = useState(null)
   const [lenderNameOverride, setLenderNameOverride] = useState('')
-  const [status, setStatus] = useState('Ready')
+  const [status, setStatus] = useState('idle')
   const [isProcessing, setIsProcessing] = useState(false)
   const [error, setError] = useState(null)
+  const [rowCount, setRowCount] = useState(null)
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0]
@@ -15,12 +16,26 @@ function App() {
     if (selectedFile && !selectedFile.name.endsWith('.csv')) {
       setError('Please select a CSV file')
       setFile(null)
+      setRowCount(null)
       return
     }
 
     setFile(selectedFile)
     setError(null)
-    setStatus('Ready')
+    setStatus('idle')
+
+    // Count rows in the CSV
+    if (selectedFile) {
+      const reader = new FileReader()
+      reader.onload = (event) => {
+        const text = event.target.result
+        const lines = text.split('\n').filter(line => line.trim().length > 0)
+        // Subtract 1 for header row
+        const dataRows = Math.max(0, lines.length - 1)
+        setRowCount(dataRows)
+      }
+      reader.readAsText(selectedFile)
+    }
   }
 
   const handleSubmit = async (e) => {
@@ -34,7 +49,7 @@ function App() {
 
     setIsProcessing(true)
     setError(null)
-    setStatus('Uploading...')
+    setStatus('uploading')
 
     try {
       // Prepare form data
@@ -45,13 +60,15 @@ function App() {
         formData.append('lender_name_override', lenderNameOverride.trim())
       }
 
-      setStatus('Enrichment in progress...')
-
-      // Send request to API
-      const response = await fetch(`${config.API_BASE_URL}/enrich`, {
+      // Start the fetch, then immediately set status to processing
+      const responsePromise = fetch(`${config.API_BASE_URL}/enrich`, {
         method: 'POST',
         body: formData
       })
+
+      setStatus('processing')
+
+      const response = await responsePromise
 
       if (!response.ok) {
         const errorText = await response.text()
@@ -73,14 +90,15 @@ function App() {
       window.URL.revokeObjectURL(url)
       document.body.removeChild(a)
 
-      setStatus('Done! Enriched CSV downloaded.')
+      setStatus('done')
       setIsProcessing(false)
 
       // Reset form after success
       setTimeout(() => {
         setFile(null)
         setLenderNameOverride('')
-        setStatus('Ready')
+        setRowCount(null)
+        setStatus('idle')
         // Reset file input
         const fileInput = document.getElementById('csvFile')
         if (fileInput) fileInput.value = ''
@@ -88,8 +106,8 @@ function App() {
 
     } catch (err) {
       console.error('Enrichment error:', err)
-      setError(err.message || 'Enrichment failed')
-      setStatus('Error')
+      setError(err.message || 'Enrichment failed. Please try again.')
+      setStatus('error')
       setIsProcessing(false)
     }
   }
@@ -117,7 +135,10 @@ function App() {
                 className="file-input"
               />
               {file && (
-                <p className="file-name">Selected: {file.name}</p>
+                <p className="file-name">
+                  Selected: {file.name}
+                  {rowCount !== null && ` (${rowCount} rows estimated)`}
+                </p>
               )}
             </div>
 
@@ -149,23 +170,38 @@ function App() {
           </form>
 
           <div className="status-area">
-            <div className={`status ${error ? 'error' : isProcessing ? 'processing' : 'ready'}`}>
-              {error ? (
+            <div className={`status ${status === 'error' ? 'error' : isProcessing ? 'processing' : 'ready'}`}>
+              {status === 'error' ? (
                 <>
                   <span className="status-icon">⚠️</span>
-                  <span>Error: {error}</span>
+                  <span>{error}</span>
                 </>
-              ) : isProcessing ? (
+              ) : status === 'idle' ? (
+                <>
+                  <span className="status-icon">📋</span>
+                  <span>Ready. Select a CSV to start.</span>
+                </>
+              ) : status === 'uploading' ? (
                 <>
                   <span className="status-icon spinner">⟳</span>
-                  <span>{status}</span>
+                  <span>Uploading CSV...</span>
+                </>
+              ) : status === 'processing' ? (
+                <>
+                  <span className="status-icon spinner">⟳</span>
+                  <span>
+                    Processing... {rowCount !== null && `(${rowCount} rows)`}. This may take a while.
+                  </span>
+                </>
+              ) : status === 'done' ? (
+                <>
+                  <span className="status-icon">✓</span>
+                  <span>Done. Processed {rowCount !== null ? `${rowCount} rows.` : 'successfully.'}</span>
                 </>
               ) : (
                 <>
-                  <span className="status-icon">
-                    {status === 'Ready' ? '📋' : '✓'}
-                  </span>
-                  <span>{status}</span>
+                  <span className="status-icon">📋</span>
+                  <span>Ready</span>
                 </>
               )}
             </div>
