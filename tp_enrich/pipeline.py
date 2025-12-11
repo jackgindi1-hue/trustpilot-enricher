@@ -13,7 +13,7 @@ from .dedupe import identify_unique_businesses, get_enrichment_context
 from .cache import EnrichmentCache
 from .domain_enrichment import extract_domain_from_website
 from .local_enrichment import enrich_local_business
-from .email_enrichment import enrich_emails_minimal
+from .email_enrichment import enrich_email_for_domain
 from .merge_results import merge_enrichment_results
 logger = setup_logger(__name__)
 def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
@@ -45,10 +45,9 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
     domain = extract_domain_from_website(local_data.get('website'))
     logger.info(f"  -> Domain extracted: {domain}")
 
-    # 3) Hunter ONLY for email enrichment (domain required)
-    logger.info(f"  -> Email enrichment (Hunter only) for {company_name}")
-    hunter_api_key = os.getenv('HUNTER_API_KEY')
-    email_data = enrich_emails_minimal(domain, hunter_api_key)
+    # 3) Email enrichment (Hunter → Snov fallback)
+    logger.info(f"  -> Email enrichment (Hunter → Snov) for {company_name}")
+    email_info = enrich_email_for_domain(domain, business_name=company_name)
 
     # Build enrichment data for merge_results
     enrichment_data = {
@@ -57,13 +56,10 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
         'local_enrichment': local_data,
         'company_domain': domain,
         'domain_confidence': 'high' if domain else 'none',
-        'generic_emails': email_data.get('generic_emails', []),
-        'person_emails': email_data.get('person_emails', []),
-        'catchall_emails': email_data.get('catchall_emails', []),
-        'primary_email': email_data.get('primary_email'),
-        'primary_email_type': email_data.get('primary_email_type'),
-        'primary_email_source': email_data.get('primary_email_source'),
-        'primary_email_confidence': email_data.get('primary_email_confidence', 'none'),
+        'primary_email': email_info.get('primary_email'),
+        'email_source': email_info.get('email_source'),
+        'email_confidence': email_info.get('email_confidence'),
+        'emails_raw': email_info.get('emails_raw'),
     }
     # Merge results and apply priority rules
     logger.debug(f"  -> Merging results for {company_name}")
