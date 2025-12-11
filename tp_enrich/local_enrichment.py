@@ -1,11 +1,10 @@
-"""" 
+"""
 Local business enrichment logic - Sections D, E, F
 Google Maps, Yelp Fusion, YellowPages/BBB
 """
 
 import os
 import requests
-import googlemaps
 from typing import Dict, Optional, Literal
 from Levenshtein import ratio
 from .logging_utils import setup_logger
@@ -39,7 +38,7 @@ def calculate_name_similarity(name1: str, name2: str) -> float:
 
 def enrich_from_google_maps(company_name: str, context: Dict) -> Dict:
     """
-    Section D: Google Maps / Places enrichment
+    Section D: Google Maps / Places enrichment (REST API)
 
     TOP PRIORITY SMB PHONE SOURCE
 
@@ -66,8 +65,6 @@ def enrich_from_google_maps(company_name: str, context: Dict) -> Dict:
         return result
 
     try:
-        gmaps = googlemaps.Client(key=api_key)
-
         # Build query
         city = context.get('city', '')
         state = context.get('state', '')
@@ -79,44 +76,43 @@ def enrich_from_google_maps(company_name: str, context: Dict) -> Dict:
 
         logger.debug(f"Querying Google Maps for: {query}")
 
-        # Text search
-        places_result = gmaps.places(query=query)
+        # Text Search (New REST API)
+        search_url = "https://places.googleapis.com/v1/places:searchText"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.nationalPhoneNumber,places.websiteUri,places.types"
+        }
+        payload = {
+            "textQuery": query,
+            "languageCode": "en"
+        }
 
-        if places_result.get('results'):
-            candidates = places_result['results']
+        response = requests.post(search_url, json=payload, headers=headers, timeout=10)
 
-            # Choose best candidate by name similarity
-            best_candidate = None
-            best_similarity = 0.0
+        if response.status_code == 200:
+            data = response.json()
+            places = data.get('places', [])
 
-            for candidate in candidates[:5]:  # Check top 5
-                candidate_name = candidate.get('name', '')
-                similarity = calculate_name_similarity(candidate_name, company_name)
+            if places:
+                # Choose best candidate by name similarity
+                best_place = None
+                best_similarity = 0.0
 
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    best_candidate = candidate
+                for place in places[:5]:  # Check top 5
+                    place_name = place.get('displayName', {}).get('text', '')
+                    similarity = calculate_name_similarity(place_name, company_name)
 
-            if best_candidate and best_similarity >= 0.6:
-                place_id = best_candidate.get('place_id')
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_place = place
 
-                # Get place details
-                details = gmaps.place(place_id=place_id, fields=[
-                    'formatted_phone_number',
-                    'international_phone_number',
-                    'formatted_address',
-                    'website',
-                    'types'
-                ])
-
-                if details.get('result'):
-                    place = details['result']
-
-                    result['maps_phone_main'] = place.get('formatted_phone_number')
-                    result['maps_phone_international'] = place.get('international_phone_number')
-                    result['maps_website'] = place.get('website')
-                    result['maps_address'] = place.get('formatted_address')
-                    result['maps_types'] = ','.join(place.get('types', []))
+                if best_place and best_similarity >= 0.6:
+                    result['maps_phone_main'] = best_place.get('nationalPhoneNumber')
+                    result['maps_phone_international'] = best_place.get('internationalPhoneNumber')
+                    result['maps_website'] = best_place.get('websiteUri')
+                    result['maps_address'] = best_place.get('formattedAddress')
+                    result['maps_types'] = ','.join(best_place.get('types', []))
 
                     # Set confidence based on similarity
                     if best_similarity >= 0.9:
@@ -127,9 +123,10 @@ def enrich_from_google_maps(company_name: str, context: Dict) -> Dict:
                         result['maps_match_confidence'] = 'low'
 
                     logger.debug(f"Google Maps found match for {company_name} (similarity: {best_similarity:.2f})")
-
+            else:
+                logger.debug(f"Google Maps: No results for {query}")
         else:
-            logger.debug(f"Google Maps: No results for {query}")
+            logger.warning(f"Google Maps API error: {response.status_code} - {response.text}")
 
     except Exception as e:
         logger.warning(f"Google Maps API error: {e}")
@@ -309,7 +306,7 @@ def enrich_local_business(name: str, region: Optional[str] = None) -> Dict:
     Perform unified local enrichment (Google Places + Yelp).
 
     Priority:
-    1. Try Google Places first
+    1. Try Google Places first (using REST API)
     2. Fall back to Yelp if Google Places fails or returns nothing
 
     Returns a unified dict with phone/address/website information.
@@ -335,69 +332,52 @@ def enrich_local_business(name: str, region: Optional[str] = None) -> Dict:
     if not name:
         return result
 
-    # Build context for search
-    context = {}
+    # Build query string
+    query = name
     if region:
-        # Try to parse region as "City, State" or just "State"
-        parts = region.split(',')
-        if len(parts) >= 2:
-            context['city'] = parts[0].strip()
-            context['state'] = parts[1].strip()
-        elif len(parts) == 1:
-            context['state'] = parts[0].strip()
+        query = f"{name} {region}"
 
-    # 1) Try Google Places first
+    # 1) Try Google Places first (REST API)
     gp_data = None
     if GOOGLE_PLACES_API_KEY and name:
-        logger.info(f"Trying Google Places for local enrichment: '{name}'")
+        logger.info(f"Trying Google Places REST API for local enrichment: '{name}'")
         try:
-            gmaps = googlemaps.Client(key=GOOGLE_PLACES_API_KEY)
-
-            # Build query
-            city = context.get('city', '')
-            state = context.get('state', '')
-
-            if city or state:
-                query = f"{name} {city} {state}".strip()
-            else:
-                query = name
+            # Text Search (New)
+            search_url = "https://places.googleapis.com/v1/places:searchText"
+            headers = {
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.websiteUri,places.addressComponents"
+            }
+            payload = {
+                "textQuery": query,
+                "languageCode": "en"
+            }
 
             logger.debug(f"Google Places query: {query}")
 
-            # Text search
-            places_result = gmaps.places(query=query)
+            response = requests.post(search_url, json=payload, headers=headers, timeout=10)
 
-            if places_result.get('results'):
-                candidates = places_result['results']
+            if response.status_code == 200:
+                data = response.json()
+                places = data.get('places', [])
 
-                # Choose best candidate by name similarity
-                best_candidate = None
-                best_similarity = 0.0
+                if places:
+                    # Choose best candidate by name similarity
+                    best_place = None
+                    best_similarity = 0.0
 
-                for candidate in candidates[:5]:  # Check top 5
-                    candidate_name = candidate.get('name', '')
-                    similarity = calculate_name_similarity(candidate_name, name)
+                    for place in places[:5]:  # Check top 5
+                        place_name = place.get('displayName', {}).get('text', '')
+                        similarity = calculate_name_similarity(place_name, name)
 
-                    if similarity > best_similarity:
-                        best_similarity = similarity
-                        best_candidate = candidate
+                        if similarity > best_similarity:
+                            best_similarity = similarity
+                            best_place = place
 
-                if best_candidate and best_similarity >= 0.6:
-                    place_id = best_candidate.get('place_id')
-
-                    # Get place details
-                    details = gmaps.place(place_id=place_id, fields=[
-                        'formatted_phone_number',
-                        'formatted_address',
-                        'address_components',
-                        'website'
-                    ])
-
-                    if details.get('result'):
-                        place = details['result']
-
+                    if best_place and best_similarity >= 0.6:
                         # Extract structured address components
-                        address_components = place.get('address_components', [])
+                        address_components = best_place.get('addressComponents', [])
                         city_val = None
                         state_val = None
                         postal_val = None
@@ -406,25 +386,28 @@ def enrich_local_business(name: str, region: Optional[str] = None) -> Dict:
                         for component in address_components:
                             types = component.get('types', [])
                             if 'locality' in types:
-                                city_val = component.get('long_name')
+                                city_val = component.get('longText')
                             elif 'administrative_area_level_1' in types:
-                                state_val = component.get('short_name')
+                                state_val = component.get('shortText')
                             elif 'postal_code' in types:
-                                postal_val = component.get('long_name')
+                                postal_val = component.get('longText')
                             elif 'country' in types:
-                                country_val = component.get('long_name')
+                                country_val = component.get('longText')
 
                         gp_data = {
-                            "phone": place.get('formatted_phone_number'),
-                            "address": place.get('formatted_address'),
+                            "phone": best_place.get('internationalPhoneNumber'),
+                            "address": best_place.get('formattedAddress'),
                             "city": city_val,
                             "state_region": state_val,
                             "postal_code": postal_val,
                             "country": country_val,
-                            "website": place.get('website'),
+                            "website": best_place.get('websiteUri'),
                         }
 
                         logger.info(f"✓ Google Places found data for '{name}' (similarity: {best_similarity:.2f})")
+            else:
+                logger.warning(f"Google Places API error: {response.status_code} - {response.text}")
+
         except Exception as e:
             logger.warning(f"Google Places API error: {e}")
             gp_data = None
@@ -460,11 +443,8 @@ def enrich_local_business(name: str, region: Optional[str] = None) -> Dict:
             }
 
             # Add location if available
-            city = context.get('city', '')
-            state = context.get('state', '')
-
-            if city or state:
-                params["location"] = f"{city}, {state}".strip(', ')
+            if region:
+                params["location"] = region
 
             logger.debug(f"Yelp query: {params}")
 
