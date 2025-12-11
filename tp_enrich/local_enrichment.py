@@ -1,85 +1,27 @@
 """
-Minimal local enrichment - Google Places ONLY
+Local business enrichment - Google Places + Yelp
 """
-
 import os
-import logging
-from typing import Optional, Dict, Any
-import requests
-
-logger = logging.getLogger(__name__)
-
+from typing import Dict, Optional
+from .logging_utils import setup_logger
+logger = setup_logger(__name__)
+# Read env vars ON IMPORT
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
-
-
-def _google_places_search(name: str) -> Optional[str]:
+YELP_API_KEY = os.getenv("YELP_API_KEY")
+logger.info(
+    "Env check (local_enrichment): GOOGLE_PLACES_API_KEY present=%s (len=%s), "
+    "YELP_API_KEY present=%s (len=%s)",
+    bool(GOOGLE_PLACES_API_KEY),
+    len(GOOGLE_PLACES_API_KEY) if GOOGLE_PLACES_API_KEY else 0,
+    bool(YELP_API_KEY),
+    len(YELP_API_KEY) if YELP_API_KEY else 0,
+)
+def enrich_local_business(name: str, region: Optional[str] = None) -> Dict:
     """
-    Simple Places Text Search by name.
-    Returns place_id or None.
+    Perform local enrichment (Google Places + Yelp).
+    Returns a unified dict with phone/address/website information.
     """
-    if not GOOGLE_PLACES_API_KEY:
-        logger.warning("Google Places API key not set.")
-        return None
-
-    if not name or not name.strip():
-        return None
-
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    params = {
-        "query": name,
-        "key": GOOGLE_PLACES_API_KEY,
-    }
-
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.exception("Google Places textsearch error for '%s': %s", name, e)
-        return None
-
-    results = data.get("results", [])
-    if not results:
-        logger.info("Google Places: no results for '%s'", name)
-        return None
-
-    place_id = results[0].get("place_id")
-    logger.info("Google Places: found place_id '%s' for '%s'", place_id, name)
-    return place_id
-
-
-def _google_places_details(place_id: str) -> Dict[str, Any]:
-    """
-    Fetch basic details (phone, address, website) from Place Details.
-    """
-    if not GOOGLE_PLACES_API_KEY or not place_id:
-        return {}
-
-    url = "https://maps.googleapis.com/maps/api/place/details/json"
-    params = {
-        "place_id": place_id,
-        "fields": "formatted_phone_number,formatted_address,website,address_components",
-        "key": GOOGLE_PLACES_API_KEY,
-    }
-
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.exception("Google Places details error for '%s': %s", place_id, e)
-        return {}
-
-    result = data.get("result", {}) or {}
-    return result
-
-
-def enrich_local_business(name: str, region: Optional[str] = None) -> Dict[str, Any]:
-    """
-    MINIMAL local enrichment: Google Places ONLY.
-    Returns phone, phone_source, address, city, state_region, postal_code, country, website.
-    """
-    base = {
+    result: Dict = {
         "phone": None,
         "phone_source": None,
         "address": None,
@@ -88,60 +30,150 @@ def enrich_local_business(name: str, region: Optional[str] = None) -> Dict[str, 
         "postal_code": None,
         "country": None,
         "website": None,
+        "provider": None,
     }
-
-    if not name or not name.strip():
-        logger.warning("Local enrichment: empty name, skipping.")
-        return base
-
-    logger.info("Local enrichment: searching Google Places for '%s'", name)
-
-    place_id = _google_places_search(name)
-    if not place_id:
-        logger.info("Local enrichment: no Google Places match for '%s'", name)
-        return base
-
-    details = _google_places_details(place_id)
-    if not details:
-        logger.info("Local enrichment: no details for place_id=%s", place_id)
-        return base
-
-    phone = details.get("formatted_phone_number")
-    address = details.get("formatted_address")
-    website = details.get("website")
-
-    city = None
-    state_region = None
-    postal_code = None
-    country = None
-
-    components = details.get("address_components") or []
-    for comp in components:
-        types = comp.get("types", [])
-        short_name = comp.get("short_name")
-        long_name = comp.get("long_name")
-
-        if "locality" in types and not city:
-            city = long_name or short_name
-        if "administrative_area_level_1" in types and not state_region:
-            state_region = short_name or long_name
-        if "postal_code" in types and not postal_code:
-            postal_code = long_name or short_name
-        if "country" in types and not country:
-            country = short_name or long_name
-
+    # Re-read env inside function just in case this module was imported
+    # before Railway injected env vars (defensive).
+    google_key = GOOGLE_PLACES_API_KEY or os.getenv("GOOGLE_PLACES_API_KEY")
+    yelp_key = YELP_API_KEY or os.getenv("YELP_API_KEY")
     logger.info(
-        "Google Places result for '%s': phone=%s, website=%s, address=%s",
-        name, phone, website, address
+        "Local enrichment start for '%s' (region=%s). google_key_present=%s, yelp_key_present=%s",
+        name,
+        region,
+        bool(google_key),
+        bool(yelp_key),
     )
-
-    return {
-        "phone": phone,
-        "phone_source": "google_places" if phone else None,
-        "address": address,
-        "city": city,
-        "state_region": state_region,
-        "postal_code": postal_code,
-        "country": country,
-        "website": website,
-    }
+    # 1) Try Google Places first
+    gp_data = None
+    if google_key and name:
+        try:
+            # REST call to Places API: Find Place From Text
+            import requests
+            find_url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
+            params = {
+                "input": name if not region else f"{name} {region}",
+                "inputtype": "textquery",
+                "fields": "place_id",
+                "key": google_key,
+            }
+            resp = requests.get(find_url, params=params, timeout=10)
+            logger.info("Google Places findplace status=%s for '%s'", resp.status_code, name)
+            data = resp.json()
+            candidates = data.get("candidates") or []
+            if candidates:
+                place_id = candidates[0].get("place_id")
+                if place_id:
+                    details_url = "https://maps.googleapis.com/maps/api/place/details/json"
+                    details_params = {
+                        "place_id": place_id,
+                        "fields": "formatted_phone_number,formatted_address,website,address_components",
+                        "key": google_key,
+                    }
+                    d_resp = requests.get(details_url, params=details_params, timeout=10)
+                    logger.info(
+                        "Google Places details status=%s for '%s'", d_resp.status_code, name
+                    )
+                    d_data = d_resp.json()
+                    result_data = d_data.get("result") or {}
+                    phone = result_data.get("formatted_phone_number")
+                    address = result_data.get("formatted_address")
+                    website = result_data.get("website")
+                    city = None
+                    state_region = None
+                    postal_code = None
+                    country = None
+                    for comp in result_data.get("address_components") or []:
+                        types = comp.get("types") or []
+                        if "locality" in types:
+                            city = comp.get("long_name")
+                        if "administrative_area_level_1" in types:
+                            state_region = comp.get("short_name")
+                        if "postal_code" in types:
+                            postal_code = comp.get("long_name")
+                        if "country" in types:
+                            country = comp.get("short_name")
+                    if phone or address or website:
+                        gp_data = {
+                            "phone": phone,
+                            "address": address,
+                            "city": city,
+                            "state_region": state_region,
+                            "postal_code": postal_code,
+                            "country": country,
+                            "website": website,
+                        }
+        except Exception as e:
+            logger.error("Google Places lookup error for '%s': %s", name, e, exc_info=True)
+    if gp_data:
+        logger.info("Google Places HIT for '%s': %s", name, gp_data)
+        result.update(
+            {
+                "phone": gp_data.get("phone"),
+                "phone_source": "google_places",
+                "address": gp_data.get("address"),
+                "city": gp_data.get("city"),
+                "state_region": gp_data.get("state_region"),
+                "postal_code": gp_data.get("postal_code"),
+                "country": gp_data.get("country"),
+                "website": gp_data.get("website"),
+                "provider": "google_places",
+            }
+        )
+        return result
+    # 2) Fallback to Yelp if Places failed or returned nothing
+    yelp_data = None
+    if yelp_key and name:
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {yelp_key}"}
+            search_url = "https://api.yelp.com/v3/businesses/search"
+            params = {
+                "term": name,
+                "location": region or "United States",
+                "limit": 1,
+            }
+            y_resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+            logger.info("Yelp search status=%s for '%s'", y_resp.status_code, name)
+            y_data = y_resp.json()
+            businesses = y_data.get("businesses") or []
+            if businesses:
+                b = businesses[0]
+                phone = b.get("phone") or b.get("display_phone")
+                address_parts = b.get("location") or {}
+                address = ", ".join(
+                    [part for part in address_parts.get("display_address", []) if part]
+                )
+                city = address_parts.get("city")
+                state_region = address_parts.get("state")
+                postal_code = address_parts.get("zip_code")
+                country = address_parts.get("country")
+                website = b.get("url")
+                yelp_data = {
+                    "phone": phone,
+                    "address": address,
+                    "city": city,
+                    "state_region": state_region,
+                    "postal_code": postal_code,
+                    "country": country,
+                    "website": website,
+                }
+        except Exception as e:
+            logger.error("Yelp lookup error for '%s': %s", name, e, exc_info=True)
+    if yelp_data:
+        logger.info("Yelp HIT for '%s': %s", name, yelp_data)
+        result.update(
+            {
+                "phone": yelp_data.get("phone"),
+                "phone_source": "yelp",
+                "address": yelp_data.get("address"),
+                "city": yelp_data.get("city"),
+                "state_region": yelp_data.get("state_region"),
+                "postal_code": yelp_data.get("postal_code"),
+                "country": yelp_data.get("country"),
+                "website": yelp_data.get("website"),
+                "provider": "yelp",
+            }
+        )
+        return result
+    logger.warning("No local enrichment data found for '%s'", name)
+    return result
