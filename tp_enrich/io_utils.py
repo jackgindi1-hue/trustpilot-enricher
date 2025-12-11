@@ -60,6 +60,53 @@ def map_display_name_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def map_review_date_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map review date column to review_date
+
+    Handles various date column naming conventions:
+    - dates.experiencedDate (Apify Trustpilot scraper)
+    - dates.experienceddate (normalized)
+    - date
+    - review_date
+
+    Args:
+        df: DataFrame with original columns (already normalized to lowercase)
+
+    Returns:
+        DataFrame with review_date column added
+    """
+    # Create lowercase mapping (columns are already lowercase from load_input_csv)
+    lower_map = {col.lower(): col for col in df.columns}
+
+    # Priority list for date columns (all lowercase since columns are normalized)
+    candidate_keys = [
+        "dates.experienceddate",
+        "dates.experienced_date",
+        "review_date",
+        "date",
+    ]
+
+    # Find first matching column
+    date_col = None
+    for candidate in candidate_keys:
+        if candidate in lower_map:
+            date_col = lower_map[candidate]
+            break
+
+    # Map to review_date
+    if date_col:
+        df["review_date"] = df[date_col]
+        logger.info(f"✓ Using date column '{date_col}' for review_date")
+    else:
+        # No date column found
+        df["review_date"] = pd.NA
+        logger.warning(f"✗ No date column found in: {list(df.columns)}")
+        logger.warning(f"  Looked for: {candidate_keys}")
+
+    return df
+
+
 def load_input_csv(filepath: str) -> pd.DataFrame:
     """
     Load and normalize input Trustpilot CSV
@@ -85,6 +132,9 @@ def load_input_csv(filepath: str) -> pd.DataFrame:
 
     # Map display name column to raw_display_name
     df = map_display_name_column(df)
+
+    # Map review date column
+    df = map_review_date_column(df)
 
     return df
 
