@@ -1,114 +1,67 @@
+# ==========================
+# tp_enrich/email_enrichment.py
+# FULL REPLACEMENT WITH APOLLO FALLBACK
+# ==========================
 import os
 import logging
-from typing import Optional, Dict, Any, List
-
 import requests
-from requests.exceptions import HTTPError
+from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
-HUNTER_API_KEY = os.getenv("HUNTER_API_KEY")
-SNOV_CLIENT_ID = os.getenv("SNOV_CLIENT_ID")
-SNOV_CLIENT_SECRET = os.getenv("SNOV_CLIENT_SECRET")
+HUNTER_API_KEY = (os.getenv("HUNTER_API_KEY") or "").strip()
+SNOV_CLIENT_ID = (os.getenv("SNOV_CLIENT_ID") or "").strip()
+SNOV_CLIENT_SECRET = (os.getenv("SNOV_CLIENT_SECRET") or "").strip()
+APOLLO_API_KEY = (os.getenv("APOLLO_API_KEY") or "").strip()
 
 
-def _pick_best_email_from_hunter(emails: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Given Hunter `emails` list, pick the best one.
-    Preference:
-      1) highest confidence_score
-      2) has 'type' == 'generic' or 'personal' (doesn't really matter, we just pick something sane)
-    """
+# -------------------------
+# HUNTER
+# -------------------------
+def _hunter_domain_search(domain: str) -> Optional[Dict[str, Any]]:
+    if not HUNTER_API_KEY:
+        return None
+
+    try:
+        resp = requests.get(
+            "https://api.hunter.io/v2/domain-search",
+            params={"domain": domain, "api_key": HUNTER_API_KEY, "limit": 10},
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error("Hunter error for %s: %s", domain, repr(e))
+        return None
+
+    data = (resp.json() or {}).get("data") or {}
+    emails = data.get("emails") or []
     if not emails:
         return None
 
-    def score(e: Dict[str, Any]) -> float:
-        # Hunter usually has confidence_score 0–100.
-        return float(e.get("confidence_score") or 0.0)
+    best = None
+    for e in emails:
+        conf = int(e.get("confidence") or 0)
+        if conf >= 80:
+            best = e
+            break
 
-    best = max(emails, key=score)
-    if not best.get("value"):
-        return None
-    return best
-
-
-def enrich_from_hunter(domain: str, business_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    Try to get an email from Hunter for a given domain.
-    Returns a dict with keys like:
-      - primary_email
-      - email_source
-      - email_confidence
-      - emails_raw
-    or None if nothing useful.
-    """
-    if not HUNTER_API_KEY:
-        logger.warning("Hunter: HUNTER_API_KEY not set; skipping Hunter enrichment for domain '%s'", domain)
+    best = best or emails[0]
+    primary = best.get("value")
+    if not primary:
         return None
 
-    params = {
-        "domain": domain,
-        "api_key": HUNTER_API_KEY,
+    return {
+        "primary_email": primary,
+        "emails": [x.get("value") for x in emails if x.get("value")],
+        "email_source": "hunter",
     }
 
-    try:
-        logger.info("Hunter: starting domain search for '%s' (business=%s)", domain, business_name)
-        resp = requests.get("https://api.hunter.io/v2/domain-search", params=params, timeout=15)
-        try:
-            resp.raise_for_status()
-        except HTTPError as e:
-            status = resp.status_code
-            if status == 429:
-                logger.warning("Hunter: rate limited (429) for domain '%s'", domain)
-            else:
-                logger.error("Hunter: HTTP %s for domain '%s': %s", status, domain, e)
-            return None
 
-        data = resp.json() or {}
-        domain_data = data.get("data") or {}
-        emails = domain_data.get("emails") or []
-
-        if not emails:
-            logger.info("Hunter: no emails found for domain '%s'", domain)
-            return None
-
-        best = _pick_best_email_from_hunter(emails)
-        if not best:
-            logger.info("Hunter: could not pick a best email for domain '%s'", domain)
-            return None
-
-        email_addr = best.get("value")
-        confidence = best.get("confidence_score")
-
-        logger.info(
-            "Hunter: selected email '%s' (confidence=%s) for domain '%s'",
-            email_addr,
-            confidence,
-            domain,
-        )
-
-        return {
-            "primary_email": email_addr,
-            "email_source": "hunter",
-            "email_confidence": confidence,
-            "emails_raw": emails,
-        }
-
-    except Exception as e:
-        logger.error("Hunter domain search error for '%s': %s", domain, e)
-        return None
-
-
-def _get_snov_access_token() -> Optional[str]:
-    """
-    Get a Snov access token via client_credentials.
-    Uses:
-      - SNOV_CLIENT_ID
-      - SNOV_CLIENT_SECRET
-    If not configured or fails, return None.
-    """
+# -------------------------
+# SNOV
+# -------------------------
+def _snov_get_token() -> Optional[str]:
     if not SNOV_CLIENT_ID or not SNOV_CLIENT_SECRET:
-        logger.warning("Snov: SNOV_CLIENT_ID / SNOV_CLIENT_SECRET not set; skipping Snov enrichment.")
         return None
 
     try:
@@ -119,135 +72,131 @@ def _get_snov_access_token() -> Optional[str]:
                 "client_id": SNOV_CLIENT_ID,
                 "client_secret": SNOV_CLIENT_SECRET,
             },
-            timeout=15,
+            timeout=20,
         )
         resp.raise_for_status()
-        data = resp.json() or {}
-        token = data.get("access_token")
-        if not token:
-            logger.error("Snov: no access_token in response: %s", data)
-            return None
-        return token
     except Exception as e:
-        logger.error("Snov: error getting access token: %s", e)
+        logger.error("Snov token error: %s", repr(e))
         return None
 
-
-def _pick_best_email_from_snov(emails: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Snov `emails` objects usually have fields like 'email', 'confidence', 'firstName', 'lastName', etc.
-    We'll pick the highest confidence.
-    """
-    if not emails:
-        return None
-
-    def score(e: Dict[str, Any]) -> float:
-        return float(e.get("confidence") or 0.0)
-
-    best = max(emails, key=score)
-    if not best.get("email"):
-        return None
-    return best
+    return (resp.json() or {}).get("access_token")
 
 
-def enrich_from_snov(domain: str, business_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    Use Snov's /v2/domain-emails-with-info endpoint to get emails for a domain.
-    Returns same shape as Hunter's dict, or None.
-    """
-    token = _get_snov_access_token()
+def _snov_domain_search(domain: str) -> Optional[Dict[str, Any]]:
+    token = _snov_get_token()
     if not token:
         return None
 
     try:
-        params = {
-            "access_token": token,
-            "domain": domain,
-            "type": "all",   # all types of emails
-            "limit": 10,
-        }
-        logger.info("Snov: starting domain search for '%s' (business=%s)", domain, business_name)
-        resp = requests.get(
-            "https://api.snov.io/v2/domain-emails-with-info",
-            params=params,
-            timeout=20,
+        resp = requests.post(
+            "https://api.snov.io/v1/get-domain-emails-with-info",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"domain": domain, "limit": 100, "type": "all", "lastId": 0},
+            timeout=30,
         )
-        try:
-            resp.raise_for_status()
-        except HTTPError as e:
-            status = resp.status_code
-            if status == 429:
-                logger.warning("Snov: rate limited (429) for domain '%s'", domain)
-            else:
-                logger.error("Snov: HTTP %s for domain '%s': %s", status, domain, e)
-            return None
-
-        data = resp.json() or {}
-        emails = data.get("emails") or []
-        if not emails:
-            logger.info("Snov: no emails found for domain '%s'", domain)
-            return None
-
-        best = _pick_best_email_from_snov(emails)
-        if not best:
-            logger.info("Snov: could not pick best email for domain '%s'", domain)
-            return None
-
-        email_addr = best.get("email")
-        confidence = best.get("confidence")
-
-        logger.info(
-            "Snov: selected email '%s' (confidence=%s) for domain '%s'",
-            email_addr,
-            confidence,
-            domain,
-        )
-
-        return {
-            "primary_email": email_addr,
-            "email_source": "snov",
-            "email_confidence": confidence,
-            "emails_raw": emails,
-        }
-
+        resp.raise_for_status()
     except Exception as e:
-        logger.error("Snov domain search error for '%s': %s", domain, e)
+        logger.error("Snov error for %s: %s", domain, repr(e))
         return None
 
+    emails = (resp.json() or {}).get("emails") or []
+    if not emails:
+        return None
 
-def enrich_email_for_domain(domain: Optional[str], business_name: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Main orchestrator used by the pipeline.
+    all_values = []
+    primary = None
+    for e in emails:
+        val = e.get("email") or e.get("value") or e.get("address")
+        if not val:
+            continue
+        all_values.append(val)
+        if not primary:
+            primary = val
 
-    Steps:
-      1) If no domain -> skip & return empty.
-      2) Try Hunter (if key present & not rate-limited).
-      3) If Hunter fails or returns None -> try Snov.
-      4) If both fail -> return empty, but NEVER raise.
-    """
-    result: Dict[str, Any] = {
+    if not primary:
+        return None
+
+    return {
+        "primary_email": primary,
+        "emails": all_values,
+        "email_source": "snov",
+    }
+
+
+# -------------------------
+# APOLLO
+# -------------------------
+def _apollo_domain_lookup(domain: str) -> Optional[Dict[str, Any]]:
+    if not APOLLO_API_KEY:
+        return None
+
+    try:
+        resp = requests.post(
+            "https://api.apollo.io/v1/organizations/search",
+            json={
+                "api_key": APOLLO_API_KEY,
+                "q_organization_domains": domain,
+                "page": 1,
+                "per_page": 5,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error("Apollo error for %s: %s", domain, repr(e))
+        return None
+
+    orgs = (resp.json() or {}).get("organizations") or []
+    if not orgs:
+        return None
+
+    emails = []
+    primary = None
+    for org in orgs:
+        people = org.get("current_employees", [])
+        for p in people:
+            email = p.get("email") or p.get("email_status")
+            if email:
+                emails.append(email)
+                if not primary:
+                    primary = email
+
+    if not primary:
+        return None
+
+    return {
+        "primary_email": primary,
+        "emails": emails,
+        "email_source": "apollo",
+    }
+
+
+# -------------------------
+# MASTER WATERFALL
+# -------------------------
+def enrich_emails_for_domain(domain: Optional[str]) -> Dict[str, Any]:
+    result = {
         "primary_email": None,
+        "emails": [],
         "email_source": None,
-        "email_confidence": None,
-        "emails_raw": None,
     }
 
     if not domain:
-        logger.error("Skipping email enrichment: domain missing or empty.")
         return result
 
-    # 1) Hunter
-    hunter_res = enrich_from_hunter(domain, business_name=business_name)
-    if hunter_res and hunter_res.get("primary_email"):
-        result.update(hunter_res)
-        return result
+    # 1) HUNTER
+    hunter = _hunter_domain_search(domain)
+    if hunter:
+        return hunter
 
-    # 2) Snov fallback
-    snov_res = enrich_from_snov(domain, business_name=business_name)
-    if snov_res and snov_res.get("primary_email"):
-        result.update(snov_res)
-        return result
+    # 2) SNOV
+    snov = _snov_domain_search(domain)
+    if snov:
+        return snov
 
-    # No provider could find an email
-    logger.info("Email enrichment: no email found for domain '%s' (Hunter + Snov).", domain)
+    # 3) APOLLO
+    apollo = _apollo_domain_lookup(domain)
+    if apollo:
+        return apollo
+
     return result

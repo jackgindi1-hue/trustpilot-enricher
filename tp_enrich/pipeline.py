@@ -4,18 +4,106 @@ Extracted from main.py to enable both CLI and API access
 """
 import os
 import pandas as pd
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
+from urllib.parse import urlparse
 from .logging_utils import setup_logger
 from .io_utils import load_input_csv, write_output_csv, get_output_schema
 from .classification import classify_name
 from .normalization import normalize_business_name, ensure_company_search_name
 from .dedupe import identify_unique_businesses, get_enrichment_context
 from .cache import EnrichmentCache
-from .domain_enrichment import extract_domain_from_website
-from .local_enrichment import enrich_local_business
-from .email_enrichment import enrich_email_for_domain
+from . import local_enrichment
+from .email_enrichment import enrich_emails_for_domain
 from .merge_results import merge_enrichment_results
+
 logger = setup_logger(__name__)
+
+
+def _compute_confidence(row: Dict[str, Any]) -> str:
+    """Compute overall confidence based on phone and email presence."""
+    has_phone = bool(row.get("primary_phone"))
+    has_email = bool(row.get("primary_email"))
+    if has_phone and has_email:
+        return "high"
+    if has_phone or has_email:
+        return "medium"
+    return "failed"
+
+
+def enrich_single_business(name: str, region: str | None = None) -> Dict[str, Any]:
+    """
+    Simplified enrichment function for a single business.
+
+    Flow:
+    1. Local enrichment (Google Places → Yelp) for phone/address/website
+    2. Extract domain from website
+    3. Email enrichment (Hunter → Snov → Apollo) for emails
+    4. Compute overall confidence
+
+    Args:
+        name: Business name
+        region: Optional region/location
+
+    Returns:
+        Dict with enriched business data
+    """
+    logger.info("Enriching business: %s", name)
+
+    row = {
+        "business_name": name,
+        "primary_phone": None,
+        "phone": None,
+        "primary_email": None,
+        "email": None,
+        "emails": [],
+        "email_source": None,
+        "website": None,
+        "domain": None,
+        "address": None,
+        "city": None,
+        "state_region": None,
+        "postal_code": None,
+        "country": None,
+    }
+
+    # ---- LOCAL (Google → Yelp)
+    local = local_enrichment.enrich_local_business(name, region)
+    if local:
+        if local.get("phone"):
+            row["phone"] = local["phone"]
+            row["primary_phone"] = local["phone"]
+
+        for f in ["address", "city", "state_region", "postal_code", "country"]:
+            if local.get(f):
+                row[f] = local[f]
+
+        if local.get("website"):
+            row["website"] = local["website"]
+
+    # ---- DOMAIN EXTRACT
+    website = row.get("website")
+    if website:
+        try:
+            parsed = urlparse(website)
+            host = parsed.netloc or parsed.path
+            if host.startswith("www."):
+                host = host[4:]
+            row["domain"] = host.lower()
+        except Exception:
+            row["domain"] = None
+
+    domain = row.get("domain")
+
+    # ---- EMAIL ENRICHMENT (Hunter → Snov → Apollo)
+    email_data = enrich_emails_for_domain(domain)
+    if email_data.get("primary_email"):
+        row["primary_email"] = email_data["primary_email"]
+        row["email"] = email_data["primary_email"]
+        row["emails"] = email_data.get("emails") or []
+        row["email_source"] = email_data.get("email_source")
+
+    row["confidence"] = _compute_confidence(row)
+    return row
 def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
     """
     Enrich a single business through all sources
@@ -27,43 +115,44 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
     """
     normalized_key = business_info['company_normalized_key']
     company_name = business_info['company_search_name']
-    logger.info(f"Enriching business: {company_name}")
+
     # Check cache
     if cache.has(normalized_key):
         logger.info(f"  -> Using cached result for {company_name}")
         return cache.get(normalized_key)
+
     # Get enrichment context
     context = get_enrichment_context(business_info)
+    region = context.get('state') or context.get('region')
 
-    # MINIMAL MVP PATH:
-    # 1) Google Places ONLY for local enrichment
-    logger.info(f"  -> Local enrichment (Google Places only) for {company_name}")
-    local_data = enrich_local_business(company_name, region=None)
+    # Use the simplified enrichment function
+    enriched_data = enrich_single_business(company_name, region=region)
 
-    # 2) Extract domain from website
-    logger.info(f"  -> Extracting domain from website")
-    domain = extract_domain_from_website(local_data.get('website'))
-    logger.info(f"  -> Domain extracted: {domain}")
-
-    # 3) Email enrichment (Hunter → Snov fallback)
-    logger.info(f"  -> Email enrichment (Hunter → Snov) for {company_name}")
-    email_info = enrich_email_for_domain(domain, business_name=company_name)
-
-    # Build enrichment data for merge_results
+    # Build enrichment data structure for merge_results
     enrichment_data = {
         'company_search_name': company_name,
         'company_normalized_key': normalized_key,
-        'local_enrichment': local_data,
-        'company_domain': domain,
-        'domain_confidence': 'high' if domain else 'none',
-        'primary_email': email_info.get('primary_email'),
-        'email_source': email_info.get('email_source'),
-        'email_confidence': email_info.get('email_confidence'),
-        'emails_raw': email_info.get('emails_raw'),
+        'local_enrichment': {
+            'phone': enriched_data.get('phone'),
+            'phone_source': 'google_places' if enriched_data.get('phone') else None,
+            'address': enriched_data.get('address'),
+            'city': enriched_data.get('city'),
+            'state_region': enriched_data.get('state_region'),
+            'postal_code': enriched_data.get('postal_code'),
+            'country': enriched_data.get('country'),
+            'website': enriched_data.get('website'),
+        },
+        'company_domain': enriched_data.get('domain'),
+        'domain_confidence': 'high' if enriched_data.get('domain') else 'none',
+        'primary_email': enriched_data.get('primary_email'),
+        'email_source': enriched_data.get('email_source'),
+        'emails': enriched_data.get('emails', []),
     }
+
     # Merge results and apply priority rules
     logger.debug(f"  -> Merging results for {company_name}")
     final_result = merge_enrichment_results(enrichment_data)
+
     # Save to cache
     cache.set(normalized_key, final_result)
     logger.info(f"  -> Completed enrichment for {company_name} (confidence: {final_result.get('overall_lead_confidence')})")
