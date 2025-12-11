@@ -139,28 +139,38 @@ def load_input_csv(filepath: str) -> pd.DataFrame:
     return df
 
 
-def write_output_csv(df: pd.DataFrame, filepath: str, column_order: List[str]) -> None:
+def write_output_csv(df: pd.DataFrame, filepath: str, column_order: List[str] = None) -> None:
     """
-    Write output CSV with exact column order
+    Write the enriched DataFrame to CSV.
+
+    IMPORTANT:
+    - We DO NOT filter columns here.
+    - We write EVERY COLUMN currently on the DataFrame.
+      That includes:
+        - consumer.displayName / DATE (original Trustpilot data)
+        - business_phone
+        - business_email
+        - business_address
+        - business_city
+        - business_state_region
+        - business_postal_code
+        - business_country
+        - business_website
+        - and any future enrichment fields.
 
     Args:
         df: DataFrame to write
         filepath: Output file path
-        column_order: Exact column order to use
+        column_order: DEPRECATED - ignored, all columns are written
     """
     logger.info(f"Writing output CSV to: {filepath}")
+    logger.info(f"Final columns: {list(df.columns)}")
+    logger.info(f"Total rows to write: {len(df)}")
 
-    # Ensure all columns exist (fill missing with None)
-    for col in column_order:
-        if col not in df.columns:
-            df[col] = None
-
-    # Reorder columns exactly
-    df = df[column_order]
-
+    # 🚨 THE FIX: write EVERYTHING, no column whitelist
     df.to_csv(filepath, index=False)
-    logger.info(f"Successfully wrote {len(df)} rows to {filepath}")
 
+    logger.info(f"Successfully wrote {len(df)} rows to {filepath}")
 
 def get_output_schema() -> List[str]:
     """
