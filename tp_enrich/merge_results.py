@@ -6,7 +6,7 @@ Sections J, K, L: Phone priority, Email priority, Overall confidence
 import json
 import re
 import phonenumbers
-from typing import Dict, List, Optional, Literal, Tuple
+from typing import Dict, List, Optional, Literal
 from .logging_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -338,15 +338,57 @@ def merge_enrichment_results(enrichment_data: Dict) -> Dict:
     """
     result = {}
 
-    # Aggregate all phones
-    all_phones = aggregate_phones(enrichment_data)
+    # Check for unified local enrichment (Google Places -> Yelp waterfall)
+    local_enrichment = enrichment_data.get('local_enrichment', {})
 
-    # Select primary phone
-    primary_phone = select_primary_phone(all_phones)
-    result.update(primary_phone)
+    # If local enrichment has phone, prioritize it
+    if local_enrichment.get('phone') and local_enrichment.get('phone_source'):
+        phone_source = local_enrichment.get('phone_source')
+        phone_value = local_enrichment.get('phone')
 
-    # Store all phones as JSON
-    result['all_phones_json'] = json.dumps(all_phones) if all_phones else None
+        # Normalize the phone
+        normalized = normalize_phone(phone_value)
+
+        if normalized:
+            # Set confidence based on source
+            if phone_source == 'google_places':
+                confidence = 'high'
+            elif phone_source == 'yelp':
+                confidence = 'medium'
+            else:
+                confidence = 'low'
+
+            # Use this as primary phone directly
+            result['primary_phone'] = normalized
+            result['primary_phone_display'] = format_phone_display(phone_value)
+            result['primary_phone_source'] = phone_source
+            result['primary_phone_confidence'] = confidence
+
+            # Also update address from local enrichment
+            if local_enrichment.get('address'):
+                result['business_address'] = local_enrichment.get('address')
+            if local_enrichment.get('city'):
+                result['business_city'] = local_enrichment.get('city')
+            if local_enrichment.get('state_region'):
+                result['business_state_region'] = local_enrichment.get('state_region')
+            if local_enrichment.get('postal_code'):
+                result['business_postal_code'] = local_enrichment.get('postal_code')
+            if local_enrichment.get('country'):
+                result['business_country'] = local_enrichment.get('country')
+        else:
+            # Fallback to standard aggregation if phone normalization failed
+            all_phones = aggregate_phones(enrichment_data)
+            primary_phone = select_primary_phone(all_phones)
+            result.update(primary_phone)
+    else:
+        # No local enrichment phone, use standard aggregation
+        all_phones = aggregate_phones(enrichment_data)
+        primary_phone = select_primary_phone(all_phones)
+        result.update(primary_phone)
+
+    # Store all phones as JSON (aggregate regardless of local enrichment)
+    all_phones_for_json = aggregate_phones(enrichment_data)
+    result['all_phones_json'] = json.dumps(all_phones_for_json) if all_phones_for_json else None
 
     # Select primary email (already done in email enrichment)
     primary_email = select_primary_email(enrichment_data)
@@ -362,18 +404,31 @@ def merge_enrichment_results(enrichment_data: Dict) -> Dict:
     result['domain_confidence'] = enrichment_data.get('domain_confidence', 'none')
 
     # Address info (choose best available)
-    address_sources = [
-        enrichment_data.get('maps_address'),
-        enrichment_data.get('yelp_address'),
-        enrichment_data.get('yp_address'),
-        enrichment_data.get('bbb_address'),
-        enrichment_data.get('oc_registered_address')
-    ]
+    # Prioritize local_enrichment, then other sources
+    if not result.get('business_address'):
+        address_sources = [
+            local_enrichment.get('address'),
+            enrichment_data.get('maps_address'),
+            enrichment_data.get('yelp_address'),
+            enrichment_data.get('yp_address'),
+            enrichment_data.get('bbb_address'),
+            enrichment_data.get('oc_registered_address')
+        ]
 
-    for addr in address_sources:
-        if addr:
-            result['business_address'] = addr
-            break
+        for addr in address_sources:
+            if addr:
+                result['business_address'] = addr
+                break
+
+    # Set city, state, postal, country from local_enrichment if not already set
+    if not result.get('business_city') and local_enrichment.get('city'):
+        result['business_city'] = local_enrichment.get('city')
+    if not result.get('business_state_region') and local_enrichment.get('state_region'):
+        result['business_state_region'] = local_enrichment.get('state_region')
+    if not result.get('business_postal_code') and local_enrichment.get('postal_code'):
+        result['business_postal_code'] = local_enrichment.get('postal_code')
+    if not result.get('business_country') and local_enrichment.get('country'):
+        result['business_country'] = local_enrichment.get('country')
 
     # OpenCorporates data
     result['oc_company_name'] = enrichment_data.get('oc_company_name')
@@ -389,3 +444,6 @@ def merge_enrichment_results(enrichment_data: Dict) -> Dict:
     result['enrichment_notes'] = status
 
     return result
+
+
+from typing import Tuple
