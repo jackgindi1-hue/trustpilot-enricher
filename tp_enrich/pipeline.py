@@ -3,6 +3,7 @@ Core enrichment pipeline - reusable function for CLI and API
 Extracted from main.py to enable both CLI and API access
 """
 import os
+import json
 import pandas as pd
 from typing import Dict, Optional, Any
 from urllib.parse import urlparse
@@ -17,6 +18,163 @@ from .email_enrichment import enrich_emails_for_domain
 from .merge_results import merge_enrichment_results
 
 logger = setup_logger(__name__)
+
+
+def _norm_key(val):
+    """Normalize a key for matching (stringify, strip, lowercase)."""
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+    return str(val).strip().lower() or None
+
+
+def merge_enrichment_back_to_rows(df: pd.DataFrame, business_enrichments: dict) -> pd.DataFrame:
+    """
+    Attach enrichment results (phones, emails, address, etc.) to each original row.
+
+    IMPORTANT:
+    - We match by company_search_name (which IS populated in your CSV)
+      and fall back to company_normalized_key / raw_display_name / consumer.displayname.
+    - This completely bypasses company_normalized_key when it's NaN, so data finally shows up.
+    """
+    logger.info("Step 6: Merging enrichment results back to rows...")
+
+    # ---------------------------------------------------------
+    # Build an index of enrichment results keyed by company name
+    # ---------------------------------------------------------
+    enrichment_index = {}
+
+    for raw_key, biz in (business_enrichments or {}).items():
+        # Prefer the explicit company_search_name stored in the enrichment
+        key = (
+            biz.get("company_search_name")
+            or biz.get("company_normalized_key")
+            or biz.get("raw_display_name")
+            or raw_key
+        )
+        norm = _norm_key(key)
+        if norm:
+            enrichment_index[norm] = biz
+
+    logger.info("  Built enrichment index for %d businesses", len(enrichment_index))
+
+    enriched_rows = []
+
+    # Ensure all expected enrichment columns exist in df
+    enrichment_columns = [
+        "company_domain",
+        "domain_confidence",
+        "primary_phone",
+        "primary_phone_display",
+        "primary_phone_source",
+        "primary_phone_confidence",
+        "primary_email",
+        "primary_email_type",
+        "primary_email_source",
+        "primary_email_confidence",
+        "business_address",
+        "business_city",
+        "business_state_region",
+        "business_postal_code",
+        "business_country",
+        "oc_company_name",
+        "oc_jurisdiction",
+        "oc_company_number",
+        "oc_incorporation_date",
+        "oc_match_confidence",
+        "overall_lead_confidence",
+        "enrichment_status",
+        "enrichment_notes",
+        "all_phones_json",
+        "generic_emails_json",
+        "person_emails_json",
+        "catchall_emails_json",
+        "source_platform",
+    ]
+
+    for col in enrichment_columns:
+        if col not in df.columns:
+            df[col] = None
+
+    # ---------------------------------------------
+    # Attach enrichment row-by-row using the index
+    # ---------------------------------------------
+    for _, row in df.iterrows():
+        # Try a few candidates in order of "niceness"
+        key = (
+            row.get("company_search_name")
+            or row.get("company_normalized_key")
+            or row.get("raw_display_name")
+            or row.get("consumer.displayname")
+        )
+        norm = _norm_key(key)
+        biz = enrichment_index.get(norm, {}) if norm else {}
+
+        # Simple helper: prefer enrichment value, fall back to existing df value
+        def pick(col_name, enrichment_key=None):
+            if not enrichment_key:
+                enrichment_key = col_name
+            val = biz.get(enrichment_key)
+            return val if val not in (None, "", []) else row.get(col_name)
+
+        # Domain + phone/email fields
+        row["company_domain"] = pick("company_domain")
+        row["domain_confidence"] = pick("domain_confidence")
+
+        row["primary_phone"] = pick("primary_phone", "primary_phone")
+        row["primary_phone_display"] = pick("primary_phone_display", "primary_phone_display")
+        row["primary_phone_source"] = pick("primary_phone_source", "primary_phone_source")
+        row["primary_phone_confidence"] = pick("primary_phone_confidence", "primary_phone_confidence")
+
+        row["primary_email"] = pick("primary_email", "primary_email")
+        row["primary_email_type"] = pick("primary_email_type", "primary_email_type")
+        row["primary_email_source"] = pick("primary_email_source", "primary_email_source")
+        row["primary_email_confidence"] = pick("primary_email_confidence", "primary_email_confidence")
+
+        # Address fields
+        row["business_address"] = pick("business_address")
+        row["business_city"] = pick("business_city")
+        row["business_state_region"] = pick("business_state_region")
+        row["business_postal_code"] = pick("business_postal_code")
+        row["business_country"] = pick("business_country")
+
+        # OpenCorporates / company registry fields (if present)
+        row["oc_company_name"] = pick("oc_company_name")
+        row["oc_jurisdiction"] = pick("oc_jurisdiction")
+        row["oc_company_number"] = pick("oc_company_number")
+        row["oc_incorporation_date"] = pick("oc_incorporation_date")
+        row["oc_match_confidence"] = pick("oc_match_confidence")
+
+        # Overall/confidence + notes
+        row["overall_lead_confidence"] = pick("overall_lead_confidence")
+        row["enrichment_status"] = pick("enrichment_status")
+        row["enrichment_notes"] = pick("enrichment_notes")
+        row["source_platform"] = pick("source_platform")
+
+        # Multi-value JSON fields (phones/emails arrays)
+        all_phones = biz.get("all_phones")
+        generic_emails = biz.get("generic_emails")
+        person_emails = biz.get("person_emails")
+        catchall_emails = biz.get("catchall_emails")
+
+        if all_phones is not None:
+            row["all_phones_json"] = json.dumps(all_phones, ensure_ascii=False)
+        if generic_emails is not None:
+            row["generic_emails_json"] = json.dumps(generic_emails, ensure_ascii=False)
+        if person_emails is not None:
+            row["person_emails_json"] = json.dumps(person_emails, ensure_ascii=False)
+        if catchall_emails is not None:
+            row["catchall_emails_json"] = json.dumps(catchall_emails, ensure_ascii=False)
+
+        enriched_rows.append(row)
+
+    out_df = pd.DataFrame(enriched_rows)
+    logger.info("  Finished merging enrichment results into %d rows", len(out_df))
+    return out_df
 
 
 def _compute_confidence(row: Dict[str, Any]) -> str:
@@ -251,29 +409,9 @@ def run_pipeline(
         conf_counts[conf] = conf_counts.get(conf, 0) + 1
     logger.info(f"  Confidence breakdown: {conf_counts}")
     logger.info("="*60)
-    # Merge back to rows
-    logger.info("Step 6: Merging enrichment results back to rows...")
-    # Create enrichment columns
-    enrichment_cols = [
-        'company_domain', 'domain_confidence',
-        'primary_phone', 'primary_phone_display', 'primary_phone_source', 'primary_phone_confidence',
-        'primary_email', 'primary_email_type', 'primary_email_source', 'primary_email_confidence',
-        'business_address', 'business_city', 'business_state_region', 'business_postal_code', 'business_country',
-        'oc_company_name', 'oc_jurisdiction', 'oc_company_number', 'oc_incorporation_date', 'oc_match_confidence',
-        'overall_lead_confidence', 'enrichment_status', 'enrichment_notes',
-        'all_phones_json', 'generic_emails_json', 'person_emails_json', 'catchall_emails_json'
-    ]
-    # Initialize enrichment columns
-    for col in enrichment_cols:
-        df[col] = None
-    # Merge enrichment data for business rows
-    for idx, row in df[business_mask].iterrows():
-        normalized_key = row['company_normalized_key']
-        if normalized_key in enrichment_results:
-            result = enrichment_results[normalized_key]
-            for col in enrichment_cols:
-                if col in result:
-                    df.at[idx, col] = result[col]
+
+    # Merge back to rows using robust matching function
+    df = merge_enrichment_back_to_rows(df, enrichment_results)
     # Map source columns from input
     if 'url' in df.columns:
         df['source_review_url'] = df['url']
