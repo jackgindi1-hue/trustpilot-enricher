@@ -167,10 +167,30 @@ def write_output_csv(df: pd.DataFrame, filepath: str, column_order: List[str] = 
     logger.info(f"Final columns: {list(df.columns)}")
     logger.info(f"Total rows to write: {len(df)}")
 
-    # 🚨 THE FIX: write EVERYTHING, no column whitelist
+    # ============================================================
+    # FINAL OUTPUT FILTER: KEEP BUSINESSES ONLY (DO NOT DROP COLUMN)
+    # ============================================================
+    if "name_classification" in df.columns:
+        before_count = len(df)
+        df = df[df["name_classification"].astype(str).str.lower() == "business"].copy()
+        after_count = len(df)
+
+        logger.info(
+            f"Final output filter applied: businesses only "
+            f"({after_count}/{before_count} rows retained)"
+        )
+    else:
+        logger.warning(
+            "name_classification column not found — exporting full dataset"
+        )
+    # ============================================================
+    # END FINAL OUTPUT FILTER
+    # ============================================================
+
     df.to_csv(filepath, index=False)
 
     logger.info(f"Successfully wrote {len(df)} rows to {filepath}")
+
 
 def get_output_schema() -> List[str]:
     """
