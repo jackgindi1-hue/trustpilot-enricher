@@ -62,6 +62,8 @@ def _get(res, *keys, default=None):
         else:
             cur = getattr(cur, k, None)
     return default if cur is None else cur
+
+
 def merge_enrichment_back_to_rows(df: pd.DataFrame, enriched_businesses: list) -> pd.DataFrame:
     """
     PATCH: Robust merge-back function
@@ -180,22 +182,6 @@ def merge_enrichment_back_to_rows(df: pd.DataFrame, enriched_businesses: list) -
     return out
 
 
-
-
-        'email_source': enriched_data.get('email_source'),
-        'emails': enriched_data.get('emails', []),
-    }
-
-    # Merge results and apply priority rules
-    logger.debug(f"  -> Merging results for {company_name}")
-    final_result = merge_enrichment_results(enrichment_data)
-
-    # Save to cache
-    cache.set(normalized_key, final_result)
-    logger.info(f"  -> Completed enrichment for {company_name} (confidence: {final_result.get('overall_lead_confidence')})")
-    return final_result
-
-
 def _compute_confidence(row: Dict[str, Any]) -> str:
     """Compute overall confidence based on phone and email presence."""
     has_phone = bool(row.get("primary_phone"))
@@ -294,8 +280,6 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
 
     row["confidence"] = _compute_confidence(row)
     return row
-
-
 def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
     """
     Enrich a single business through all sources
@@ -320,206 +304,51 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
     # Use the simplified enrichment function
     enriched_data = enrich_single_business(company_name, region=region)
 
-    # Build enrichment data structure for merge_results
-    enrichment_data = {
-        'company_search_name': company_name,
-        'company_normalized_key': normalized_key,
-        'local_enrichment': {
-            'phone': enriched_data.get('phone'),
-            'phone_source': enriched_data.get('phone_source'),
-            'address': enriched_data.get('address'),
-            'city': enriched_data.get('city'),
-            'state_region': enriched_data.get('state_region'),
-            'postal_code': enriched_data.get('postal_code'),
-            'country': enriched_data.get('country'),
-            'website': enriched_data.get('website'),
-        },
-        'company_domain': enriched_data.get('domain'),
-        'domain_confidence': 'high' if enriched_data.get('domain') else 'none',
-        'primary_phone': enriched_data.get('primary_phone'),
-        'primary_phone_source': enriched_data.get('phone_source'),
-        'primary_phone_confidence': enriched_data.get('phone_confidence'),
-        'all_phones_json': enriched_data.get('all_phones_json'),
-        'primary_email': enriched_data.get('primary_email'),
-        'email_source': enriched_data.get('email_source'),
-        'emails': enriched_data.get('emails', []),
-    }
+    # --- BUILD ENRICHED ROW (DO NOT CHANGE INDENTATION) ---
+    enriched_row = {
+        # identity / keys
+        "company_normalized_key": enriched_data.get("company_normalized_key", normalized_key),
+        "company_search_name": enriched_data.get("company_search_name", company_name),
+        "company_domain": enriched_data.get("company_domain") or enriched_data.get("domain"),
+        "domain_confidence": enriched_data.get("domain_confidence", "high" if enriched_data.get("domain") else "none"),
 
-    # Merge results and apply priority rules
-    logger.debug(f"  -> Merging results for {company_name}")
-    final_result = merge_enrichment_results(enrichment_data)
+        # primary phone
+        "primary_phone": enriched_data.get("primary_phone"),
+        "primary_phone_display": enriched_data.get("primary_phone"),
+        "primary_phone_source": enriched_data.get("primary_phone_source") or enriched_data.get("phone_source"),
+        "primary_phone_confidence": enriched_data.get("primary_phone_confidence") or enriched_data.get("phone_confidence"),
+
+        # primary email
+        "primary_email": enriched_data.get("primary_email"),
+        "primary_email_type": enriched_data.get("primary_email_type", "generic"),
+        "primary_email_source": enriched_data.get("primary_email_source") or enriched_data.get("email_source"),
+        "primary_email_confidence": enriched_data.get("primary_email_confidence", "medium" if enriched_data.get("primary_email") else "none"),
+
+        # address
+        "business_address": enriched_data.get("business_address") or enriched_data.get("address"),
+        "business_city": enriched_data.get("business_city") or enriched_data.get("city"),
+        "business_state_region": enriched_data.get("business_state_region") or enriched_data.get("state_region"),
+        "business_postal_code": enriched_data.get("business_postal_code") or enriched_data.get("postal_code"),
+        "business_country": enriched_data.get("business_country") or enriched_data.get("country"),
+
+        # metadata
+        "overall_lead_confidence": enriched_data.get("overall_lead_confidence", enriched_data.get("confidence", "medium")),
+        "enrichment_status": enriched_data.get("enrichment_status", "success"),
+        "enrichment_notes": enriched_data.get("enrichment_notes", ""),
+
+        # debug payloads
+        "all_phones_json": enriched_data.get("all_phones_json"),
+        "generic_emails_json": enriched_data.get("generic_emails_json"),
+        "person_emails_json": enriched_data.get("person_emails_json"),
+        "catchall_emails_json": enriched_data.get("catchall_emails_json"),
+        "source_platform": "trustpilot",
+    }
+    # --- END BUILD ENRICHED ROW ---
 
     # Save to cache
-    cache.set(normalized_key, final_result)
-    logger.info(f"  -> Completed enrichment for {company_name} (confidence: {final_result.get('overall_lead_confidence')})")
-    return final_result
-
-
-
-
-
-
-def _compute_confidence(row: Dict[str, Any]) -> str:
-    """Compute overall confidence based on phone and email presence."""
-    has_phone = bool(row.get("primary_phone"))
-    has_email = bool(row.get("primary_email"))
-    if has_phone and has_email:
-        return "high"
-    if has_phone or has_email:
-        return "medium"
-    return "failed"
-
-
-def enrich_single_business(name: str, region: str | None = None) -> Dict[str, Any]:
-    """
-    PHASE 2: Enhanced enrichment function with phone waterfall.
-
-    Flow:
-    1. Google Places for address/website (phone extracted but not used directly)
-    2. Extract domain from website
-    3. Phone waterfall (Google → Yelp → Website → Apollo) with validation
-    4. Email enrichment (Hunter only)
-    5. Compute overall confidence
-
-    Args:
-        name: Business name
-        region: Optional region/location
-
-    Returns:
-        Dict with enriched business data including validated phone
-    """
-    logger.info("Enriching business: %s", name)
-
-    row = {
-        "business_name": name,
-        "primary_phone": None,
-        "phone": None,
-        "primary_email": None,
-        "email": None,
-        "emails": [],
-        "email_source": None,
-        "website": None,
-        "domain": None,
-        "address": None,
-        "city": None,
-        "state_region": None,
-        "postal_code": None,
-        "country": None,
-    }
-
-    # ---- LOCAL (Google Places only)
-    local = local_enrichment.enrich_local_business(name, region)
-
-    # Store address/location data
-    if local:
-        for f in ["address", "city", "state_region", "postal_code", "country"]:
-            if local.get(f):
-                row[f] = local[f]
-
-        if local.get("website"):
-            row["website"] = local["website"]
-
-    # ---- DOMAIN EXTRACT
-    website = row.get("website")
-    if website:
-        try:
-            parsed = urlparse(website)
-            host = parsed.netloc or parsed.path
-            if host.startswith("www."):
-                host = host[4:]
-            row["domain"] = host.lower()
-        except Exception:
-            row["domain"] = None
-
-    domain = row.get("domain")
-
-    # ---- PHONE WATERFALL (Google → Yelp → Website → Apollo)
-    phone_layer = enrich_business_phone_waterfall(
-        biz_name=name,
-        google_hit=local or {},
-        domain=domain
-    )
-
-    # Map phone results
-    row["primary_phone"] = phone_layer.get("primary_phone")
-    row["phone"] = phone_layer.get("primary_phone")
-    row["phone_source"] = phone_layer.get("primary_phone_source")
-    row["phone_confidence"] = phone_layer.get("primary_phone_confidence")
-    row["all_phones_json"] = phone_layer.get("all_phones_json")
-
-    # ---- EMAIL ENRICHMENT (Hunter only)
-    email_data = enrich_emails_for_domain(domain)
-    if email_data.get("primary_email"):
-        row["primary_email"] = email_data["primary_email"]
-        row["email"] = email_data["primary_email"]
-        row["emails"] = email_data.get("emails") or []
-        row["email_source"] = email_data.get("email_source")
-
-    row["confidence"] = _compute_confidence(row)
-    return row
-
-
-def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
-    """
-    Enrich a single business through all sources
-    Args:
-        business_info: Business information dict
-        cache: Enrichment cache
-    Returns:
-        Complete enrichment result
-    """
-    normalized_key = business_info['company_normalized_key']
-    company_name = business_info['company_search_name']
-
-    # Check cache
-    if cache.has(normalized_key):
-        logger.info(f"  -> Using cached result for {company_name}")
-        return cache.get(normalized_key)
-
-    # Get enrichment context
-    context = get_enrichment_context(business_info)
-    region = context.get('state') or context.get('region')
-
-    # Use the simplified enrichment function
-    enriched_data = enrich_single_business(company_name, region=region)
-
-    # Build enrichment data structure for merge_results
-    enrichment_data = {
-        'company_search_name': company_name,
-        'company_normalized_key': normalized_key,
-        'local_enrichment': {
-            'phone': enriched_data.get('phone'),
-            'phone_source': enriched_data.get('phone_source'),
-            'address': enriched_data.get('address'),
-            'city': enriched_data.get('city'),
-            'state_region': enriched_data.get('state_region'),
-            'postal_code': enriched_data.get('postal_code'),
-            'country': enriched_data.get('country'),
-            'website': enriched_data.get('website'),
-        },
-        'company_domain': enriched_data.get('domain'),
-        'domain_confidence': 'high' if enriched_data.get('domain') else 'none',
-        'primary_phone': enriched_data.get('primary_phone'),
-        'primary_phone_source': enriched_data.get('phone_source'),
-        'primary_phone_confidence': enriched_data.get('phone_confidence'),
-        'all_phones_json': enriched_data.get('all_phones_json'),
-        'primary_email': enriched_data.get('primary_email'),
-        'email_source': enriched_data.get('email_source'),
-        'emails': enriched_data.get('emails', []),
-    }
-
-    # Merge results and apply priority rules
-    logger.debug(f"  -> Merging results for {company_name}")
-    final_result = merge_enrichment_results(enrichment_data)
-
-    # Save to cache
-    cache.set(normalized_key, final_result)
-    logger.info(f"  -> Completed enrichment for {company_name} (confidence: {final_result.get('overall_lead_confidence')})")
-    return final_result
-
-
-
-
+    cache.set(normalized_key, enriched_row)
+    logger.info(f"  -> Completed enrichment for {company_name} (confidence: {enriched_row.get('overall_lead_confidence')})}")
+    return enriched_row
 def run_pipeline(
     input_csv_path: str,
     output_csv_path: str,
@@ -616,6 +445,7 @@ def run_pipeline(
     logger.info("="*60)
 
     # Merge back to rows using robust matching function
+    # Convert dict values to list for new merge function signature
     df = merge_enrichment_back_to_rows(df, list(enrichment_results.values()))
     # Map source columns from input
     if 'url' in df.columns:
