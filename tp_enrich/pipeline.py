@@ -347,7 +347,7 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
 
     # Save to cache
     cache.set(normalized_key, enriched_row)
-    logger.info(f"  -> Completed enrichment for {company_name} (confidence: {enriched_row.get('overall_lead_confidence')})}")
+    logger.info(f"  -> Completed enrichment for {company_name} (confidence: {enriched_row.get('overall_lead_confidence')})")
     return enriched_row
 def run_pipeline(
     input_csv_path: str,
