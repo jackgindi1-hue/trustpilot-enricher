@@ -280,30 +280,25 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     email_result = run_email_waterfall(domain, logger=logger, company_name=name)
 
     # Always log one line proving what happened (super useful for debugging credits)
-    try:
-        logger.info(
-            "   -> Email providers attempted: "
-            + ", ".join([f"{a.get('provider')}({'ok' if a.get('ok') else 'fail'})" for a in (email_result.get('provider_debug') or [])])
-        )
-    except Exception:
-        pass
+    # Use self-proving fields from run_email_waterfall (these CANNOT be blank)
+    logger.info(f"   -> Email providers attempted: {email_result.get('email_waterfall_tried')}")
+    logger.info(f"   -> Email waterfall tracking: tried={email_result.get('email_waterfall_tried')} winner={email_result.get('email_waterfall_winner')}")
 
     primary_email = email_result.get("primary_email")
     primary_email_source = email_result.get("primary_email_source")
     primary_email_confidence = email_result.get("primary_email_confidence")
 
     logger.info(f"   -> Email enrichment complete: primary_email={primary_email} source={primary_email_source} confidence={primary_email_confidence}")
-    logger.info(f"   -> Email waterfall tracking: tried={email_result.get('email_providers_tried')} winner={email_result.get('email_waterfall_winner')}")
 
     # Make sure you store these into row so they get returned
     row["primary_email"] = primary_email
     row["primary_email_source"] = primary_email_source
     row["primary_email_confidence"] = primary_email_confidence
 
-    # PHASE 1 PROOF: Store waterfall tracking fields
-    row["email_providers_tried"] = email_result.get("email_providers_tried", "")
-    row["email_provider_errors_json"] = email_result.get("email_provider_errors_json", "{}")
+    # SELF-PROVING WATERFALL TRACKING: These fields come directly from run_email_waterfall
+    row["email_waterfall_tried"] = email_result.get("email_waterfall_tried", "")
     row["email_waterfall_winner"] = email_result.get("email_waterfall_winner")
+    row["provider_status_json"] = email_result.get("provider_status_json", "{}")
 
     # CRITICAL: Ensure primary_email_source is correctly mapped
     # CSV writer expects: primary_email_source (NOT email_source)
