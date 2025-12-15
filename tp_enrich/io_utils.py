@@ -236,5 +236,8 @@ def get_output_schema() -> List[str]:
         'all_phones_json',
         'generic_emails_json',
         'person_emails_json',
-        'catchall_emails_json'
+        'catchall_emails_json',
+        'email_providers_tried',
+        'email_provider_errors_json',
+        'email_waterfall_winner'
     ]

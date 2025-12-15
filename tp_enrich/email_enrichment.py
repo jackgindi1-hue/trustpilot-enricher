@@ -108,13 +108,16 @@ def _fullenrich_domain_search(domain: str) -> Tuple[Optional[str], Dict[str, Any
     except Exception as e:
         return None, {"ok": False, "provider": "fullenrich", "error": repr(e)}
 
-def run_email_waterfall(domain: Optional[str], logger=None) -> Dict[str, Any]:
+def run_email_waterfall(domain: Optional[str], logger=None, company_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Returns a stable shape that pipeline can always merge:
     - primary_email
     - primary_email_source
     - primary_email_confidence
     - provider_debug (list of provider attempt summaries)
+    - email_providers_tried (string: "hunter -> snov -> apollo")
+    - email_provider_errors_json (json string with errors)
+    - email_waterfall_winner (string: which provider won)
     """
     d = _norm_domain(domain)
     out: Dict[str, Any] = {
@@ -122,44 +125,101 @@ def run_email_waterfall(domain: Optional[str], logger=None) -> Dict[str, Any]:
         "primary_email_source": None,
         "primary_email_confidence": None,
         "provider_debug": [],
+        "email_providers_tried": "",
+        "email_provider_errors_json": "{}",
+        "email_waterfall_winner": None,
     }
 
     if not d or d in SKIP_EMAIL_DOMAINS:
         out["provider_debug"].append({"provider": "skip", "domain": d, "reason": "missing_or_low_value_domain"})
+        out["email_providers_tried"] = "skip"
+        out["email_provider_errors_json"] = json.dumps({"skip": "missing_or_low_value_domain"})
         return out
+
+    # Track attempts and errors
+    attempts = []
+    tried = []
+    errors = {}
+
+    # Helper to record attempt
+    def _record(provider: str, meta: Dict[str, Any], email: Optional[str]):
+        tried.append(provider)
+        attempts.append(meta)
+        if not meta.get("ok") and meta.get("error"):
+            errors[provider] = meta.get("error")
+        return email
 
     # Hunter → Snov → Apollo → FullEnrich (your desired waterfall)
-    attempts = []
+    # 1) HUNTER (optional skip via env var)
+    if os.getenv("DISABLE_HUNTER_EMAIL", "").strip() == "1":
+        tried.append("hunter")
+        errors["hunter"] = "SKIPPED_BY_ENV(DISABLE_HUNTER_EMAIL=1)"
+        attempts.append({"ok": False, "provider": "hunter", "error": "SKIPPED_BY_ENV"})
+    else:
+        email, meta = _hunter_domain_search(d)
+        _record("hunter", meta, email)
+        if email:
+            out.update({
+                "primary_email": email,
+                "primary_email_source": "hunter",
+                "primary_email_confidence": "medium",
+                "provider_debug": attempts,
+                "email_providers_tried": " -> ".join(tried),
+                "email_provider_errors_json": json.dumps(errors),
+                "email_waterfall_winner": "hunter",
+            })
+            return out
 
-    email, meta = _hunter_domain_search(d)
-    attempts.append(meta)
-    if email:
-        out.update({"primary_email": email, "primary_email_source": "hunter", "primary_email_confidence": "medium"})
-        out["provider_debug"] = attempts
-        return out
-
+    # 2) SNOV
     email, meta = _snov_domain_search(d)
-    attempts.append(meta)
+    _record("snov", meta, email)
     if email:
-        out.update({"primary_email": email, "primary_email_source": "snov", "primary_email_confidence": "medium"})
-        out["provider_debug"] = attempts
+        out.update({
+            "primary_email": email,
+            "primary_email_source": "snov",
+            "primary_email_confidence": "medium",
+            "provider_debug": attempts,
+            "email_providers_tried": " -> ".join(tried),
+            "email_provider_errors_json": json.dumps(errors),
+            "email_waterfall_winner": "snov",
+        })
         return out
 
+    # 3) APOLLO
     email, meta = _apollo_org_search(d)
-    attempts.append(meta)
+    _record("apollo", meta, email)
     if email:
-        out.update({"primary_email": email, "primary_email_source": "apollo", "primary_email_confidence": "low"})
-        out["provider_debug"] = attempts
+        out.update({
+            "primary_email": email,
+            "primary_email_source": "apollo",
+            "primary_email_confidence": "low",
+            "provider_debug": attempts,
+            "email_providers_tried": " -> ".join(tried),
+            "email_provider_errors_json": json.dumps(errors),
+            "email_waterfall_winner": "apollo",
+        })
         return out
 
+    # 4) FULLENRICH
     email, meta = _fullenrich_domain_search(d)
-    attempts.append(meta)
+    _record("fullenrich", meta, email)
     if email:
-        out.update({"primary_email": email, "primary_email_source": "fullenrich", "primary_email_confidence": "low"})
-        out["provider_debug"] = attempts
+        out.update({
+            "primary_email": email,
+            "primary_email_source": "fullenrich",
+            "primary_email_confidence": "low",
+            "provider_debug": attempts,
+            "email_providers_tried": " -> ".join(tried),
+            "email_provider_errors_json": json.dumps(errors),
+            "email_waterfall_winner": "fullenrich",
+        })
         return out
 
+    # Nobody found an email
     out["provider_debug"] = attempts
+    out["email_providers_tried"] = " -> ".join(tried)
+    out["email_provider_errors_json"] = json.dumps(errors)
+    out["email_waterfall_winner"] = None
     return out
 
 
@@ -196,6 +256,14 @@ def _finalize_email_result(result: dict) -> dict:
         if k not in result or result[k] is None:
             result[k] = "[]"
 
+    # Ensure tracking fields are present
+    if "email_providers_tried" not in result or result["email_providers_tried"] is None:
+        result["email_providers_tried"] = ""
+    if "email_provider_errors_json" not in result or result["email_provider_errors_json"] is None:
+        result["email_provider_errors_json"] = "{}"
+    if "email_waterfall_winner" not in result or result["email_waterfall_winner"] is None:
+        result["email_waterfall_winner"] = result.get("primary_email_source")
+
     return result
 
 
@@ -203,7 +271,7 @@ def _finalize_email_result(result: dict) -> dict:
 # BACKWARDS COMPATIBILITY WRAPPER
 # ============================================================
 
-def enrich_emails_for_domain(domain: str, logger=None) -> dict:
+def enrich_emails_for_domain(domain: str, logger=None, company_name: str = None) -> dict:
     """
     Backwards-compatible wrapper so existing pipeline imports keep working.
 
@@ -214,9 +282,12 @@ def enrich_emails_for_domain(domain: str, logger=None) -> dict:
       - generic_emails_json
       - person_emails_json
       - catchall_emails_json
+      - email_providers_tried (NEW)
+      - email_provider_errors_json (NEW)
+      - email_waterfall_winner (NEW)
     """
     # run_email_waterfall is the new implementation
-    result = run_email_waterfall(domain, logger=logger)
+    result = run_email_waterfall(domain, logger=logger, company_name=company_name)
 
     primary_email = result.get("primary_email")
     primary_email_source = result.get("primary_email_source")
@@ -234,6 +305,10 @@ def enrich_emails_for_domain(domain: str, logger=None) -> dict:
         "generic_emails_json": generic_emails_json,
         "person_emails_json": None,
         "catchall_emails_json": None,
+        # NEW tracking fields
+        "email_providers_tried": result.get("email_providers_tried", ""),
+        "email_provider_errors_json": result.get("email_provider_errors_json", "{}"),
+        "email_waterfall_winner": result.get("email_waterfall_winner"),
     }
 
     # Finalize and return
