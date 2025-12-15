@@ -164,6 +164,42 @@ def run_email_waterfall(domain: Optional[str], logger=None) -> Dict[str, Any]:
 
 
 # ============================================================
+# RESULT FINALIZATION HELPER
+# ============================================================
+
+def _finalize_email_result(result: dict) -> dict:
+    """
+    Ensures email result has all required fields populated correctly.
+
+    Critical fixes:
+    - If email exists but source is blank/None/NaN, set to "unknown"
+    - Copy email_source to primary_email_source if needed
+    - Ensure JSON fields never return None
+    """
+    email = result.get("primary_email")
+    source = result.get("primary_email_source")
+
+    # If we have an email but no source, mark it explicitly
+    if email and (source is None or str(source).strip() == "" or str(source).lower() == "nan"):
+        # Prefer explicit provider if present
+        if result.get("email_source"):
+            result["primary_email_source"] = result["email_source"]
+        else:
+            result["primary_email_source"] = "unknown"
+
+    # Ensure JSON fields never return None
+    for k in [
+        "generic_emails_json",
+        "person_emails_json",
+        "catchall_emails_json"
+    ]:
+        if k not in result or result[k] is None:
+            result[k] = "[]"
+
+    return result
+
+
+# ============================================================
 # BACKWARDS COMPATIBILITY WRAPPER
 # ============================================================
 
@@ -191,7 +227,7 @@ def enrich_emails_for_domain(domain: str, logger=None) -> dict:
     # Put everything in generic_emails_json for now (so you can see attempts/results)
     generic_emails_json = json.dumps(provider_debug)
 
-    return {
+    email_result = {
         "primary_email": primary_email,
         "primary_email_source": primary_email_source,
         "primary_email_confidence": primary_email_confidence,
@@ -199,6 +235,9 @@ def enrich_emails_for_domain(domain: str, logger=None) -> dict:
         "person_emails_json": None,
         "catchall_emails_json": None,
     }
+
+    # Finalize and return
+    return _finalize_email_result(email_result)
 
 # Some codebases used this older name; alias it too just in case.
 enrich_email_for_domain = enrich_emails_for_domain

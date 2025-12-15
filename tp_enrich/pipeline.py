@@ -298,6 +298,12 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     row["primary_email"] = primary_email
     row["primary_email_source"] = primary_email_source
     row["primary_email_confidence"] = primary_email_confidence
+
+    # CRITICAL: Ensure primary_email_source is correctly mapped
+    # CSV writer expects: primary_email_source (NOT email_source)
+    if row.get("email_source") and not row.get("primary_email_source"):
+        row["primary_email_source"] = row["email_source"]
+
     # ============================================================
     # END EMAIL WATERFALL
     # ============================================================
@@ -345,8 +351,8 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
         # primary email
         "primary_email": enriched_data.get("primary_email"),
         "primary_email_type": "generic",
-        "primary_email_source": enriched_data.get("email_source"),
-        "primary_email_confidence": "medium" if enriched_data.get("primary_email") else "none",
+        "primary_email_source": enriched_data.get("primary_email_source") or enriched_data.get("email_source"),
+        "primary_email_confidence": enriched_data.get("primary_email_confidence") or ("medium" if enriched_data.get("primary_email") else "none"),
 
         # address
         "business_address": enriched_data.get("address"),
