@@ -139,57 +139,75 @@ def load_input_csv(filepath: str) -> pd.DataFrame:
     return df
 
 
-def write_output_csv(df: pd.DataFrame, filepath: str, column_order: List[str] = None) -> None:
+def write_output_csv(df, output_path: str):
     """
-    Write the enriched DataFrame to CSV.
-
-    IMPORTANT:
-    - We DO NOT filter columns here.
-    - We write EVERY COLUMN currently on the DataFrame.
-      That includes:
-        - consumer.displayName / DATE (original Trustpilot data)
-        - business_phone
-        - business_email
-        - business_address
-        - business_city
-        - business_state_region
-        - business_postal_code
-        - business_country
-        - business_website
-        - and any future enrichment fields.
-
-    Args:
-        df: DataFrame to write
-        filepath: Output file path
-        column_order: DEPRECATED - ignored, all columns are written
+    Write enriched CSV reliably.
+    - Never silently drops enrichment columns
+    - Ensures expected enrichment columns exist (creates them if missing)
+    - Writes expected columns first, then any extra columns that may exist
     """
-    logger.info(f"Writing output CSV to: {filepath}")
-    logger.info(f"Final columns: {list(df.columns)}")
-    logger.info(f"Total rows to write: {len(df)}")
+    # The columns your pipeline is designed to produce (based on prior runs/logs)
+    expected_cols = [
+        "consumer.displayname",
+        "date",
+        "raw_display_name",
+        "review_date",
+        "row_id",
+        "name_classification",
+        "company_search_name",
+        "company_normalized_key",
+        "company_domain",
+        "domain_confidence",
+        "primary_phone",
+        "primary_phone_display",
+        "primary_phone_source",
+        "primary_phone_confidence",
+        "primary_email",
+        "primary_email_type",
+        "primary_email_source",
+        "primary_email_confidence",
+        "business_address",
+        "business_city",
+        "business_state_region",
+        "business_postal_code",
+        "business_country",
+        "oc_company_name",
+        "oc_jurisdiction",
+        "oc_company_number",
+        "oc_incorporation_date",
+        "oc_match_confidence",
+        "overall_lead_confidence",
+        "enrichment_status",
+        "enrichment_notes",
+        "all_phones_json",
+        "generic_emails_json",
+        "person_emails_json",
+        "catchall_emails_json",
+        "source_platform",
+    ]
 
-    # ============================================================
-    # FINAL OUTPUT FILTER: KEEP BUSINESSES ONLY (DO NOT DROP COLUMN)
-    # ============================================================
-    if "name_classification" in df.columns:
-        before_count = len(df)
-        df = df[df["name_classification"].astype(str).str.lower() == "business"].copy()
-        after_count = len(df)
+    # Make sure all expected columns exist (so they can be exported)
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = None
 
-        logger.info(
-            f"Final output filter applied: businesses only "
-            f"({after_count}/{before_count} rows retained)"
-        )
-    else:
-        logger.warning(
-            "name_classification column not found — exporting full dataset"
-        )
-    # ============================================================
-    # END FINAL OUTPUT FILTER
-    # ============================================================
+    # Order: expected first, then anything else your df contains
+    extras = [c for c in df.columns.tolist() if c not in expected_cols]
+    final_cols = expected_cols + extras
 
-    df.to_csv(filepath, index=False)
+    # Quick sanity logging
+    try:
+        phones = int(df["primary_phone"].notna().sum())
+        emails = int(df["primary_email"].notna().sum())
+        logger.info(f"Export sanity: rows={len(df)} phones_nonnull={phones} emails_nonnull={emails}")
+    except Exception:
+        logger.info(f"Export sanity: rows={len(df)} (could not compute phone/email nonnull counts)")
 
-    logger.info(f"Successfully wrote {len(df)} rows to {filepath}")
+    logger.info(f"Writing output CSV to: {output_path}")
+    logger.info(f"Final columns: {final_cols}")
+
+    df.to_csv(output_path, index=False, columns=final_cols)
+    logger.info(f"Successfully wrote {len(df)} rows to {output_path}")
 
 
 def get_output_schema() -> List[str]:
