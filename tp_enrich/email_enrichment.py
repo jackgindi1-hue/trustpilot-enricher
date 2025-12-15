@@ -273,3 +273,77 @@ def enrich_emails_for_domain(domain: str, company_name: Optional[str] = None, lo
         return out
 
     return out
+
+
+# ============================================================
+# HOTFIX: restore missing run_email_waterfall symbol
+# ============================================================
+
+def run_email_waterfall(
+    domain: Optional[str],
+    company_name: Optional[str] = None,
+    logger: Any = None,
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Compatibility wrapper.
+
+    pipeline.py expects: from .email_enrichment import run_email_waterfall
+    Some recent edits renamed the function, causing ImportError and blank email columns.
+
+    This wrapper calls the existing implementation if present, otherwise returns
+    a safe empty result (no crash).
+    """
+
+    if not domain:
+        return {
+            "primary_email": None,
+            "primary_email_type": None,
+            "primary_email_source": None,
+            "primary_email_confidence": None,
+            "generic_emails_json": "[]",
+            "person_emails_json": "[]",
+            "catchall_emails_json": "[]",
+        }
+
+    # Try common function names that may already exist in this file
+    candidates = [
+        "enrich_emails_for_domain",
+        "email_waterfall",
+        "run_waterfall",
+        "enrich_domain_emails",
+    ]
+
+    for fn_name in candidates:
+        fn = globals().get(fn_name)
+        if callable(fn):
+            try:
+                # Call with flexible signature
+                try:
+                    return fn(domain=domain, company_name=company_name, logger=logger, **kwargs)
+                except TypeError:
+                    try:
+                        return fn(domain, company_name, logger, **kwargs)
+                    except TypeError:
+                        return fn(domain)
+            except Exception as e:
+                if logger:
+                    logger.warning(f"run_email_waterfall wrapper: {fn_name} failed for {domain}: {e}")
+                # continue to next candidate
+
+    # No implementation found (prevents crashes; yields blank email)
+    if logger:
+        logger.warning("run_email_waterfall wrapper: no underlying implementation found; returning empty email result")
+    return {
+        "primary_email": None,
+        "primary_email_type": None,
+        "primary_email_source": None,
+        "primary_email_confidence": None,
+        "generic_emails_json": "[]",
+        "person_emails_json": "[]",
+        "catchall_emails_json": "[]",
+    }
+
+# ============================================================
+# END HOTFIX
+# ============================================================
