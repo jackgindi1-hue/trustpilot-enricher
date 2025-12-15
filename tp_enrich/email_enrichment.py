@@ -1,322 +1,275 @@
+# tp_enrich/email_enrichment.py
 import os
-import re
+import time
 import json
 import requests
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Any, Optional, List, Tuple
 
-# domains where "email by domain" is usually garbage / not meaningful
-SKIP_EMAIL_DOMAINS = {
-    "facebook.com", "www.facebook.com",
-    "instagram.com", "www.instagram.com",
-    "linkedin.com", "www.linkedin.com",
-    "yelp.com", "www.yelp.com",
-    "maps.google.com", "google.com",
-    "tiktok.com", "www.tiktok.com",
-    "x.com", "twitter.com", "www.twitter.com",
-}
+# NOTE:
+# - Apollo requires X-Api-Key header (your logs show INVALID_API_KEY when not using header).
+# - Snov Domain Search API is v2 task-based (start -> result/{task_hash}); old get-domain-emails-with-info returns 404 now.
+#   https://api.snov.io/v2/domain-search/domain-emails/start?domain=...
+#   https://api.snov.io/v2/domain-search/domain-emails/result/{task_hash}
+#
+# This module exposes: enrich_emails_for_domain(domain, company_name=None, logger=None)
 
-def _norm_domain(domain: Optional[str]) -> Optional[str]:
+def _is_bad_domain(domain: str) -> bool:
     if not domain:
-        return None
-    d = str(domain).strip().lower()
-    d = re.sub(r"^https?://", "", d)
-    d = d.split("/")[0]
-    d = d.replace("www.", "")
-    return d or None
+        return True
+    d = domain.strip().lower()
+    # Skip social / link hubs / non-company domains
+    bad = (
+        d.endswith("facebook.com")
+        or d.endswith("instagram.com")
+        or d.endswith("linkedin.com")
+        or d.endswith("twitter.com")
+        or d.endswith("x.com")
+        or d.endswith("yelp.com")
+        or d.endswith("tiktok.com")
+        or d.endswith("google.com")
+        or d.endswith("goo.gl")
+        or d.endswith("linktr.ee")
+    )
+    return bad
 
-def _pick_best_email(emails: list) -> Optional[str]:
-    # Simple, safe selection: prefer non-noreply, non-example, basic validity
+def _pick_primary_email(emails: List[str]) -> Optional[str]:
     if not emails:
         return None
-    def score(e: str) -> int:
-        e = (e or "").strip().lower()
-        if "@" not in e: return -999
-        if any(bad in e for bad in ["noreply", "no-reply", "donotreply", "example.com"]): return -50
-        if e.startswith("info@"): return 10
-        if e.startswith("support@"): return 9
-        if e.startswith("contact@"): return 8
-        return 5
-    emails = [e for e in emails if isinstance(e, str)]
-    emails = sorted(set([e.strip() for e in emails if e.strip()]), key=score, reverse=True)
-    return emails[0] if emails else None
+    # Prefer generic inboxes first (better for businesses)
+    preferred_prefixes = ["info@", "support@", "sales@", "hello@", "contact@", "office@", "admin@", "billing@"]
+    lowered = [e.strip() for e in emails if e and "@" in e]
+    lowered_unique = []
+    seen = set()
+    for e in lowered:
+        el = e.lower()
+        if el not in seen:
+            seen.add(el)
+            lowered_unique.append(e)
 
-def _hunter_domain_search(domain: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    key = os.getenv("HUNTER_API_KEY") or os.getenv("HUNTER_KEY")
-    if not key:
-        return None, {"ok": False, "provider": "hunter", "error": "missing_api_key"}
+    for pref in preferred_prefixes:
+        for e in lowered_unique:
+            if e.lower().startswith(pref):
+                return e
+    # Otherwise first email
+    return lowered_unique[0] if lowered_unique else None
+
+# ---------------------------
+# HUNTER
+# ---------------------------
+def _hunter_domain_search(domain: str, logger=None) -> Tuple[Optional[str], Dict[str, Any]]:
+    api_key = os.getenv("HUNTER_API_KEY", "").strip()
+    if not api_key:
+        return None, {"ok": False, "error": "HUNTER_API_KEY missing"}
+    url = "https://api.hunter.io/v2/domain-search"
     try:
-        url = "https://api.hunter.io/v2/domain-search"
-        params = {"domain": domain, "api_key": key, "limit": 50}
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params={"domain": domain, "api_key": api_key}, timeout=20)
         if r.status_code != 200:
-            return None, {"ok": False, "provider": "hunter", "status": r.status_code, "body": r.text[:500]}
+            return None, {"ok": False, "status": r.status_code, "body": r.text[:500]}
         data = r.json() or {}
         emails = []
         for item in (data.get("data", {}).get("emails") or []):
-            val = item.get("value")
-            if val: emails.append(val)
-        best = _pick_best_email(emails)
-        return best, {"ok": True, "provider": "hunter", "count": len(emails)}
+            v = item.get("value")
+            if v:
+                emails.append(v)
+        primary = _pick_primary_email(emails)
+        return primary, {"ok": True, "emails": emails}
     except Exception as e:
-        return None, {"ok": False, "provider": "hunter", "error": repr(e)}
+        return None, {"ok": False, "error": repr(e)}
 
-def _apollo_org_search(domain: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    # IMPORTANT: Apollo requires X-Api-Key header (your logs literally say this)
-    key = os.getenv("APOLLO_API_KEY") or os.getenv("APOLLO_KEY")
-    if not key:
-        return None, {"ok": False, "provider": "apollo", "error": "missing_api_key"}
+# ---------------------------
+# APOLLO (FIXED: X-Api-Key header)
+# ---------------------------
+def _apollo_org_search(domain: str, logger=None) -> Tuple[Optional[str], Dict[str, Any]]:
+    api_key = os.getenv("APOLLO_API_KEY", "").strip()
+    if not api_key:
+        return None, {"ok": False, "error": "APOLLO_API_KEY missing"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Api-Key": api_key,   # IMPORTANT (your logs explicitly require this)
+    }
+
+    # Apollo v1 org search - we try to find an organization by domain.
+    # If your account/plan requires different endpoints, we'll see it in logs as non-200.
+    url = "https://api.apollo.io/v1/organizations/search"
+    payload = {"q_organization_domains": domain, "page": 1}
+
     try:
-        url = "https://api.apollo.io/v1/organizations/search"
-        headers = {"X-Api-Key": key, "Content-Type": "application/json"}
-        payload = {"q_organization_domains": domain, "page": 1}
         r = requests.post(url, headers=headers, json=payload, timeout=25)
         if r.status_code != 200:
-            return None, {"ok": False, "provider": "apollo", "status": r.status_code, "body": r.text[:500]}
+            return None, {"ok": False, "status": r.status_code, "body": r.text[:800]}
         data = r.json() or {}
-        # Apollo org search often doesn't return emails directly; but sometimes includes "email" fields in org/person results.
-        # We safely scan for any obvious email strings in the response.
-        blob = json.dumps(data)
-        found = sorted(set(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", blob, flags=re.I)))
-        best = _pick_best_email(found)
-        return best, {"ok": True, "provider": "apollo", "count": len(found)}
-    except Exception as e:
-        return None, {"ok": False, "provider": "apollo", "error": repr(e)}
+        orgs = data.get("organizations") or data.get("organizations", [])
+        # Apollo doesn't reliably return public emails at org level.
+        # We treat Apollo as a fallback for "generic email" if present in response fields.
+        found = []
 
-def _snov_domain_search(domain: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    # Your logs show 404 on get-domain-emails-with-info endpoints.
-    # So we DO NOT hard-fail the pipeline; we just report the failure cleanly.
-    client_id = os.getenv("SNOV_CLIENT_ID")
-    client_secret = os.getenv("SNOV_CLIENT_SECRET")
+        # Some responses may include fields like: "email", "emails", "public_email"
+        for o in (orgs or []):
+            for key in ["email", "public_email"]:
+                v = o.get(key)
+                if isinstance(v, str) and "@" in v:
+                    found.append(v)
+            v2 = o.get("emails")
+            if isinstance(v2, list):
+                for e in v2:
+                    if isinstance(e, str) and "@" in e:
+                        found.append(e)
+
+        primary = _pick_primary_email(found)
+        return primary, {"ok": True, "emails": found, "organizations_found": len(orgs or [])}
+    except Exception as e:
+        return None, {"ok": False, "error": repr(e)}
+
+# ---------------------------
+# SNOV (FIXED: v2 task flow)
+# ---------------------------
+def _snov_get_access_token(logger=None) -> Tuple[Optional[str], Dict[str, Any]]:
+    client_id = os.getenv("SNOV_CLIENT_ID", "").strip()
+    client_secret = os.getenv("SNOV_CLIENT_SECRET", "").strip()
     if not client_id or not client_secret:
-        return None, {"ok": False, "provider": "snov", "error": "missing_client_id_or_secret"}
+        return None, {"ok": False, "error": "SNOV_CLIENT_ID or SNOV_CLIENT_SECRET missing"}
 
-    # If your existing project already has a working Snov implementation elsewhere,
-    # keep it there. This function is intentionally conservative to avoid breaking deploys.
+    url = "https://api.snov.io/v1/oauth/access_token"
     try:
-        # NOTE: leaving as "attempted but non-blocking" until you confirm the correct endpoint for your account plan.
-        return None, {"ok": False, "provider": "snov", "error": "endpoint_not_configured_confirm_snov_api_path"}
+        r = requests.post(url, data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret}, timeout=20)
+        if r.status_code != 200:
+            return None, {"ok": False, "status": r.status_code, "body": r.text[:800]}
+        token = (r.json() or {}).get("access_token")
+        return token, {"ok": True}
     except Exception as e:
-        return None, {"ok": False, "provider": "snov", "error": repr(e)}
+        return None, {"ok": False, "error": repr(e)}
 
-def _fullenrich_domain_search(domain: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    key = os.getenv("FULLENRICH_API_KEY") or os.getenv("FULL_ENRICH_API_KEY")
+def _snov_domain_emails(domain: str, logger=None) -> Tuple[Optional[str], Dict[str, Any]]:
+    token, meta = _snov_get_access_token(logger=logger)
+    if not token:
+        return None, {"ok": False, "auth": meta}
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    # v2 start -> result/{task_hash}
+    start_url = f"https://api.snov.io/v2/domain-search/domain-emails/start?domain={domain}"
+    try:
+        start = requests.post(start_url, headers=headers, timeout=25)
+        if start.status_code != 200:
+            return None, {"ok": False, "stage": "start", "status": start.status_code, "body": start.text[:800]}
+
+        start_json = start.json() or {}
+        task_hash = start_json.get("task_hash")
+        if not task_hash:
+            return None, {"ok": False, "stage": "start", "body": json.dumps(start_json)[:800]}
+
+        result_url = f"https://api.snov.io/v2/domain-search/domain-emails/result/{task_hash}"
+
+        # poll a few times
+        emails = []
+        for _ in range(8):
+            res = requests.get(result_url, headers=headers, timeout=25)
+            if res.status_code != 200:
+                return None, {"ok": False, "stage": "result", "status": res.status_code, "body": res.text[:800]}
+
+            res_json = res.json() or {}
+            status = res_json.get("status")
+            if status == "completed":
+                for item in (res_json.get("emails") or []):
+                    # docs show list of emails; sometimes objects, sometimes strings
+                    if isinstance(item, str) and "@" in item:
+                        emails.append(item)
+                    elif isinstance(item, dict):
+                        v = item.get("email")
+                        if isinstance(v, str) and "@" in v:
+                            emails.append(v)
+                primary = _pick_primary_email(emails)
+                return primary, {"ok": True, "emails": emails}
+            if status == "in_progress":
+                time.sleep(0.7)
+                continue
+
+            # unexpected status
+            return None, {"ok": False, "stage": "result", "unexpected_status": status, "body": json.dumps(res_json)[:800]}
+
+        return None, {"ok": False, "stage": "result", "error": "timeout_waiting_for_completion"}
+    except Exception as e:
+        return None, {"ok": False, "error": repr(e)}
+
+# ---------------------------
+# FULLENRICH (placeholder hook)
+# ---------------------------
+def _fullenrich_domain(domain: str, logger=None) -> Tuple[Optional[str], Dict[str, Any]]:
+    # Keep this as a no-op unless you already have an endpoint + key wired.
+    # This prevents "fake success" and makes it obvious in logs if it's not configured.
+    key = os.getenv("FULLENRICH_API_KEY", "").strip()
     if not key:
-        return None, {"ok": False, "provider": "fullenrich", "error": "missing_api_key"}
-    try:
-        # IMPORTANT: endpoint varies by vendor/account. Keep non-blocking until confirmed.
-        return None, {"ok": False, "provider": "fullenrich", "error": "endpoint_not_configured_confirm_fullenrich_api_path"}
-    except Exception as e:
-        return None, {"ok": False, "provider": "fullenrich", "error": repr(e)}
+        return None, {"ok": False, "error": "FULLENRICH_API_KEY missing (not configured)"}
+    # If you have a real endpoint, replace this implementation.
+    return None, {"ok": False, "error": "FullEnrich not yet implemented in code"}
 
-def run_email_waterfall(domain: Optional[str], logger=None, company_name: Optional[str] = None) -> Dict[str, Any]:
+# ============================================================
+# PUBLIC API USED BY PIPELINE
+# ============================================================
+def enrich_emails_for_domain(domain: str, company_name: Optional[str] = None, logger=None) -> Dict[str, Any]:
     """
-    Returns a stable shape that pipeline can always merge:
-    - primary_email
-    - primary_email_source
-    - primary_email_confidence
-    - provider_debug (list of provider attempt summaries)
-    - email_providers_tried (string: "hunter -> snov -> apollo")
-    - email_provider_errors_json (json string with errors)
-    - email_waterfall_winner (string: which provider won)
+    Waterfall:
+      Hunter -> Snov -> Apollo -> FullEnrich
+    Returns a dict containing:
+      primary_email, primary_email_source, primary_email_confidence, generic_emails_json, person_emails_json, catchall_emails_json
     """
-    d = _norm_domain(domain)
     out: Dict[str, Any] = {
         "primary_email": None,
         "primary_email_source": None,
         "primary_email_confidence": None,
-        "provider_debug": [],
-        "email_providers_tried": "",
-        "email_provider_errors_json": "{}",
-        "email_waterfall_winner": None,
-    }
-
-    if not d or d in SKIP_EMAIL_DOMAINS:
-        out["provider_debug"].append({"provider": "skip", "domain": d, "reason": "missing_or_low_value_domain"})
-        out["email_providers_tried"] = "skip"
-        out["email_provider_errors_json"] = json.dumps({"skip": "missing_or_low_value_domain"})
-        return out
-
-    # Track attempts and errors
-    attempts = []
-    tried = []
-    errors = {}
-
-    # Helper to record attempt
-    def _record(provider: str, meta: Dict[str, Any], email: Optional[str]):
-        tried.append(provider)
-        attempts.append(meta)
-        if not meta.get("ok") and meta.get("error"):
-            errors[provider] = meta.get("error")
-        return email
-
-    # Hunter → Snov → Apollo → FullEnrich (your desired waterfall)
-    # 1) HUNTER (optional skip via env var)
-    if os.getenv("DISABLE_HUNTER_EMAIL", "").strip() == "1":
-        tried.append("hunter")
-        errors["hunter"] = "SKIPPED_BY_ENV(DISABLE_HUNTER_EMAIL=1)"
-        attempts.append({"ok": False, "provider": "hunter", "error": "SKIPPED_BY_ENV"})
-    else:
-        email, meta = _hunter_domain_search(d)
-        _record("hunter", meta, email)
-        if email:
-            out.update({
-                "primary_email": email,
-                "primary_email_source": "hunter",
-                "primary_email_confidence": "medium",
-                "provider_debug": attempts,
-                "email_providers_tried": " -> ".join(tried),
-                "email_provider_errors_json": json.dumps(errors),
-                "email_waterfall_winner": "hunter",
-            })
-            return out
-
-    # 2) SNOV
-    email, meta = _snov_domain_search(d)
-    _record("snov", meta, email)
-    if email:
-        out.update({
-            "primary_email": email,
-            "primary_email_source": "snov",
-            "primary_email_confidence": "medium",
-            "provider_debug": attempts,
-            "email_providers_tried": " -> ".join(tried),
-            "email_provider_errors_json": json.dumps(errors),
-            "email_waterfall_winner": "snov",
-        })
-        return out
-
-    # 3) APOLLO
-    email, meta = _apollo_org_search(d)
-    _record("apollo", meta, email)
-    if email:
-        out.update({
-            "primary_email": email,
-            "primary_email_source": "apollo",
-            "primary_email_confidence": "low",
-            "provider_debug": attempts,
-            "email_providers_tried": " -> ".join(tried),
-            "email_provider_errors_json": json.dumps(errors),
-            "email_waterfall_winner": "apollo",
-        })
-        return out
-
-    # 4) FULLENRICH
-    email, meta = _fullenrich_domain_search(d)
-    _record("fullenrich", meta, email)
-    if email:
-        out.update({
-            "primary_email": email,
-            "primary_email_source": "fullenrich",
-            "primary_email_confidence": "low",
-            "provider_debug": attempts,
-            "email_providers_tried": " -> ".join(tried),
-            "email_provider_errors_json": json.dumps(errors),
-            "email_waterfall_winner": "fullenrich",
-        })
-        return out
-
-    # Nobody found an email
-    out["provider_debug"] = attempts
-    out["email_providers_tried"] = " -> ".join(tried)
-    out["email_provider_errors_json"] = json.dumps(errors)
-    out["email_waterfall_winner"] = None
-    return out
-
-
-# ============================================================
-# RESULT FINALIZATION HELPER
-# ============================================================
-
-def _finalize_email_result(result: dict) -> dict:
-    """
-    Ensures email result has all required fields populated correctly.
-
-    Critical fixes:
-    - If email exists but source is blank/None/NaN, set to "unknown"
-    - Copy email_source to primary_email_source if needed
-    - Ensure JSON fields never return None
-    """
-    email = result.get("primary_email")
-    source = result.get("primary_email_source")
-
-    # If we have an email but no source, mark it explicitly
-    if email and (source is None or str(source).strip() == "" or str(source).lower() == "nan"):
-        # Prefer explicit provider if present
-        if result.get("email_source"):
-            result["primary_email_source"] = result["email_source"]
-        else:
-            result["primary_email_source"] = "unknown"
-
-    # Ensure JSON fields never return None
-    for k in [
-        "generic_emails_json",
-        "person_emails_json",
-        "catchall_emails_json"
-    ]:
-        if k not in result or result[k] is None:
-            result[k] = "[]"
-
-    # Ensure tracking fields are present
-    if "email_providers_tried" not in result or result["email_providers_tried"] is None:
-        result["email_providers_tried"] = ""
-    if "email_provider_errors_json" not in result or result["email_provider_errors_json"] is None:
-        result["email_provider_errors_json"] = "{}"
-    if "email_waterfall_winner" not in result or result["email_waterfall_winner"] is None:
-        result["email_waterfall_winner"] = result.get("primary_email_source")
-
-    return result
-
-
-# ============================================================
-# BACKWARDS COMPATIBILITY WRAPPER
-# ============================================================
-
-def enrich_emails_for_domain(domain: str, logger=None, company_name: str = None) -> dict:
-    """
-    Backwards-compatible wrapper so existing pipeline imports keep working.
-
-    Returns keys that pipeline expects:
-      - primary_email
-      - primary_email_source
-      - primary_email_confidence
-      - generic_emails_json
-      - person_emails_json
-      - catchall_emails_json
-      - email_providers_tried (NEW)
-      - email_provider_errors_json (NEW)
-      - email_waterfall_winner (NEW)
-    """
-    # run_email_waterfall is the new implementation
-    result = run_email_waterfall(domain, logger=logger, company_name=company_name)
-
-    primary_email = result.get("primary_email")
-    primary_email_source = result.get("primary_email_source")
-    primary_email_confidence = result.get("primary_email_confidence")
-
-    # Keep the existing CSV/debug columns populated in a safe way:
-    provider_debug = result.get("provider_debug") or []
-    # Put everything in generic_emails_json for now (so you can see attempts/results)
-    generic_emails_json = json.dumps(provider_debug)
-
-    email_result = {
-        "primary_email": primary_email,
-        "primary_email_source": primary_email_source,
-        "primary_email_confidence": primary_email_confidence,
-        "generic_emails_json": generic_emails_json,
+        "generic_emails_json": None,
         "person_emails_json": None,
         "catchall_emails_json": None,
-        # NEW tracking fields
-        "email_providers_tried": result.get("email_providers_tried", ""),
-        "email_provider_errors_json": result.get("email_provider_errors_json", "{}"),
-        "email_waterfall_winner": result.get("email_waterfall_winner"),
     }
 
-    # Finalize and return
-    return _finalize_email_result(email_result)
+    if not domain or _is_bad_domain(domain):
+        if logger:
+            logger.info(f"Email enrichment skipped (bad/empty domain): {domain}")
+        return out
 
-# Some codebases used this older name; alias it too just in case.
-enrich_email_for_domain = enrich_emails_for_domain
+    # 1) Hunter
+    email, meta = _hunter_domain_search(domain, logger=logger)
+    if logger:
+        logger.info(f"Email provider=Hunter domain={domain} ok={meta.get('ok')} status={meta.get('status')}")
+    if email:
+        out["primary_email"] = email
+        out["primary_email_source"] = "hunter"
+        out["primary_email_confidence"] = "high"
+        out["generic_emails_json"] = json.dumps(meta.get("emails") or [])
+        return out
 
-# ============================================================
-# END BACKWARDS COMPATIBILITY WRAPPER
-# ============================================================
+    # 2) Snov
+    email, meta = _snov_domain_emails(domain, logger=logger)
+    if logger:
+        logger.info(f"Email provider=Snov domain={domain} ok={meta.get('ok')} stage={meta.get('stage')} status={meta.get('status')}")
+    if email:
+        out["primary_email"] = email
+        out["primary_email_source"] = "snov"
+        out["primary_email_confidence"] = "medium"
+        out["generic_emails_json"] = json.dumps(meta.get("emails") or [])
+        return out
+
+    # 3) Apollo
+    email, meta = _apollo_org_search(domain, logger=logger)
+    if logger:
+        logger.info(f"Email provider=Apollo domain={domain} ok={meta.get('ok')} status={meta.get('status')}")
+    if email:
+        out["primary_email"] = email
+        out["primary_email_source"] = "apollo"
+        out["primary_email_confidence"] = "medium"
+        out["generic_emails_json"] = json.dumps(meta.get("emails") or [])
+        return out
+
+    # 4) FullEnrich
+    email, meta = _fullenrich_domain(domain, logger=logger)
+    if logger:
+        logger.info(f"Email provider=FullEnrich domain={domain} ok={meta.get('ok')} status={meta.get('status')}")
+    if email:
+        out["primary_email"] = email
+        out["primary_email_source"] = "fullenrich"
+        out["primary_email_confidence"] = "medium"
+        return out
+
+    return out
