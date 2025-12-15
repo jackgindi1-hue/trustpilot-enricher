@@ -423,6 +423,65 @@ def run_pipeline(
     df['name_classification'] = df['raw_display_name'].apply(classify_name)
     classification_counts = df['name_classification'].value_counts()
     logger.info(f"  Classification results: {dict(classification_counts)}")
+
+    # ============================================================
+    # POST-CLASSIFICATION OVERRIDES (business pattern boosts)
+    # ============================================================
+    import re
+
+    BUSINESS_KEYWORDS = [
+        "llc", "inc", "ltd", "corp", "company", "co.", "co ",
+        "plumbing", "roofing", "construction", "landscapes", "landscaping",
+        "cosmetics", "detailing", "transport", "logistics", "trucking",
+        "restaurant", "bistro", "sushi", "fitness", "academy", "institute",
+        "services", "service", "shop", "auto", "glass", "appliance", "spa",
+    ]
+
+    def _looks_like_business(name: str) -> bool:
+        s = (name or "").strip().lower()
+        if not s:
+            return False
+        s2 = re.sub(r"[^a-z0-9]+", " ", s).strip()
+        # glued suffixes like westerstatepainllc
+        if re.search(r"(llc|inc|ltd|corp)$", s):
+            return True
+        for kw in BUSINESS_KEYWORDS:
+            if kw in s2:
+                return True
+        # patterns like "X - Y" where Y contains a business noun
+        if " - " in s2 or "-" in s:
+            return any(kw in s2 for kw in ["llc", "inc", "plumbing", "appliance", "landscap", "cosmetic", "institute"])
+        return False
+
+    def _extract_company_search_name(raw_name: str) -> str:
+        s = (raw_name or "").strip()
+        # If format "Owner - Company", take the RHS as the company search name
+        if " - " in s:
+            left, right = s.split(" - ", 1)
+            # If right side isn't empty, prefer it
+            if right.strip():
+                return right.strip()
+        # If "Name, LLC" etc. leave as-is
+        return s
+
+    if "raw_display_name" in df.columns:
+        raw_col = df["raw_display_name"].astype(str)
+    else:
+        # fall back to your display name column
+        raw_col = df["consumer.displayname"].astype(str) if "consumer.displayname" in df.columns else df.iloc[:, 0].astype(str)
+
+    mask = raw_col.apply(_looks_like_business)
+    # Upgrade misclassified rows to business
+    df.loc[mask, "name_classification"] = "business"
+
+    # Ensure company_search_name is populated with best guess for search
+    if "company_search_name" in df.columns:
+        df.loc[mask, "company_search_name"] = raw_col[mask].apply(_extract_company_search_name)
+
+    # ============================================================
+    # END POST-CLASSIFICATION OVERRIDES
+    # ============================================================
+
     # Normalize business names
     logger.info("Step 3: Normalizing business names...")
     business_mask = df['name_classification'] == 'business'

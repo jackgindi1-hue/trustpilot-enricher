@@ -1,13 +1,18 @@
-# tp_enrich/email_enrichment.py
 import os
 import re
 import json
 import requests
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
-_GENERIC_PREFIXES = ("info@", "support@", "sales@", "hello@", "contact@", "admin@", "billing@", "team@")
+GENERIC_PREFIXES = ("info@", "support@", "sales@", "hello@", "contact@", "admin@", "office@", "team@")
 
-def _clean_email(s: Optional[str]) -> Optional[str]:
+# Disallow social/profile domains for email enrichment (these will never yield company emails)
+BLOCKED_EMAIL_DOMAINS = {
+    "facebook.com", "m.facebook.com", "instagram.com", "linkedin.com",
+    "tiktok.com", "yelp.com", "goo.gl", "maps.app.goo.gl"
+}
+
+def _clean_email(s: Any) -> Optional[str]:
     if not s:
         return None
     s = str(s).strip()
@@ -15,244 +20,215 @@ def _clean_email(s: Optional[str]) -> Optional[str]:
         return s.lower()
     return None
 
-def _split_emails(emails: List[str]) -> Dict[str, List[str]]:
-    out = []
-    for e in emails:
-        e2 = _clean_email(e)
-        if e2 and e2 not in out:
-            out.append(e2)
-    generic = [e for e in out if e.startswith(_GENERIC_PREFIXES)]
-    person = [e for e in out if e not in generic]
-    return {"generic": generic, "person": person, "catchall": []}
+def _split_generic_person(emails: List[str]) -> Tuple[List[str], List[str]]:
+    generic = [e for e in emails if e.startswith(GENERIC_PREFIXES)]
+    person = [e for e in emails if e not in generic]
+    return generic, person
 
-def _pick_primary(source: str, confidence: Optional[str], emails: Dict[str, List[str]]) -> Dict[str, Any]:
-    generic = emails.get("generic") or []
-    person = emails.get("person") or []
-    catchall = emails.get("catchall") or []
-    ordered = generic + person + catchall
-    primary = ordered[0] if ordered else None
-    if not primary:
-        return {
-            "primary_email": None,
-            "primary_email_type": None,
-            "primary_email_source": None,
-            "primary_email_confidence": None,
-            "generic_emails_json": "[]",
-            "person_emails_json": "[]",
-            "catchall_emails_json": "[]",
-        }
-    if primary in generic:
-        t = "generic"
-    elif primary in person:
-        t = "person"
-    else:
-        t = "catchall"
+def _pick_primary(source: Optional[str], confidence: Optional[str], generic: List[str], person: List[str], catchall: List[str]) -> Dict[str, Any]:
+    # prefer generic -> person -> catchall
+    for e in (generic + person + catchall):
+        e2 = _clean_email(e)
+        if e2:
+            email_type = "generic" if e in generic else ("person" if e in person else "catchall")
+            return {
+                "primary_email": e2,
+                "primary_email_type": email_type,
+                "primary_email_source": source,
+                "primary_email_confidence": confidence,
+                "generic_emails_json": json.dumps(generic),
+                "person_emails_json": json.dumps(person),
+                "catchall_emails_json": json.dumps(catchall),
+            }
     return {
-        "primary_email": primary,
-        "primary_email_type": t,
-        "primary_email_source": source,
-        "primary_email_confidence": confidence,
-        "generic_emails_json": json.dumps(generic),
-        "person_emails_json": json.dumps(person),
-        "catchall_emails_json": json.dumps(catchall),
+        "primary_email": None,
+        "primary_email_type": None,
+        "primary_email_source": None,
+        "primary_email_confidence": None,
+        "generic_emails_json": "[]",
+        "person_emails_json": "[]",
+        "catchall_emails_json": "[]",
     }
 
-def _hunter(domain: str) -> Dict[str, Any]:
+def _hunter(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
     key = os.getenv("HUNTER_API_KEY") or os.getenv("HUNTER_KEY")
     if not key:
-        return {"attempted": False, "ok": False, "reason": "missing HUNTER_API_KEY", "emails": []}
-    try:
-        r = requests.get(
-            "https://api.hunter.io/v2/domain-search",
-            params={"domain": domain, "api_key": key},
-            timeout=20,
-        )
-        if r.status_code != 200:
-            return {"attempted": True, "ok": False, "reason": f"HTTP {r.status_code}: {r.text[:200]}", "emails": []}
-        js = r.json() or {}
-        items = (js.get("data", {}) or {}).get("emails") or []
-        emails = [i.get("value") for i in items if i.get("value")]
-        return {"attempted": True, "ok": True, "reason": None, "emails": emails}
-    except Exception as e:
-        return {"attempted": True, "ok": False, "reason": f"exception: {repr(e)}", "emails": []}
+        return None, "missing HUNTER_API_KEY"
+    url = "https://api.hunter.io/v2/domain-search"
+    r = requests.get(url, params={"domain": domain, "api_key": key}, timeout=25)
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:200]}"
+    data = r.json() or {}
+    emails = []
+    for item in (data.get("data", {}).get("emails") or []):
+        e = _clean_email(item.get("value"))
+        if e:
+            emails.append(e)
+    generic, person = _split_generic_person(emails)
+    return {
+        "source": "hunter",
+        "confidence": "high" if generic else ("medium" if person else None),
+        "generic": generic,
+        "person": person,
+        "catchall": [],
+    }, "ok"
 
-def _apollo(domain: str) -> Dict[str, Any]:
-    key = os.getenv("APOLLO_API_KEY")
-    if not key:
-        return {"attempted": False, "ok": False, "reason": "missing APOLLO_API_KEY", "emails": []}
+def _apollo(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    api_key = os.getenv("APOLLO_API_KEY")
+    if not api_key:
+        return None, "missing APOLLO_API_KEY"
 
-    # Apollo docs say "include API key in header"; your logs said X-Api-Key.
-    # So we try BOTH common patterns to avoid silent failure:
-    headers_variants = [
-        {"X-Api-Key": key, "Content-Type": "application/json"},
-        {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    ]
+    # Apollo requires X-Api-Key header (your logs showed INVALID_API_KEY_LOCATION when not used)
+    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
 
-    # NOTE: Org enrichment often does NOT return emails.
-    # But if Apollo returns any org-level email fields, we'll take them.
-    url = "https://api.apollo.io/v1/organizations/enrich"
+    # NOTE: org enrich often returns no emails. We still run it, but treat it as "best effort".
+    r = requests.post("https://api.apollo.io/v1/organizations/enrich", headers=headers, json={"domain": domain}, timeout=25)
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:200]}"
 
-    last_reason = None
-    for headers in headers_variants:
-        try:
-            r = requests.post(url, headers=headers, json={"domain": domain}, timeout=25)
-            if r.status_code != 200:
-                last_reason = f"HTTP {r.status_code}: {r.text[:200]}"
-                continue
+    js = r.json() or {}
+    org = js.get("organization") or {}
 
-            js = r.json() or {}
-            org = js.get("organization") or {}
+    # Rarely present, but capture if it exists
+    emails = []
+    e = _clean_email(org.get("email"))
+    if e:
+        emails.append(e)
 
-            candidates = []
-            for k in ("email", "public_email", "support_email", "contact_email"):
-                if org.get(k):
-                    candidates.append(org.get(k))
+    generic, person = _split_generic_person(emails)
+    return {
+        "source": "apollo",
+        "confidence": "medium" if emails else None,
+        "generic": generic,
+        "person": person,
+        "catchall": [],
+    }, "ok"
 
-            # Some Apollo responses include "emails" arrays in some accounts
-            if isinstance(org.get("emails"), list):
-                candidates.extend(org.get("emails"))
-
-            emails = [c for c in candidates if c]
-            return {"attempted": True, "ok": True, "reason": None, "emails": emails}
-
-        except Exception as e:
-            last_reason = f"exception: {repr(e)}"
-            continue
-
-    return {"attempted": True, "ok": False, "reason": last_reason or "unknown", "emails": []}
-
-def _snov(domain: str) -> Dict[str, Any]:
-    # Snov needs OAuth token. We support either:
-    # - SNOV_ACCESS_TOKEN already set
-    # - OR SNOV_CLIENT_ID + SNOV_CLIENT_SECRET to fetch one
+def _snov(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    # Minimal SNOV auth flow. If your Railway env uses a stored token, set SNOV_ACCESS_TOKEN.
     access_token = os.getenv("SNOV_ACCESS_TOKEN")
     client_id = os.getenv("SNOV_CLIENT_ID")
     client_secret = os.getenv("SNOV_CLIENT_SECRET")
 
     if not access_token and not (client_id and client_secret):
-        return {"attempted": False, "ok": False, "reason": "missing SNOV auth env", "emails": []}
+        return None, "missing SNOV_ACCESS_TOKEN or SNOV_CLIENT_ID/SNOV_CLIENT_SECRET"
 
-    try:
-        if not access_token:
-            tok = requests.post(
-                "https://api.snov.io/v1/oauth/access_token",
-                data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
-                timeout=20,
-            )
-            if tok.status_code != 200:
-                return {"attempted": True, "ok": False, "reason": f"token HTTP {tok.status_code}: {tok.text[:200]}", "emails": []}
-            access_token = (tok.json() or {}).get("access_token")
-            if not access_token:
-                return {"attempted": True, "ok": False, "reason": "token missing access_token", "emails": []}
-
-        # IMPORTANT:
-        # Your logs showed you were calling:
-        #   /v1/get-domain-emails-with-info (404)
-        #   /v2/get-domain-emails-with-info (404)
-        # This uses the common v2 path WITHOUT "get-".
-        r = requests.post(
-            "https://api.snov.io/v2/domain-emails-with-info",
-            data={"access_token": access_token, "domain": domain},
+    if not access_token:
+        tok = requests.post(
+            "https://api.snov.io/v1/oauth/access_token",
+            data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
             timeout=25,
         )
-        if r.status_code != 200:
-            return {"attempted": True, "ok": False, "reason": f"HTTP {r.status_code}: {r.text[:200]}", "emails": []}
+        if tok.status_code != 200:
+            return None, f"token HTTP {tok.status_code}: {tok.text[:200]}"
+        access_token = (tok.json() or {}).get("access_token")
+        if not access_token:
+            return None, "token response had no access_token"
 
-        js = r.json() or {}
-        # Snov commonly returns: {"emails":[{"email":"..."}, ...]}
-        items = js.get("emails") or []
-        emails = []
-        for it in items:
-            if isinstance(it, dict) and it.get("email"):
-                emails.append(it.get("email"))
-            elif isinstance(it, str):
-                emails.append(it)
-        return {"attempted": True, "ok": True, "reason": None, "emails": emails}
+    # SNOV domain emails w/ info (v2) expects POST with access_token + domain
+    # (Your earlier code was hitting endpoints that 404'd)
+    r = requests.post(
+        "https://api.snov.io/v2/domain-emails-with-info",
+        data={"access_token": access_token, "domain": domain},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:200]}"
 
-    except Exception as e:
-        return {"attempted": True, "ok": False, "reason": f"exception: {repr(e)}", "emails": []}
+    js = r.json() or {}
+    emails = []
+    for item in (js.get("emails") or []):
+        e = _clean_email(item.get("email"))
+        if e:
+            emails.append(e)
 
-def _fullenrich(domain: str) -> Dict[str, Any]:
+    generic, person = _split_generic_person(emails)
+    return {
+        "source": "snov",
+        "confidence": "medium" if emails else None,
+        "generic": generic,
+        "person": person,
+        "catchall": [],
+    }, "ok"
+
+def _fullenrich(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
     key = os.getenv("FULLENRICH_API_KEY")
     if not key:
-        return {"attempted": False, "ok": False, "reason": "missing FULLENRICH_API_KEY", "emails": []}
-    try:
-        # Keep minimal + safe: if your FullEnrich endpoint differs, it will show as provider_status_json reason.
-        r = requests.post(
-            "https://api.fullenrich.com/v1/domain",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"domain": domain},
-            timeout=25,
-        )
-        if r.status_code != 200:
-            return {"attempted": True, "ok": False, "reason": f"HTTP {r.status_code}: {r.text[:200]}", "emails": []}
-        js = r.json() or {}
-        emails = js.get("emails") or []
-        return {"attempted": True, "ok": True, "reason": None, "emails": emails if isinstance(emails, list) else []}
-    except Exception as e:
-        return {"attempted": True, "ok": False, "reason": f"exception: {repr(e)}", "emails": []}
+        return None, "missing FULLENRICH_API_KEY"
 
-def run_email_waterfall(
-    domain: Optional[str],
-    company_name: Optional[str] = None,
-    logger: Any = None,
-    **kwargs
-) -> Dict[str, Any]:
+    # If your FullEnrich integration uses a different endpoint already, update this block to match it.
+    r = requests.post(
+        "https://api.fullenrich.com/v1/domain",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={"domain": domain},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:200]}"
+
+    js = r.json() or {}
+    emails = []
+    for e in (js.get("emails") or []):
+        e2 = _clean_email(e)
+        if e2:
+            emails.append(e2)
+
+    generic, person = _split_generic_person(emails)
+    return {
+        "source": "fullenrich",
+        "confidence": "medium" if emails else None,
+        "generic": generic,
+        "person": person,
+        "catchall": [],
+    }, "ok"
+
+def run_email_waterfall(domain: Optional[str], company_name: Optional[str] = None, logger: Any = None, **kwargs) -> Dict[str, Any]:
     """
-    Returns:
-      primary_email, primary_email_source, primary_email_confidence,
-      generic/person/catchall json columns,
-      provider_status_json (self-proving: shows each provider attempted + reason)
+    Guaranteed stable API for pipeline:
+      - returns primary_email fields + *_emails_json
+      - returns provider_status_json so you can PROVE which providers ran and why they failed
     """
     if not domain:
-        out = _pick_primary(source=None, confidence=None, emails={"generic": [], "person": [], "catchall": []})
-        out["provider_status_json"] = "{}"
+        return {**_pick_primary(None, None, [], [], []), "provider_status_json": "{}"}
+
+    d = str(domain).strip().lower()
+    if any(d == bad or d.endswith("." + bad) for bad in BLOCKED_EMAIL_DOMAINS):
+        # Don't waste credits on facebook/linkedin etc.
+        out = _pick_primary(None, None, [], [], [])
+        out["provider_status_json"] = json.dumps({"blocked_domain": d})
         return out
 
-    status: Dict[str, Any] = {}
+    status = {}
 
     def _log(msg: str):
         if logger:
             logger.info(msg)
 
-    _log(f"EMAIL WATERFALL START: domain={domain} company={company_name}")
+    _log(f"EMAIL WATERFALL: domain={d} company={company_name}")
 
-    # Order: Hunter → Apollo → Snov → FullEnrich (easy to change later)
-    # (Apollo before Snov is fine because Apollo credit usage can be higher; we'll decide later.)
-    for name, fn in [
-        ("hunter", _hunter),
-        ("apollo", _apollo),
-        ("snov", _snov),
-        ("fullenrich", _fullenrich),
-    ]:
-        res = fn(domain)
-        status[name] = {
-            "attempted": res.get("attempted"),
-            "ok": res.get("ok"),
-            "reason": res.get("reason"),
-            "email_count": len(res.get("emails") or []),
-        }
+    # Order: Hunter → Apollo → Snov → FullEnrich (you can reorder later)
+    # The key point: we always attempt the next provider if nothing found.
+    for name, fn in [("hunter", _hunter), ("apollo", _apollo), ("snov", _snov), ("fullenrich", _fullenrich)]:
+        try:
+            payload, note = fn(d)
+            status[name] = {"attempted": True, "note": note}
+            if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
+                out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+                out["provider_status_json"] = json.dumps(status)
+                return out
+        except Exception as e:
+            status[name] = {"attempted": True, "note": f"exception: {repr(e)}"}
 
-        emails_raw = res.get("emails") or []
-        emails_split = _split_emails(emails_raw)
-
-        if (emails_split["generic"] or emails_split["person"] or emails_split["catchall"]):
-            conf = "high" if emails_split["generic"] else "medium"
-            out = _pick_primary(source=name, confidence=conf, emails=emails_split)
-            out["provider_status_json"] = json.dumps(status)
-            _log(f"EMAIL WATERFALL WINNER: {name} primary={out.get('primary_email')}")
-            return out
-
-        _log(f"EMAIL WATERFALL: {name} found 0 emails ({status[name].get('reason')})")
-
-    out = _pick_primary(source=None, confidence=None, emails={"generic": [], "person": [], "catchall": []})
+    out = _pick_primary(None, None, [], [], [])
     out["provider_status_json"] = json.dumps(status)
-    _log("EMAIL WATERFALL END: no email found from any provider")
     return out
 
-# Backward-compat aliases (prevents "cannot import name …" crashes)
-def enrich_emails_for_domain(domain: Optional[str], company_name: Optional[str] = None, logger: Any = None, **kwargs) -> Dict[str, Any]:
-    return run_email_waterfall(domain=domain, company_name=company_name, logger=logger, **kwargs)
 
-def enrich_domain_emails(domain: Optional[str], company_name: Optional[str] = None, logger: Any = None, **kwargs) -> Dict[str, Any]:
-    return run_email_waterfall(domain=domain, company_name=company_name, logger=logger, **kwargs)
+# ============================================================
+# BACKWARD COMPATIBILITY: Maintain enrich_emails_for_domain
+# ============================================================
+def enrich_emails_for_domain(domain: str, company_name: Optional[str] = None, logger=None) -> Dict[str, Any]:
+    """
+    Legacy function name - calls run_email_waterfall for backward compatibility
+    """
+    return run_email_waterfall(domain=domain, company_name=company_name, logger=logger)
