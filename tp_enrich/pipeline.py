@@ -271,67 +271,35 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     row["all_phones_json"] = phone_layer.get("all_phones_json")
 
     # ============================================================
-    # FORCE EMAIL WATERFALL RUN (Hunter -> Snov -> Apollo -> FullEnrich)
+    # EMAIL WATERFALL (Hunter → Snov → Apollo → FullEnrich)
     # ============================================================
+    from tp_enrich.email_enrichment import run_email_waterfall
+
+    logger.info(f"   -> Email enrichment (Hunter → Snov → Apollo → FullEnrich) for {name} domain={domain}")
+
+    email_result = run_email_waterfall(domain, logger=logger)
+
+    # Always log one line proving what happened (super useful for debugging credits)
     try:
-        import inspect
+        logger.info(
+            "   -> Email providers attempted: "
+            + ", ".join([f"{a.get('provider')}({'ok' if a.get('ok') else 'fail'})" for a in (email_result.get('provider_debug') or [])])
+        )
+    except Exception:
+        pass
 
-        if domain and str(domain).strip():
-            logger.info(f"   -> Email enrichment (Hunter → Snov → Apollo → FullEnrich) for {name} domain={domain}")
+    primary_email = email_result.get("primary_email")
+    primary_email_source = email_result.get("primary_email_source")
+    primary_email_confidence = email_result.get("primary_email_confidence")
 
-            # Try to import the email waterfall function under common names
-            email_fn = None
-            try:
-                from tp_enrich.email_enrichment import enrich_emails_for_domain as email_fn
-            except Exception:
-                try:
-                    from tp_enrich.email_enrichment import enrich_emails_waterfall as email_fn
-                except Exception:
-                    try:
-                        from tp_enrich.email_enrichment import enrich_emails as email_fn
-                    except Exception:
-                        try:
-                            from tp_enrich.email_enrichment import run_email_waterfall as email_fn
-                        except Exception:
-                            email_fn = None
+    logger.info(f"   -> Email enrichment complete: primary_email={primary_email} source={primary_email_source} confidence={primary_email_confidence}")
 
-            if email_fn is None:
-                logger.warning("Email enrichment module not found (tp_enrich.email_enrichment). Skipping email waterfall.")
-            else:
-                # Call with only the args it actually accepts (prevents crashes on signature mismatch)
-                sig = inspect.signature(email_fn)
-                kwargs = {}
-                for p in sig.parameters.keys():
-                    lp = p.lower()
-                    if lp in ("domain", "company_domain"):
-                        kwargs[p] = domain
-                    elif lp in ("company_name", "business_name", "name"):
-                        kwargs[p] = name
-                    elif lp in ("website", "url"):
-                        kwargs[p] = row.get("website")
-                    elif lp in ("logger",):
-                        kwargs[p] = logger
-
-                email_result = email_fn(**kwargs) if kwargs else email_fn(domain)
-
-                if isinstance(email_result, dict):
-                    # IMPORTANT: merge results back into row so they get returned
-                    for k, v in email_result.items():
-                        row[k] = v
-
-                logger.info(
-                    "   -> Email enrichment complete: "
-                    f"primary_email={row.get('primary_email')} "
-                    f"source={row.get('primary_email_source')} "
-                    f"confidence={row.get('primary_email_confidence')}"
-                )
-        else:
-            logger.info(f"   -> Email enrichment skipped (no domain) for {name}")
-
-    except Exception as e:
-        logger.exception(f"Email waterfall execution failed for {name}: {e}")
+    # Make sure you store these into row so they get returned
+    row["primary_email"] = primary_email
+    row["primary_email_source"] = primary_email_source
+    row["primary_email_confidence"] = primary_email_confidence
     # ============================================================
-    # END FORCE EMAIL WATERFALL RUN
+    # END EMAIL WATERFALL
     # ============================================================
 
     row["confidence"] = _compute_confidence(row)
