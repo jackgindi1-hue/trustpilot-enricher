@@ -104,83 +104,163 @@ def _apollo(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
         "catchall": [],
     }, "ok"
 
-def _snov(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    # Minimal SNOV auth flow. If your Railway env uses a stored token, set SNOV_ACCESS_TOKEN.
-    access_token = os.getenv("SNOV_ACCESS_TOKEN")
+def _snov(domain: str, logger=None) -> Dict[str, Any]:
+    """
+    SNOV self-proving implementation.
+    
+    Returns dict with:
+      - _attempted: bool
+      - _reason: str (if failed)
+      - source, confidence, generic_emails, person_emails, catchall_emails (if successful)
+    
+    NOTES:
+    - If you see HTTP 403 with "no permissions", that is an ACCOUNT/PLAN permission issue.
+      Code cannot fix a 403 permission denial.
+    - This function logs the exact URL used so you can verify what is being called.
+    """
     client_id = os.getenv("SNOV_CLIENT_ID")
     client_secret = os.getenv("SNOV_CLIENT_SECRET")
+    access_token = os.getenv("SNOV_ACCESS_TOKEN")  # optional if you already store it
 
-    if not access_token and not (client_id and client_secret):
-        return None, "missing SNOV_ACCESS_TOKEN or SNOV_CLIENT_ID/SNOV_CLIENT_SECRET"
+    if not (access_token or (client_id and client_secret)):
+        return {"_attempted": False, "_reason": "missing SNOV auth env (SNOV_ACCESS_TOKEN or SNOV_CLIENT_ID/SNOV_CLIENT_SECRET)"}
 
-    if not access_token:
-        tok = requests.post(
-            "https://api.snov.io/v1/oauth/access_token",
-            data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
-            timeout=25,
-        )
-        if tok.status_code != 200:
-            return None, f"token HTTP {tok.status_code}: {tok.text[:200]}"
-        access_token = (tok.json() or {}).get("access_token")
+    try:
+        # 1) Resolve token if needed
+        if not access_token and client_id and client_secret:
+            token_url = "https://api.snov.io/v1/oauth/access_token"
+            if logger:
+                logger.info(f"SNOV token URL: {token_url}")
+            tok = requests.post(
+                token_url,
+                data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
+                timeout=20,
+            )
+            if tok.status_code != 200:
+                return {"_attempted": True, "_reason": f"token HTTP {tok.status_code}: {tok.text[:300]}"}
+            access_token = (tok.json() or {}).get("access_token")
+
         if not access_token:
-            return None, "token response had no access_token"
+            return {"_attempted": True, "_reason": "no access_token resolved"}
 
-    # SNOV domain emails w/ info (v2) expects POST with access_token + domain
-    # (Your earlier code was hitting endpoints that 404'd)
-    r = requests.post(
-        "https://api.snov.io/v2/domain-emails-with-info",
-        data={"access_token": access_token, "domain": domain},
-        timeout=30,
-    )
-    if r.status_code != 200:
-        return None, f"HTTP {r.status_code}: {r.text[:200]}"
+        # 2) Try the domain emails endpoint(s).
+        # Different SNOV accounts/plans expose different methods. We try a small list and log each.
+        endpoints_to_try = [
+            "https://api.snov.io/v2/domain-emails-with-info",
+            "https://api.snov.io/v1/get-domain-emails-with-info",
+            "https://api.snov.io/v2/get-domain-emails-with-info",
+        ]
 
-    js = r.json() or {}
-    emails = []
-    for item in (js.get("emails") or []):
-        e = _clean_email(item.get("email"))
-        if e:
-            emails.append(e)
+        last_err = None
+        for url in endpoints_to_try:
+            if logger:
+                logger.info(f"SNOV domain email URL: {url} (domain={domain})")
 
-    generic, person = _split_generic_person(emails)
-    return {
-        "source": "snov",
-        "confidence": "medium" if emails else None,
-        "generic": generic,
-        "person": person,
-        "catchall": [],
-    }, "ok"
+            r = requests.post(
+                url,
+                data={"access_token": access_token, "domain": domain},
+                timeout=25,
+            )
 
-def _fullenrich(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
+            # 403 = permissions/plan, not code
+            if r.status_code == 403:
+                last_err = f"HTTP 403 (permissions): {r.text[:300]}"
+                continue
+
+            # 404 = endpoint not present in this API version/account
+            if r.status_code == 404:
+                last_err = f"HTTP 404 (endpoint not found): {r.text[:300]}"
+                continue
+
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+                continue
+
+            js = r.json() or {}
+
+            # SNOV response formats vary; support a couple common shapes
+            raw_items = js.get("emails") or js.get("data") or []
+            emails = []
+            for item in raw_items:
+                if isinstance(item, dict):
+                    e = item.get("email") or item.get("value")
+                else:
+                    e = item
+                if e:
+                    emails.append(str(e).strip())
+
+            generic = [e for e in emails if any(p in e.lower() for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@"])]
+            person = [e for e in emails if e not in generic]
+
+            return {
+                "_attempted": True,
+                "source": "snov",
+                "confidence": "medium" if emails else None,
+                "generic": generic,
+                "person": person,
+                "catchall": [],
+            }
+
+        return {"_attempted": True, "_reason": f"snov exhausted; last_err={last_err}"}
+
+    except Exception as ex:
+        return {"_attempted": True, "_reason": f"exception: {repr(ex)}"}
+
+
+def _fullenrich(domain: str, logger=None) -> Dict[str, Any]:
+    """
+    FULLENRICH self-proving implementation.
+    
+    Returns dict with:
+      - _attempted: bool
+      - _reason: str (if failed)
+      - source, confidence, generic_emails, person_emails, catchall_emails (if successful)
+    
+    NOTES:
+    - Your logs show DNS resolution failure. That usually means:
+      (a) wrong hostname/base URL, or
+      (b) your environment can't resolve that domain.
+    - Make base URL configurable via FULLENRICH_BASE_URL and log it.
+    """
     key = os.getenv("FULLENRICH_API_KEY")
     if not key:
-        return None, "missing FULLENRICH_API_KEY"
+        return {"_attempted": False, "_reason": "missing FULLENRICH_API_KEY"}
 
-    # If your FullEnrich integration uses a different endpoint already, update this block to match it.
-    r = requests.post(
-        "https://api.fullenrich.com/v1/domain",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"domain": domain},
-        timeout=30,
-    )
-    if r.status_code != 200:
-        return None, f"HTTP {r.status_code}: {r.text[:200]}"
+    base = os.getenv("FULLENRICH_BASE_URL", "https://api.fullenrich.com").rstrip("/")
+    url = f"{base}/v1/domain"
 
-    js = r.json() or {}
-    emails = []
-    for e in (js.get("emails") or []):
-        e2 = _clean_email(e)
-        if e2:
-            emails.append(e2)
+    try:
+        if logger:
+            logger.info(f"FULLENRICH URL: {url} (domain={domain})")
 
-    generic, person = _split_generic_person(emails)
-    return {
-        "source": "fullenrich",
-        "confidence": "medium" if emails else None,
-        "generic": generic,
-        "person": person,
-        "catchall": [],
-    }, "ok"
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"domain": domain},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return {"_attempted": True, "_reason": f"HTTP {r.status_code}: {r.text[:300]}"}
+
+        js = r.json() or {}
+        raw_emails = js.get("emails") or js.get("data", {}).get("emails") or []
+        emails = [str(e).strip() for e in raw_emails if e]
+
+        generic = [e for e in emails if any(p in e.lower() for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@"])]
+        person = [e for e in emails if e not in generic]
+
+        return {
+            "_attempted": True,
+            "source": "fullenrich",
+            "confidence": "medium" if emails else None,
+            "generic": generic,
+            "person": person,
+            "catchall": [],
+        }
+
+    except Exception as ex:
+        return {"_attempted": True, "_reason": f"exception: {repr(ex)}"}
+
 
 def run_email_waterfall(domain: Optional[str], company_name: Optional[str] = None, logger: Any = None, **kwargs) -> Dict[str, Any]:
     """
@@ -247,17 +327,18 @@ def run_email_waterfall(domain: Optional[str], company_name: Optional[str] = Non
     # 2. Try Snov
     tried.append("snov")
     try:
-        payload, note = _snov(d)
-        status["snov"] = {"attempted": True, "note": note}
-        if payload and (payload.get("generic") or payload.get("person") or payload.get("catchall")):
+        result = _snov(d, logger=logger)
+        status["snov"] = {"attempted": result.get("_attempted", True), "note": result.get("_reason", "ok")}
+        if result.get("_attempted") and not result.get("_reason") and (result.get("generic") or result.get("person") or result.get("catchall")):
+            payload = result
             winner = "snov"
-            out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out = _pick_primary(result["source"], result["confidence"], result["generic"], result["person"], result["catchall"])
             out["email_waterfall_tried"] = ",".join(tried)
             out["email_waterfall_winner"] = winner
             out["provider_status_json"] = json.dumps(status)
-            _log(f"   -> Snov SUCCESS: found {len(payload.get('generic', []))} generic, {len(payload.get('person', []))} person emails")
+            _log(f"   -> Snov SUCCESS: found {len(result.get('generic', []))} generic, {len(result.get('person', []))} person emails")
             return out
-        _log(f"   -> Snov: {note} (no emails)")
+        _log(f"   -> Snov: {result.get('_reason', 'no emails')}")
     except Exception as e:
         status["snov"] = {"attempted": True, "note": f"exception: {repr(e)}"}
         _log(f"   -> Snov exception: {repr(e)}")
@@ -283,17 +364,18 @@ def run_email_waterfall(domain: Optional[str], company_name: Optional[str] = Non
     # 4. Try FullEnrich
     tried.append("fullenrich")
     try:
-        payload, note = _fullenrich(d)
-        status["fullenrich"] = {"attempted": True, "note": note}
-        if payload and (payload.get("generic") or payload.get("person") or payload.get("catchall")):
+        result = _fullenrich(d, logger=logger)
+        status["fullenrich"] = {"attempted": result.get("_attempted", True), "note": result.get("_reason", "ok")}
+        if result.get("_attempted") and not result.get("_reason") and (result.get("generic") or result.get("person") or result.get("catchall")):
+            payload = result
             winner = "fullenrich"
-            out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out = _pick_primary(result["source"], result["confidence"], result["generic"], result["person"], result["catchall"])
             out["email_waterfall_tried"] = ",".join(tried)
             out["email_waterfall_winner"] = winner
             out["provider_status_json"] = json.dumps(status)
-            _log(f"   -> FullEnrich SUCCESS: found {len(payload.get('generic', []))} generic, {len(payload.get('person', []))} person emails")
+            _log(f"   -> FullEnrich SUCCESS: found {len(result.get('generic', []))} generic, {len(result.get('person', []))} person emails")
             return out
-        _log(f"   -> FullEnrich: {note} (no emails)")
+        _log(f"   -> FullEnrich: {result.get('_reason', 'no emails')}")
     except Exception as e:
         status["fullenrich"] = {"attempted": True, "note": f"exception: {repr(e)}"}
         _log(f"   -> FullEnrich exception: {repr(e)}")
