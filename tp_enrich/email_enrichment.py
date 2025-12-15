@@ -188,21 +188,31 @@ def _snov(domain: str, logger=None) -> Dict[str, Any]:
             return {"_attempted": True, "_reason": f"missing links.result; body={str(js)[:250]}"}
 
         # 3) Poll result endpoint
-        # Try up to ~20 seconds total (10 polls x 2s)
-        for i in range(10):
-            _log(f"SNOV poll {i+1}/10: GET {result_url}")
+        # Configurable polling (default: 40 polls x 2s = ~80s total)
+        max_polls = int(os.getenv("SNOV_MAX_POLLS", "40"))
+        sleep_seconds = float(os.getenv("SNOV_POLL_SLEEP", "2"))
+
+        for i in range(max_polls):
+            _log(f"SNOV poll {i+1}/{max_polls}: GET {result_url}")
             res = requests.get(result_url, timeout=30)
-            if res.status_code != 200:
-                # keep polling unless hard fail
+
+            # Snov may return 202 while still processing
+            if res.status_code == 202:
                 import time
-                time.sleep(2)
+                time.sleep(sleep_seconds)
+                continue
+
+            if res.status_code != 200:
+                import time
+                time.sleep(sleep_seconds)
                 continue
 
             out = res.json() or {}
             data = out.get("data") or out.get("emails") or []
-            emails = []
+            meta = out.get("meta") or {}
+            next_token = meta.get("next", None)
 
-            # Snov formats vary; normalize a few common shapes
+            emails = []
             for item in data:
                 if isinstance(item, str):
                     emails.append(item.strip())
@@ -211,12 +221,11 @@ def _snov(domain: str, logger=None) -> Dict[str, Any]:
                     if e:
                         emails.append(e)
 
-            # basic split generic vs person
             emails = [e.lower() for e in emails if "@" in e and "." in e]
-            generic = [e for e in emails if any(p in e for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@"])]
-            person = [e for e in emails if e not in generic]
 
             if emails:
+                generic = [e for e in emails if any(p in e for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@"])]
+                person = [e for e in emails if e not in generic]
                 return {
                     "_attempted": True,
                     "source": "snov",
@@ -226,11 +235,14 @@ def _snov(domain: str, logger=None) -> Dict[str, Any]:
                     "catchall": [],
                 }
 
-            # no emails yet; keep polling (task still running)
-            import time
-            time.sleep(2)
+            # If Snov says there's no "next" and data is empty, the job is finished (no emails)
+            if next_token == "" or next_token is None:
+                return {"_attempted": True, "_reason": "job complete (no emails returned)"}
 
-        return {"_attempted": True, "_reason": "timeout polling links.result (task not ready / no emails found)"}
+            import time
+            time.sleep(sleep_seconds)
+
+        return {"_attempted": True, "_reason": f"timeout polling links.result after {max_polls} polls"}
 
     except Exception as ex:
         return {"_attempted": True, "_reason": f"exception: {repr(ex)}"}
