@@ -251,68 +251,57 @@ def _snov(domain: str, logger=None) -> Dict[str, Any]:
 
 
 def _fullenrich(domain: str, logger=None) -> Dict[str, Any]:
-    """
-    FULLENRICH FIX:
-      - Your logs show DNS failures for api.fullenrich.com
-      - FullEnrich docs use app.fullenrich.com/api/v1/...
-
-    IMPORTANT:
-      FullEnrich's "domain -> emails" may require a different endpoint depending on your account/product.
-      So we make the endpoint configurable and log it clearly.
-
-    Env options:
-      - FULLENRICH_API_KEY  (Bearer token)
-      - FULLENRICH_DOMAIN_URL
-          default: https://app.fullenrich.com/api/v1/contact/enrich/bulk   (CONFIGURE IF NEEDED)
-      - FULLENRICH_DISABLED=1 to skip
-    """
-    if _env_flag("FULLENRICH_DISABLED", "0"):
-        return {"_attempted": False, "_reason": "FULLENRICH_DISABLED=1"}
-
-    key = (os.getenv("FULLENRICH_API_KEY") or "").strip()
+    key = os.getenv("FULLENRICH_API_KEY")
     if not key:
         return {"_attempted": False, "_reason": "missing FULLENRICH_API_KEY"}
 
-    # NOTE: this default may not match your purchased FullEnrich product;
-    # but it will at least hit the *correct host* and give a real HTTP response (not DNS fail).
-    url = os.getenv("FULLENRICH_DOMAIN_URL", "https://app.fullenrich.com/api/v1/contact/enrich/bulk").strip()
-    if logger:
-        logger.info(f"FULLENRICH URL: {url} (domain={domain})")
+    url = "https://app.fullenrich.com/api/v1/contact/enrich/bulk"
+
+    # FullEnrich expects a non-empty "data" array; we enrich by domain.
+    payload = {
+        "data": [
+            {"domain": domain}
+        ]
+    }
 
     try:
+        if logger:
+            logger.info(f"FULLENRICH URL: {url} (domain={domain})")
+
         r = requests.post(
             url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "name": "tp_enrich_domain_lookup",
-                "data": [{"domain": domain}],
-            },
+            json=payload,
             timeout=35,
         )
 
-        # Even if this endpoint isn't the right one for your plan, you should now get a real status code.
         if r.status_code != 200:
-            if logger:
-                logger.info(f"   -> FullEnrich: HTTP {r.status_code}: {_safe_txt(r.text)} (no emails)")
-            return {"_attempted": True, "_reason": f"HTTP {r.status_code}: {_safe_txt(r.text)}"}
+            return {"_attempted": True, "_reason": f"HTTP {r.status_code}: {r.text[:500]}"}
 
         js = r.json() or {}
 
-        # If this endpoint returns an async enrichment_id, you'll need to poll "Get Enrichment Result".
-        # For now, we just log and return empty if emails aren't directly present.
+        # Be tolerant to a few possible shapes:
+        # - {"data":[{"emails":[...]}]}
+        # - {"results":[{"emails":[...]}]}
+        # - {"data":[{"contacts":[{"email":...}]}]}
+        rows = js.get("data") or js.get("results") or []
         emails = []
-        if isinstance(js, dict):
-            # try common locations
-            if isinstance(js.get("emails"), list):
-                emails = js.get("emails") or []
-            elif isinstance(js.get("data"), list) and js["data"] and isinstance(js["data"][0], dict):
-                maybe_emails = js["data"][0].get("emails")
-                if isinstance(maybe_emails, list):
-                    emails = maybe_emails
 
-        emails = [str(e).strip() for e in emails if isinstance(e, (str,)) and "@" in e]
+        for row in rows:
+            for e in (row.get("emails") or []):
+                e2 = _clean_email(e)
+                if e2:
+                    emails.append(e2)
 
-        generic = [e for e in emails if any(p in e.lower() for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@"])]
+            for c in (row.get("contacts") or []):
+                e2 = _clean_email(c.get("email"))
+                if e2:
+                    emails.append(e2)
+
+        # de-dupe
+        emails = list(dict.fromkeys(emails))
+
+        generic = [e for e in emails if any(p in e for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@"])]
         person = [e for e in emails if e not in generic]
 
         return {
@@ -324,10 +313,8 @@ def _fullenrich(domain: str, logger=None) -> Dict[str, Any]:
             "catchall": [],
         }
 
-    except Exception as e:
-        if logger:
-            logger.info(f"   -> FullEnrich exception: {repr(e)}")
-        return {"_attempted": True, "_reason": f"exception: {repr(e)}"}
+    except Exception as ex:
+        return {"_attempted": True, "_reason": f"exception: {repr(ex)}"}
 
 
 
