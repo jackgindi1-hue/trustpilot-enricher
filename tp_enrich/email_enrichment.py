@@ -25,6 +25,53 @@ def _split_generic_person(emails: List[str]) -> Tuple[List[str], List[str]]:
     person = [e for e in emails if e not in generic]
     return generic, person
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _safe_txt(s: str, n: int = 200) -> str:
+    try:
+        return (s or "")[:n]
+    except Exception:
+        return ""
+
+def _snov_get_access_token(logger=None) -> Optional[str]:
+    """
+    Supports either:
+      - SNOV_ACCESS_TOKEN (preferred if you already have it)
+      - SNOV_CLIENT_ID + SNOV_CLIENT_SECRET -> token request
+    """
+    access_token = (os.getenv("SNOV_ACCESS_TOKEN") or "").strip()
+    if access_token:
+        return access_token
+
+    client_id = (os.getenv("SNOV_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("SNOV_CLIENT_SECRET") or "").strip()
+    if not (client_id and client_secret):
+        return None
+
+    token_url = os.getenv("SNOV_TOKEN_URL", "https://api.snov.io/v1/oauth/access_token").strip()
+    if logger:
+        logger.info(f"SNOV token URL: {token_url}")
+
+    try:
+        r = requests.post(
+            token_url,
+            data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            if logger:
+                logger.info(f"   -> Snov token failed: HTTP {r.status_code}: {_safe_txt(r.text)}")
+            return None
+        js = r.json() or {}
+        return (js.get("access_token") or "").strip() or None
+    except Exception as e:
+        if logger:
+            logger.info(f"   -> Snov token exception: {repr(e)}")
+        return None
+
+
 def _pick_primary(source: Optional[str], confidence: Optional[str], generic: List[str], person: List[str], catchall: List[str]) -> Dict[str, Any]:
     # prefer generic -> person -> catchall
     for e in (generic + person + catchall):
@@ -106,88 +153,82 @@ def _apollo(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
 
 def _snov(domain: str, logger=None) -> Dict[str, Any]:
     """
-    SNOV self-proving implementation.
-    
-    Returns dict with:
-      - _attempted: bool
-      - _reason: str (if failed)
-      - source, confidence, generic_emails, person_emails, catchall_emails (if successful)
-    
-    NOTES:
-    - If you see HTTP 403 with "no permissions", that is an ACCOUNT/PLAN permission issue.
-      Code cannot fix a 403 permission denial.
-    - This function logs the exact URL used so you can verify what is being called.
+    SNOV FIX:
+      - Your logs show 404 on several endpoints.
+      - Different SNOV accounts / docs / versions may support different routes.
+      - So: try a list of endpoints (env-configurable), and log each attempt clearly.
+
+    Env options:
+      - SNOV_DOMAIN_EMAIL_URLS  (comma-separated list)
+        Example:
+          https://api.snov.io/v2/domain-emails-with-info,
+          https://api.snov.io/v2/get-domain-emails-with-info,
+          https://api.snov.io/v1/get-domain-emails-with-info
+
+      - SNOV_ACCESS_TOKEN  OR  SNOV_CLIENT_ID + SNOV_CLIENT_SECRET
     """
-    client_id = os.getenv("SNOV_CLIENT_ID")
-    client_secret = os.getenv("SNOV_CLIENT_SECRET")
-    access_token = os.getenv("SNOV_ACCESS_TOKEN")  # optional if you already store it
+    if _env_flag("SNOV_DISABLED", "0"):
+        return {"_attempted": False, "_reason": "SNOV_DISABLED=1"}
 
-    if not (access_token or (client_id and client_secret)):
-        return {"_attempted": False, "_reason": "missing SNOV auth env (SNOV_ACCESS_TOKEN or SNOV_CLIENT_ID/SNOV_CLIENT_SECRET)"}
+    token = _snov_get_access_token(logger=logger)
+    if not token:
+        return {"_attempted": False, "_reason": "missing SNOV auth (SNOV_ACCESS_TOKEN or SNOV_CLIENT_ID/SNOV_CLIENT_SECRET)"}
 
-    try:
-        # 1) Resolve token if needed
-        if not access_token and client_id and client_secret:
-            token_url = "https://api.snov.io/v1/oauth/access_token"
-            if logger:
-                logger.info(f"SNOV token URL: {token_url}")
-            tok = requests.post(
-                token_url,
-                data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
-                timeout=20,
-            )
-            if tok.status_code != 200:
-                return {"_attempted": True, "_reason": f"token HTTP {tok.status_code}: {tok.text[:300]}"}
-            access_token = (tok.json() or {}).get("access_token")
+    # Default list (can be overridden without code changes)
+    urls_raw = os.getenv(
+        "SNOV_DOMAIN_EMAIL_URLS",
+        "https://api.snov.io/v2/domain-emails-with-info,"
+        "https://api.snov.io/v2/get-domain-emails-with-info,"
+        "https://api.snov.io/v1/get-domain-emails-with-info",
+    )
+    urls = [u.strip() for u in urls_raw.split(",") if u.strip()]
 
-        if not access_token:
-            return {"_attempted": True, "_reason": "no access_token resolved"}
-
-        # 2) Try the domain emails endpoint(s).
-        # Different SNOV accounts/plans expose different methods. We try a small list and log each.
-        endpoints_to_try = [
-            "https://api.snov.io/v2/domain-emails-with-info",
-            "https://api.snov.io/v1/get-domain-emails-with-info",
-            "https://api.snov.io/v2/get-domain-emails-with-info",
-        ]
-
-        last_err = None
-        for url in endpoints_to_try:
+    last_err = None
+    for url in urls:
+        try:
             if logger:
                 logger.info(f"SNOV domain email URL: {url} (domain={domain})")
 
-            r = requests.post(
-                url,
-                data={"access_token": access_token, "domain": domain},
-                timeout=25,
-            )
+            # Many SNOV endpoints are form-encoded POSTs
+            r = requests.post(url, data={"access_token": token, "domain": domain}, timeout=30)
 
-            # 403 = permissions/plan, not code
             if r.status_code == 403:
-                last_err = f"HTTP 403 (permissions): {r.text[:300]}"
-                continue
+                last_err = f"HTTP 403 (permission): {_safe_txt(r.text)}"
+                if logger:
+                    logger.info(f"   -> Snov: HTTP 403: {_safe_txt(r.text)} (no emails)")
+                # 403 usually means your SNOV plan/key lacks that method — stop early
+                break
 
-            # 404 = endpoint not present in this API version/account
             if r.status_code == 404:
-                last_err = f"HTTP 404 (endpoint not found): {r.text[:300]}"
+                last_err = f"HTTP 404 (endpoint not found): {_safe_txt(r.text)}"
+                # try next URL
                 continue
 
             if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+                last_err = f"HTTP {r.status_code}: {_safe_txt(r.text)}"
+                # try next URL
                 continue
 
             js = r.json() or {}
 
-            # SNOV response formats vary; support a couple common shapes
-            raw_items = js.get("emails") or js.get("data") or []
+            # Be flexible: SNOV sometimes returns different shapes
+            candidates = []
+            if isinstance(js, dict):
+                if isinstance(js.get("emails"), list):
+                    candidates = js.get("emails") or []
+                elif isinstance(js.get("data"), dict) and isinstance(js["data"].get("emails"), list):
+                    candidates = js["data"].get("emails") or []
+
             emails = []
-            for item in raw_items:
-                if isinstance(item, dict):
-                    e = item.get("email") or item.get("value")
-                else:
-                    e = item
-                if e:
-                    emails.append(str(e).strip())
+            for item in candidates:
+                if isinstance(item, str):
+                    emails.append(item)
+                elif isinstance(item, dict):
+                    e = item.get("email") or item.get("value") or item.get("address")
+                    if e:
+                        emails.append(str(e).strip())
+
+            emails = [e for e in emails if "@" in e]  # basic sanity
 
             generic = [e for e in emails if any(p in e.lower() for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@"])]
             person = [e for e in emails if e not in generic]
@@ -201,50 +242,75 @@ def _snov(domain: str, logger=None) -> Dict[str, Any]:
                 "catchall": [],
             }
 
-        return {"_attempted": True, "_reason": f"snov exhausted; last_err={last_err}"}
+        except Exception as e:
+            last_err = f"exception: {repr(e)}"
+            continue
 
-    except Exception as ex:
-        return {"_attempted": True, "_reason": f"exception: {repr(ex)}"}
+    return {"_attempted": True, "_reason": f"snov exhausted; last_err={last_err}"}
+
 
 
 def _fullenrich(domain: str, logger=None) -> Dict[str, Any]:
     """
-    FULLENRICH self-proving implementation.
-    
-    Returns dict with:
-      - _attempted: bool
-      - _reason: str (if failed)
-      - source, confidence, generic_emails, person_emails, catchall_emails (if successful)
-    
-    NOTES:
-    - Your logs show DNS resolution failure. That usually means:
-      (a) wrong hostname/base URL, or
-      (b) your environment can't resolve that domain.
-    - Make base URL configurable via FULLENRICH_BASE_URL and log it.
+    FULLENRICH FIX:
+      - Your logs show DNS failures for api.fullenrich.com
+      - FullEnrich docs use app.fullenrich.com/api/v1/...
+
+    IMPORTANT:
+      FullEnrich's "domain -> emails" may require a different endpoint depending on your account/product.
+      So we make the endpoint configurable and log it clearly.
+
+    Env options:
+      - FULLENRICH_API_KEY  (Bearer token)
+      - FULLENRICH_DOMAIN_URL
+          default: https://app.fullenrich.com/api/v1/contact/enrich/bulk   (CONFIGURE IF NEEDED)
+      - FULLENRICH_DISABLED=1 to skip
     """
-    key = os.getenv("FULLENRICH_API_KEY")
+    if _env_flag("FULLENRICH_DISABLED", "0"):
+        return {"_attempted": False, "_reason": "FULLENRICH_DISABLED=1"}
+
+    key = (os.getenv("FULLENRICH_API_KEY") or "").strip()
     if not key:
         return {"_attempted": False, "_reason": "missing FULLENRICH_API_KEY"}
 
-    base = os.getenv("FULLENRICH_BASE_URL", "https://api.fullenrich.com").rstrip("/")
-    url = f"{base}/v1/domain"
+    # NOTE: this default may not match your purchased FullEnrich product;
+    # but it will at least hit the *correct host* and give a real HTTP response (not DNS fail).
+    url = os.getenv("FULLENRICH_DOMAIN_URL", "https://app.fullenrich.com/api/v1/contact/enrich/bulk").strip()
+    if logger:
+        logger.info(f"FULLENRICH URL: {url} (domain={domain})")
 
     try:
-        if logger:
-            logger.info(f"FULLENRICH URL: {url} (domain={domain})")
-
         r = requests.post(
             url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"domain": domain},
-            timeout=25,
+            json={
+                "name": "tp_enrich_domain_lookup",
+                "data": [{"domain": domain}],
+            },
+            timeout=35,
         )
+
+        # Even if this endpoint isn't the right one for your plan, you should now get a real status code.
         if r.status_code != 200:
-            return {"_attempted": True, "_reason": f"HTTP {r.status_code}: {r.text[:300]}"}
+            if logger:
+                logger.info(f"   -> FullEnrich: HTTP {r.status_code}: {_safe_txt(r.text)} (no emails)")
+            return {"_attempted": True, "_reason": f"HTTP {r.status_code}: {_safe_txt(r.text)}"}
 
         js = r.json() or {}
-        raw_emails = js.get("emails") or js.get("data", {}).get("emails") or []
-        emails = [str(e).strip() for e in raw_emails if e]
+
+        # If this endpoint returns an async enrichment_id, you'll need to poll "Get Enrichment Result".
+        # For now, we just log and return empty if emails aren't directly present.
+        emails = []
+        if isinstance(js, dict):
+            # try common locations
+            if isinstance(js.get("emails"), list):
+                emails = js.get("emails") or []
+            elif isinstance(js.get("data"), list) and js["data"] and isinstance(js["data"][0], dict):
+                maybe_emails = js["data"][0].get("emails")
+                if isinstance(maybe_emails, list):
+                    emails = maybe_emails
+
+        emails = [str(e).strip() for e in emails if isinstance(e, (str,)) and "@" in e]
 
         generic = [e for e in emails if any(p in e.lower() for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@"])]
         person = [e for e in emails if e not in generic]
@@ -258,8 +324,11 @@ def _fullenrich(domain: str, logger=None) -> Dict[str, Any]:
             "catchall": [],
         }
 
-    except Exception as ex:
-        return {"_attempted": True, "_reason": f"exception: {repr(ex)}"}
+    except Exception as e:
+        if logger:
+            logger.info(f"   -> FullEnrich exception: {repr(e)}")
+        return {"_attempted": True, "_reason": f"exception: {repr(e)}"}
+
 
 
 def run_email_waterfall(domain: Optional[str], company_name: Optional[str] = None, logger: Any = None, **kwargs) -> Dict[str, Any]:
