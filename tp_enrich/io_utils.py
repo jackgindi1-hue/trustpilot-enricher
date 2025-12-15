@@ -139,14 +139,19 @@ def load_input_csv(filepath: str) -> pd.DataFrame:
     return df
 
 
-def write_output_csv(df, output_path: str):
+def write_output_csv(df, output_path: str, *args, **kwargs):
     """
     Write enriched CSV reliably.
+
+    IMPORTANT:
+    Some callers pass (df, output_path, logger) or other extra args.
+    We accept *args/**kwargs to stay compatible and avoid 500s.
+
     - Never silently drops enrichment columns
     - Ensures expected enrichment columns exist (creates them if missing)
     - Writes expected columns first, then any extra columns that may exist
     """
-    # The columns your pipeline is designed to produce (based on prior runs/logs)
+
     expected_cols = [
         "consumer.displayname",
         "date",
@@ -186,25 +191,25 @@ def write_output_csv(df, output_path: str):
         "source_platform",
     ]
 
-    # Make sure all expected columns exist (so they can be exported)
+    # Ensure expected columns exist
     for col in expected_cols:
         if col not in df.columns:
             df[col] = None
 
-    # Order: expected first, then anything else your df contains
+    # Keep expected first, then extras
     extras = [c for c in df.columns.tolist() if c not in expected_cols]
     final_cols = expected_cols + extras
 
-    # Quick sanity logging
+    # Sanity log
     try:
         phones = int(df["primary_phone"].notna().sum())
         emails = int(df["primary_email"].notna().sum())
         logger.info(f"Export sanity: rows={len(df)} phones_nonnull={phones} emails_nonnull={emails}")
     except Exception:
-        logger.info(f"Export sanity: rows={len(df)} (could not compute phone/email nonnull counts)")
+        logger.info(f"Export sanity: rows={len(df)} (could not compute phone/email counts)")
 
     logger.info(f"Writing output CSV to: {output_path}")
-    logger.info(f"Final columns: {final_cols}")
+    logger.info(f"Final columns count: {len(final_cols)}")
 
     df.to_csv(output_path, index=False, columns=final_cols)
     logger.info(f"Successfully wrote {len(df)} rows to {output_path}")
