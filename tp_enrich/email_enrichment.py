@@ -135,69 +135,105 @@ def _apollo(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
 
 def _snov(domain: str, logger=None) -> Dict[str, Any]:
     """
-    Uses SNOV new Domain Search endpoints:
-      POST https://api.snov.io/v2/domain-search/domain-emails/start?domain=...
-      GET  https://api.snov.io/v2/domain-search/domain-emails/result/{task_hash}
-    (Docs show result contains: data: [{email: ...}, ...]) 
+    SNOV Domain Search (async):
+    - Start task (returns 202)
+    - Poll links.result until emails are ready
     """
-    token = _get_snov_access_token(logger=logger)
-    if not token:
-        return {"_attempted": False, "_reason": "missing SNOV auth env (SNOV_ACCESS_TOKEN or SNOV_CLIENT_ID/SNOV_CLIENT_SECRET)"}
+    client_id = os.getenv("SNOV_CLIENT_ID")
+    client_secret = os.getenv("SNOV_CLIENT_SECRET")
+    access_token = os.getenv("SNOV_ACCESS_TOKEN")
 
-    headers = {"Authorization": f"Bearer {token}"}
+    if not (access_token or (client_id and client_secret)):
+        return {"_attempted": False, "_reason": "missing SNOV auth (SNOV_ACCESS_TOKEN or SNOV_CLIENT_ID/SNOV_CLIENT_SECRET)"}
 
-    start_url = "https://api.snov.io/v2/domain-search/domain-emails/start"
-    if logger:
-        logger.info(f"SNOV domain email URL: {start_url} (domain={domain})")
+    def _log(msg: str):
+        if logger:
+            logger.info(msg)
 
-    # NOTE: docs show POST with params=domain 
-    r = requests.post(start_url, params={"domain": domain}, headers=headers, timeout=30)
-    if r.status_code != 200:
-        return {"_attempted": True, "_reason": f"HTTP {r.status_code}: {r.text[:200]}"}
+    try:
+        # 1) Get token if needed
+        if not access_token and client_id and client_secret:
+            token_url = "https://api.snov.io/v1/oauth/access_token"
+            _log(f"SNOV token URL: {token_url}")
+            tok = requests.post(
+                token_url,
+                data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
+                timeout=25,
+            )
+            if tok.status_code != 200:
+                return {"_attempted": True, "_reason": f"token HTTP {tok.status_code}: {tok.text[:250]}"}
+            access_token = (tok.json() or {}).get("access_token")
 
-    js = r.json() or {}
-    result_url = (js.get("links") or {}).get("result")
-    task_hash = (js.get("meta") or {}).get("task_hash")
+        if not access_token:
+            return {"_attempted": True, "_reason": "no access_token resolved"}
 
-    if not result_url and task_hash:
-        result_url = f"https://api.snov.io/v2/domain-search/domain-emails/result/{task_hash}"
+        # 2) Start async task
+        start_url = "https://api.snov.io/v2/domain-search/domain-emails/start"
+        _log(f"SNOV domain email URL: {start_url} (domain={domain})")
 
-    if not result_url:
-        return {"_attempted": True, "_reason": f"no result link/task_hash in response: {str(js)[:200]}"}
+        r = requests.post(
+            start_url,
+            data={"access_token": access_token, "domain": domain},
+            timeout=30,
+        )
 
-    # Poll a couple times in case it's "in progress"
-    emails = []
-    last_status = None
-    for _ in range(3):
-        rr = requests.get(result_url, headers=headers, timeout=30)
-        if rr.status_code != 200:
-            return {"_attempted": True, "_reason": f"result HTTP {rr.status_code}: {rr.text[:200]}"}
-        out = rr.json() or {}
-        last_status = out.get("status")
+        if r.status_code not in (200, 202):
+            return {"_attempted": True, "_reason": f"HTTP {r.status_code}: {r.text[:250]}"}
 
-        for item in (out.get("data") or []):
-            e = _clean_email(item.get("email"))
-            if e:
-                emails.append(e)
+        js = r.json() or {}
+        links = js.get("links") or {}
+        result_url = links.get("result")
+        if not result_url:
+            # Some responses may already include data (rare)
+            return {"_attempted": True, "_reason": f"missing links.result; body={str(js)[:250]}"}
 
-        if emails or last_status == "completed":
-            break
+        # 3) Poll result endpoint
+        # Try up to ~20 seconds total (10 polls x 2s)
+        for i in range(10):
+            _log(f"SNOV poll {i+1}/10: GET {result_url}")
+            res = requests.get(result_url, timeout=30)
+            if res.status_code != 200:
+                # keep polling unless hard fail
+                import time
+                time.sleep(2)
+                continue
 
-        import time
-        time.sleep(1.0)
+            out = res.json() or {}
+            data = out.get("data") or out.get("emails") or []
+            emails = []
 
-    emails = sorted(set(emails))
-    generic = [e for e in emails if any(p in e for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@", "billing@"])]
-    person = [e for e in emails if e not in generic]
+            # Snov formats vary; normalize a few common shapes
+            for item in data:
+                if isinstance(item, str):
+                    emails.append(item.strip())
+                elif isinstance(item, dict):
+                    e = (item.get("email") or item.get("value") or "").strip()
+                    if e:
+                        emails.append(e)
 
-    return {
-        "_attempted": True,
-        "source": "snov",
-        "confidence": "medium" if emails else None,
-        "generic": generic,
-        "person": person,
-        "catchall": [],
-    }
+            # basic split generic vs person
+            emails = [e.lower() for e in emails if "@" in e and "." in e]
+            generic = [e for e in emails if any(p in e for p in ["info@", "support@", "sales@", "hello@", "contact@", "admin@"])]
+            person = [e for e in emails if e not in generic]
+
+            if emails:
+                return {
+                    "_attempted": True,
+                    "source": "snov",
+                    "confidence": "medium",
+                    "generic": generic,
+                    "person": person,
+                    "catchall": [],
+                }
+
+            # no emails yet; keep polling (task still running)
+            import time
+            time.sleep(2)
+
+        return {"_attempted": True, "_reason": "timeout polling links.result (task not ready / no emails found)"}
+
+    except Exception as ex:
+        return {"_attempted": True, "_reason": f"exception: {repr(ex)}"}
 
 
 
