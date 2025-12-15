@@ -184,83 +184,129 @@ def _fullenrich(domain: str) -> Tuple[Optional[Dict[str, Any]], str]:
 
 def run_email_waterfall(domain: Optional[str], company_name: Optional[str] = None, logger: Any = None, **kwargs) -> Dict[str, Any]:
     """
-    Guaranteed stable API for pipeline:
-      - returns primary_email fields + *_emails_json
-      - returns provider_status_json so you can PROVE which providers ran and why they failed
+    STRICT sequential waterfall with self-proving tracking.
+    
+    Always returns:
+      - primary_email fields + *_emails_json
+      - email_waterfall_tried: comma-separated list of providers attempted
+      - email_waterfall_winner: provider that found emails (or None)
+      - provider_status_json: JSON string with attempt details
+    
+    Logs cannot lie - these fields are set by the function itself.
     """
-    if not domain:
-        return {**_pick_primary(None, None, [], [], []), "provider_status_json": "{}"}
-
-    d = str(domain).strip().lower()
-    if any(d == bad or d.endswith("." + bad) for bad in BLOCKED_EMAIL_DOMAINS):
-        # Don't waste credits on facebook/linkedin etc.
-        out = _pick_primary(None, None, [], [], [])
-        out["provider_status_json"] = json.dumps({"blocked_domain": d})
-        return out
-
+    
+    tried = []
+    winner = None
     status = {}
-
+    
     def _log(msg: str):
         if logger:
             logger.info(msg)
-
-    _log(f"EMAIL WATERFALL: domain={d} company={company_name}")
-
-    # Explicit sequential waterfall: Hunter → Snov → Apollo → FullEnrich
-    # Each provider runs independently with no early exits except on email success.
-
+    
+    _log(f"EMAIL WATERFALL: domain={domain} company={company_name}")
+    
+    # Handle empty domain
+    if not domain:
+        out = _pick_primary(None, None, [], [], [])
+        out["email_waterfall_tried"] = ""
+        out["email_waterfall_winner"] = None
+        out["provider_status_json"] = "{}"
+        return out
+    
+    d = str(domain).strip().lower()
+    
+    # Handle blocked domains
+    if any(d == bad or d.endswith("." + bad) for bad in BLOCKED_EMAIL_DOMAINS):
+        out = _pick_primary(None, None, [], [], [])
+        out["email_waterfall_tried"] = ""
+        out["email_waterfall_winner"] = None
+        out["provider_status_json"] = json.dumps({"blocked_domain": d})
+        return out
+    
+    # STRICT SEQUENTIAL WATERFALL: Hunter → Snov → Apollo → FullEnrich
+    # Each provider runs independently. Track ALL attempts.
+    
     # 1. Try Hunter
+    tried.append("hunter")
     try:
         payload, note = _hunter(d)
         status["hunter"] = {"attempted": True, "note": note}
-        if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
+        if payload and (payload.get("generic") or payload.get("person") or payload.get("catchall")):
+            winner = "hunter"
             out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out["email_waterfall_tried"] = ",".join(tried)
+            out["email_waterfall_winner"] = winner
             out["provider_status_json"] = json.dumps(status)
+            _log(f"   -> Hunter SUCCESS: found {len(payload.get('generic', []))} generic, {len(payload.get('person', []))} person emails")
             return out
+        _log(f"   -> Hunter: {note} (no emails)")
     except Exception as e:
         status["hunter"] = {"attempted": True, "note": f"exception: {repr(e)}"}
-
+        _log(f"   -> Hunter exception: {repr(e)}")
+    
     # 2. Try Snov
+    tried.append("snov")
     try:
         payload, note = _snov(d)
         status["snov"] = {"attempted": True, "note": note}
-        if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
+        if payload and (payload.get("generic") or payload.get("person") or payload.get("catchall")):
+            winner = "snov"
             out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out["email_waterfall_tried"] = ",".join(tried)
+            out["email_waterfall_winner"] = winner
             out["provider_status_json"] = json.dumps(status)
+            _log(f"   -> Snov SUCCESS: found {len(payload.get('generic', []))} generic, {len(payload.get('person', []))} person emails")
             return out
+        _log(f"   -> Snov: {note} (no emails)")
     except Exception as e:
         status["snov"] = {"attempted": True, "note": f"exception: {repr(e)}"}
-
+        _log(f"   -> Snov exception: {repr(e)}")
+    
     # 3. Try Apollo
+    tried.append("apollo")
     try:
         payload, note = _apollo(d)
         status["apollo"] = {"attempted": True, "note": note}
-        if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
+        if payload and (payload.get("generic") or payload.get("person") or payload.get("catchall")):
+            winner = "apollo"
             out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out["email_waterfall_tried"] = ",".join(tried)
+            out["email_waterfall_winner"] = winner
             out["provider_status_json"] = json.dumps(status)
+            _log(f"   -> Apollo SUCCESS: found {len(payload.get('generic', []))} generic, {len(payload.get('person', []))} person emails")
             return out
+        _log(f"   -> Apollo: {note} (no emails)")
     except Exception as e:
         status["apollo"] = {"attempted": True, "note": f"exception: {repr(e)}"}
-
+        _log(f"   -> Apollo exception: {repr(e)}")
+    
     # 4. Try FullEnrich
+    tried.append("fullenrich")
     try:
         payload, note = _fullenrich(d)
         status["fullenrich"] = {"attempted": True, "note": note}
-        if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
+        if payload and (payload.get("generic") or payload.get("person") or payload.get("catchall")):
+            winner = "fullenrich"
             out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out["email_waterfall_tried"] = ",".join(tried)
+            out["email_waterfall_winner"] = winner
             out["provider_status_json"] = json.dumps(status)
+            _log(f"   -> FullEnrich SUCCESS: found {len(payload.get('generic', []))} generic, {len(payload.get('person', []))} person emails")
             return out
+        _log(f"   -> FullEnrich: {note} (no emails)")
     except Exception as e:
         status["fullenrich"] = {"attempted": True, "note": f"exception: {repr(e)}"}
-
+        _log(f"   -> FullEnrich exception: {repr(e)}")
+    
+    # All providers failed or returned no emails
+    _log(f"   -> All providers exhausted. Tried: {','.join(tried)}")
     out = _pick_primary(None, None, [], [], [])
+    out["email_waterfall_tried"] = ",".join(tried)
+    out["email_waterfall_winner"] = None
     out["provider_status_json"] = json.dumps(status)
     return out
 
 
-# ============================================================
-# BACKWARD COMPATIBILITY: Maintain enrich_emails_for_domain
-# ============================================================
 def enrich_emails_for_domain(domain: str, company_name: Optional[str] = None, logger=None) -> Dict[str, Any]:
     """
     Legacy function name - calls run_email_waterfall for backward compatibility
