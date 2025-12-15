@@ -206,18 +206,52 @@ def run_email_waterfall(domain: Optional[str], company_name: Optional[str] = Non
 
     _log(f"EMAIL WATERFALL: domain={d} company={company_name}")
 
-    # Order: Hunter → Apollo → Snov → FullEnrich (you can reorder later)
-    # The key point: we always attempt the next provider if nothing found.
-    for name, fn in [("hunter", _hunter), ("apollo", _apollo), ("snov", _snov), ("fullenrich", _fullenrich)]:
-        try:
-            payload, note = fn(d)
-            status[name] = {"attempted": True, "note": note}
-            if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
-                out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
-                out["provider_status_json"] = json.dumps(status)
-                return out
-        except Exception as e:
-            status[name] = {"attempted": True, "note": f"exception: {repr(e)}"}
+    # Explicit sequential waterfall: Hunter → Snov → Apollo → FullEnrich
+    # Each provider runs independently with no early exits except on email success.
+
+    # 1. Try Hunter
+    try:
+        payload, note = _hunter(d)
+        status["hunter"] = {"attempted": True, "note": note}
+        if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
+            out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out["provider_status_json"] = json.dumps(status)
+            return out
+    except Exception as e:
+        status["hunter"] = {"attempted": True, "note": f"exception: {repr(e)}"}
+
+    # 2. Try Snov
+    try:
+        payload, note = _snov(d)
+        status["snov"] = {"attempted": True, "note": note}
+        if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
+            out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out["provider_status_json"] = json.dumps(status)
+            return out
+    except Exception as e:
+        status["snov"] = {"attempted": True, "note": f"exception: {repr(e)}"}
+
+    # 3. Try Apollo
+    try:
+        payload, note = _apollo(d)
+        status["apollo"] = {"attempted": True, "note": note}
+        if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
+            out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out["provider_status_json"] = json.dumps(status)
+            return out
+    except Exception as e:
+        status["apollo"] = {"attempted": True, "note": f"exception: {repr(e)}"}
+
+    # 4. Try FullEnrich
+    try:
+        payload, note = _fullenrich(d)
+        status["fullenrich"] = {"attempted": True, "note": note}
+        if payload and (payload["generic"] or payload["person"] or payload["catchall"]):
+            out = _pick_primary(payload["source"], payload["confidence"], payload["generic"], payload["person"], payload["catchall"])
+            out["provider_status_json"] = json.dumps(status)
+            return out
+    except Exception as e:
+        status["fullenrich"] = {"attempted": True, "note": f"exception: {repr(e)}"}
 
     out = _pick_primary(None, None, [], [], [])
     out["provider_status_json"] = json.dumps(status)
