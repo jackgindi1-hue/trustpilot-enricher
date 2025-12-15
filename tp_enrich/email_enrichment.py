@@ -161,3 +161,48 @@ def run_email_waterfall(domain: Optional[str], logger=None) -> Dict[str, Any]:
 
     out["provider_debug"] = attempts
     return out
+
+
+# ============================================================
+# BACKWARDS COMPATIBILITY WRAPPER
+# ============================================================
+
+def enrich_emails_for_domain(domain: str, logger=None) -> dict:
+    """
+    Backwards-compatible wrapper so existing pipeline imports keep working.
+
+    Returns keys that pipeline expects:
+      - primary_email
+      - primary_email_source
+      - primary_email_confidence
+      - generic_emails_json
+      - person_emails_json
+      - catchall_emails_json
+    """
+    # run_email_waterfall is the new implementation
+    result = run_email_waterfall(domain, logger=logger)
+
+    primary_email = result.get("primary_email")
+    primary_email_source = result.get("primary_email_source")
+    primary_email_confidence = result.get("primary_email_confidence")
+
+    # Keep the existing CSV/debug columns populated in a safe way:
+    provider_debug = result.get("provider_debug") or []
+    # Put everything in generic_emails_json for now (so you can see attempts/results)
+    generic_emails_json = json.dumps(provider_debug)
+
+    return {
+        "primary_email": primary_email,
+        "primary_email_source": primary_email_source,
+        "primary_email_confidence": primary_email_confidence,
+        "generic_emails_json": generic_emails_json,
+        "person_emails_json": None,
+        "catchall_emails_json": None,
+    }
+
+# Some codebases used this older name; alias it too just in case.
+enrich_email_for_domain = enrich_emails_for_domain
+
+# ============================================================
+# END BACKWARDS COMPATIBILITY WRAPPER
+# ============================================================
