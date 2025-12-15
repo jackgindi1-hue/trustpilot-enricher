@@ -211,7 +211,18 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
     logger.info(f"Writing output CSV to: {output_path}")
     logger.info(f"Final columns count: {len(final_cols)}")
 
-    df.to_csv(output_path, index=False, columns=final_cols)
+    # --- CSV SANITIZE (prevents "rectangle" glyphs / control chars) ---
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = (
+                df[c]
+                .astype(str)
+                .str.replace(r"[\u0000-\u001F\u007F]", "", regex=True)  # control chars
+                .str.replace("\u00A0", " ", regex=False)                # nbsp
+            )
+    # write with explicit utf-8
+    df.to_csv(output_path, index=False, columns=final_cols, encoding="utf-8")
+    # --- END CSV SANITIZE ---
     logger.info(f"Successfully wrote {len(df)} rows to {output_path}")
 
 
