@@ -158,6 +158,7 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
         "raw_display_name",
         "review_date",
         "row_id",
+        "run_id",
         "name_classification",
         "company_search_name",
         "company_normalized_key",
@@ -235,6 +236,7 @@ def get_output_schema() -> List[str]:
     """
     return [
         'row_id',
+        'run_id',
         'source_platform',
         'source_lender_name',
         'source_review_url',

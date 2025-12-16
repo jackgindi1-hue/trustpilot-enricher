@@ -4,6 +4,8 @@ Extracted from main.py to enable both CLI and API access
 """
 import os
 import json
+import uuid
+import datetime
 import pandas as pd
 import numpy as np
 from typing import Dict, Optional, Any
@@ -311,12 +313,13 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
 
     row["confidence"] = _compute_confidence(row)
     return row
-def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
+def enrich_business(business_info: Dict, cache: EnrichmentCache, run_id: str = None) -> Dict:
     """
     Enrich a single business through all sources
     Args:
         business_info: Business information dict
         cache: Enrichment cache
+        run_id: Optional RUN_ID for tracing this enrichment run
     Returns:
         Complete enrichment result
     """
@@ -379,6 +382,9 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache) -> Dict:
         "email_waterfall_winner": enriched_data.get("email_waterfall_winner"),
 
         "source_platform": "trustpilot",
+
+        # RUN_ID for tracing this enrichment run
+        "run_id": run_id or "",
     }
     # --- END BUILD ENRICHED ROW ---
 
@@ -405,6 +411,13 @@ def run_pipeline(
     logger.info("="*60)
     logger.info("Starting Trustpilot Enrichment Pipeline")
     logger.info("="*60)
+
+    # ============================================================
+    # RUN ID (trace one CSV run across logs + output)
+    # ============================================================
+    RUN_ID = f"{datetime.datetime.utcnow().isoformat()}_{uuid.uuid4().hex[:8]}"
+    logger.info(f"RUN_ID={RUN_ID}")
+
     config = config or {}
     # Load input CSV
     logger.info("Step 1: Loading input CSV...")
@@ -509,14 +522,15 @@ def run_pipeline(
     for idx, (normalized_key, business_info) in enumerate(unique_businesses.items(), 1):
         logger.info(f"  [{idx}/{len(unique_businesses)}] Processing: {business_info['company_search_name']}")
         try:
-            result = enrich_business(business_info, cache)
+            result = enrich_business(business_info, cache, run_id=RUN_ID)
             enrichment_results[normalized_key] = result
         except Exception as e:
             logger.error(f"  Error enriching {business_info['company_search_name']}: {e}")
             enrichment_results[normalized_key] = {
                 'enrichment_status': 'error',
                 'enrichment_notes': str(e),
-                'overall_lead_confidence': 'failed'
+                'overall_lead_confidence': 'failed',
+                'run_id': RUN_ID
             }
     # Save cache
     cache.save_cache()
