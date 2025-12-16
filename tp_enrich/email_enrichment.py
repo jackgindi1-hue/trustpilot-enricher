@@ -11,10 +11,34 @@ import os
 import re
 import json
 import time
+import logging
 import requests
 from typing import Any, Dict, Optional
 
 GENERIC_PREFIXES = ("info@", "support@", "sales@", "hello@", "contact@", "admin@", "billing@", "help@")
+
+# ============================================================
+# BOOT-TIME ENV CHECK (logs once on container start)
+# ============================================================
+logging.getLogger("uvicorn").info(
+    f"BOOT ENV CHECK: "
+    f"HUNTER_API_KEY present={bool(os.getenv('HUNTER_API_KEY'))} "
+    f"len={len(os.getenv('HUNTER_API_KEY') or '')} | "
+    f"HUNTER_KEY present={bool(os.getenv('HUNTER_KEY'))} "
+    f"len={len(os.getenv('HUNTER_KEY') or '')}"
+)
+
+# ============================================================
+# HELPER: Mask API keys for safe logging
+# ============================================================
+def _mask(s: Optional[str]) -> str:
+    """Mask API key for safe logging (show first 3 + last 3 chars)"""
+    if not s:
+        return "None"
+    s = str(s)
+    if len(s) <= 6:
+        return "***"
+    return s[:3] + "***" + s[-3:]
 
 def _clean_email(s: str) -> Optional[str]:
     if not s:
@@ -66,31 +90,74 @@ def _log(logger: Any, msg: str):
         except Exception:
             pass
 
-# -----------------------------
-# HUNTER (domain-search)
-# -----------------------------
+# ============================================================
+# HUNTER (domain-search) - ENHANCED DEBUG VERSION
+# ============================================================
 def _hunter_domain_search(domain: str, logger=None) -> Dict[str, Any]:
+    """
+    Hunter.io domain search with comprehensive debug logging
+
+    Returns dict with:
+        - ok: bool (success/failure)
+        - attempted: bool (whether API call was attempted)
+        - reason: str (error message if failed)
+        - source: str ('hunter')
+        - confidence: str ('high'/'medium'/None)
+        - generic: list (generic emails like info@, support@)
+        - person: list (person emails)
+        - catchall: list (catchall emails)
+    """
+    # Accept either env var name, prefer HUNTER_API_KEY
     key = os.getenv("HUNTER_API_KEY") or os.getenv("HUNTER_KEY")
+
+    # ENHANCED DEBUG LOGGING
+    if logger:
+        logger.info(
+            f"HUNTER ENV CHECK: "
+            f"HUNTER_API_KEY present={bool(os.getenv('HUNTER_API_KEY'))} "
+            f"(len={len(os.getenv('HUNTER_API_KEY') or '')}) | "
+            f"HUNTER_KEY present={bool(os.getenv('HUNTER_KEY'))} "
+            f"(len={len(os.getenv('HUNTER_KEY') or '')}) | "
+            f"chosen={_mask(key)}"
+        )
+
     if not key:
-        return {"ok": False, "attempted": False, "reason": "missing HUNTER_API_KEY"}
+        return {
+            "ok": False,
+            "attempted": False,
+            "reason": "missing HUNTER_API_KEY (or HUNTER_KEY)"
+        }
 
     url = "https://api.hunter.io/v2/domain-search"
     params = {"domain": domain, "api_key": key}
 
     try:
         r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return {"ok": False, "attempted": True, "reason": f"HTTP {r.status_code}: {r.text[:200]}"}
 
-        js = r.json() or {}
-        raw = (js.get("data", {}) or {}).get("emails", []) or []
+        if r.status_code != 200:
+            return {
+                "ok": False,
+                "attempted": True,
+                "reason": f"HTTP {r.status_code}: {r.text[:200]}"
+            }
+
+        data = r.json() or {}
         emails = []
-        for item in raw:
-            e = _clean_email((item or {}).get("value"))
+
+        for item in (data.get("data", {}).get("emails") or []):
+            e = _clean_email(item.get("value"))
             if e:
                 emails.append(e)
 
-        generic, person = _split_generic_person(emails)
+        # Split into generic vs person emails
+        generic = [
+            e for e in emails
+            if any(p in e for p in [
+                "info@", "support@", "sales@", "hello@", "contact@", "admin@"
+            ])
+        ]
+        person = [e for e in emails if e not in generic]
+
         return {
             "ok": True,
             "attempted": True,
@@ -101,8 +168,12 @@ def _hunter_domain_search(domain: str, logger=None) -> Dict[str, Any]:
             "catchall": [],
         }
 
-    except Exception as e:
-        return {"ok": False, "attempted": True, "reason": f"exception: {repr(e)}"}
+    except Exception as ex:
+        return {
+            "ok": False,
+            "attempted": True,
+            "reason": f"exception: {repr(ex)}"
+        }
 
 # -----------------------------
 # SNOV (async domain emails)
