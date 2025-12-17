@@ -257,7 +257,7 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     # ============================================================
     # PHASE 2: Apply fallback enrichment for phone/website coverage
     # ============================================================
-    from tp_enrich.phase2_enrichment import apply_phase2_fallbacks
+    from tp_enrich.phase2_enrichment import apply_phase2_fallbacks_v2
     logger.info(f"   -> Applying Phase 2 fallbacks for {name}")
     # Build google_payload from local enrichment data
     google_payload = {
@@ -269,7 +269,7 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
         "state": row.get("state_region"),
         "postal_code": row.get("postal_code"),
     }
-    p2 = apply_phase2_fallbacks(
+    p2 = apply_phase2_fallbacks_v2(
         business_name=name,
         google_payload=google_payload,
         current_phone=row.get("primary_phone"),
@@ -290,14 +290,14 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
         # NEW: Store contact names extracted from BBB/YP/OC scrapers
     contact_names = p2.get("contact_names", [])
     if contact_names:
-        row["contact_names_json"] = str(contact_names)
+        row["phase2_bbb_names_json"] = str(contact_names)
         logger.info(f"   -> Phase 2 extracted {len(contact_names)} contact names: {contact_names}")
     else:
-        row["contact_names_json"] = "[]"
+        row["phase2_bbb_names_json"] = "[]"
     
     # Add discovery URLs (optional but useful)
-    row["bbb_url"] = p2.get("bbb_url")
-    row["yellowpages_url"] = p2.get("yp_url")
+    row["phase2_bbb_link"] = p2.get("bbb_url")
+    row["phase2_yp_link"] = p2.get("yp_url")
     row["yelp_url"] = p2.get("yelp_url")
     # Add OpenCorporates validation (optional)
     row["oc_company_number"] = p2.get("oc_company_number")
