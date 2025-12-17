@@ -1,12 +1,16 @@
 # ============================================================
-# HOTFIX: Fix Hunter using HUNTER_KEY + Fix Phase2 KeyError
-# - Hunter: ALWAYS read HUNTER_KEY (fallback to HUNTER_API_KEY if ever added)
-# - Phase2: ALWAYS define phase2_* keys so CSV writer never KeyErrors
-# - Phase2 YP: link only (no HTML fetch)
+# PHASE 2 CONTACT DATA PATCH (NO URL-ONLY OUTPUTS)
+# Goal: Extract DATA (phone/email/contact_name), not just links.
+# - BBB: fetch profile HTML (when we have a BBB profile URL) and extract:
+#        phone(s), email(s), contact_name (best-guess filtered)
+# - YellowPages: DO NOT HTML fetch (blocks). Use SerpApi Google Search
+#        and parse snippet/title for phone/email if present.
+# - OpenCorporates: verification only (no phone/email expectation).
 # ============================================================
 
 import os
 import re
+import html
 import requests
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -49,9 +53,10 @@ def phase2_env_debug(logger=None) -> None:
         )
 
 # -----------------------------
-# PHONE
+# NORMALIZATION / EXTRACTION
 # -----------------------------
-_US_PHONE_RE = re.compile(r"\+?1?\s*[\(\-\.]?\s*(\d{3})\s*[\)\-\.]?\s*(\d{3})\s*[\-\.]?\s*(\d{4})")
+_US_PHONE_RE = re.compile(r"(?:\+?1[\s\-\.])?(?:\(?([2-9]\d{2})\)?[\s\-\.]?)([2-9]\d{2})[\s\-\.]?(\d{4})")
+_EMAIL_RE_GLOBAL = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
 
 def normalize_us_phone(raw: Optional[str]) -> Optional[str]:
     if not raw:
@@ -60,9 +65,62 @@ def normalize_us_phone(raw: Optional[str]) -> Optional[str]:
     if not m:
         return None
     a, b, c = m.group(1), m.group(2), m.group(3)
-    if a[0] in ("0", "1") or b[0] in ("0", "1"):
-        return None
     return f"({a}) {b}-{c}"
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+def _extract_emails(text: str) -> List[str]:
+    if not text:
+        return []
+    text = html.unescape(text)
+    emails = [e.lower() for e in _EMAIL_RE_GLOBAL.findall(text)]
+    return _dedupe_keep_order(emails)
+
+def _extract_phones(text: str) -> List[str]:
+    if not text:
+        return []
+    text = html.unescape(text)
+    phones = []
+    for m in _US_PHONE_RE.finditer(text):
+        phones.append(f"({m.group(1)}) {m.group(2)}-{m.group(3)}")
+    return _dedupe_keep_order(phones)
+
+# Very conservative "name candidate" filter
+_BAD_NAME_PHRASES = {
+    "business profile", "accredited since", "customer reviews", "bbb", "better business bureau",
+    "roofing contractors", "reviews", "complaints", "years in business", "profile",
+}
+
+def _pick_contact_name(candidates: List[str]) -> Optional[str]:
+    cleaned = []
+    for c in candidates:
+        if not c:
+            continue
+        s = " ".join(str(c).strip().split())
+        s_low = s.lower()
+        if len(s) < 6 or len(s) > 50:
+            continue
+        if any(p in s_low for p in _BAD_NAME_PHRASES):
+            continue
+        # require at least 2 words, mostly letters
+        parts = s.split()
+        if len(parts) < 2:
+            continue
+        if sum(ch.isalpha() for ch in s) < (len(s) * 0.6):
+            continue
+        cleaned.append(s)
+    cleaned = _dedupe_keep_order(cleaned)
+    return cleaned[0] if cleaned else None
 
 # -----------------------------
 # HUNTER (DOMAIN SEARCH) - MUST BE THE ONLY HUNTER CALL USED
@@ -317,6 +375,197 @@ def apply_phase2_fallbacks(
 # Backward compatibility aliases
 apply_phase2_fallbacks_v2 = apply_phase2_fallbacks
 apply_phase2_fallbacks_logged = apply_phase2_fallbacks
+
+# ============================================================
+# PHASE 2 CONTACT DATA EXTRACTION (NEW)
+# ============================================================
+
+def serpapi_google_search(query: str, logger=None) -> Dict[str, Any]:
+    key = get_serp_key()
+    if not key:
+        return {"_attempted": False, "notes": "missing SERP key"}
+
+    url = "https://serpapi.com/search.json"
+    params = {"engine": "google", "q": query, "api_key": key}
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            if logger:
+                logger.warning(f"PHASE2 SERP google failed: status={r.status_code} body={r.text[:200]}")
+            return {"_attempted": True, "notes": f"http_{r.status_code}"}
+
+        js = r.json() or {}
+        return {"_attempted": True, "notes": "ok", "json": js}
+    except Exception as e:
+        return {"_attempted": True, "notes": f"exception={repr(e)}"}
+
+def _first_matching_link(organic: List[Dict[str, Any]], must_contain: str) -> Optional[str]:
+    must = (must_contain or "").lower()
+    for r in organic or []:
+        link = (r.get("link") or "").strip()
+        if link and must in link.lower():
+            return link
+    return None
+
+def find_bbb_profile_url(company: str, city: Optional[str], state: Optional[str], logger=None) -> Dict[str, Any]:
+    q_parts = [f"site:bbb.org", f'"{company}"']
+    if city and state:
+        q_parts.append(f'"{city} {state}"')
+    q = " ".join(q_parts)
+
+    s = serpapi_google_search(q, logger=logger)
+    if not s.get("_attempted"):
+        return {"attempted": False, "notes": s.get("notes")}
+
+    js = s.get("json") or {}
+    organic = js.get("organic_results") or []
+    link = _first_matching_link(organic, "bbb.org/us/")
+    return {"attempted": True, "notes": s.get("notes"), "url": link, "serp": s}
+
+def find_yp_url(company: str, city: Optional[str], state: Optional[str], logger=None) -> Dict[str, Any]:
+    q_parts = [f"site:yellowpages.com", f'"{company}"']
+    if city and state:
+        q_parts.append(f'"{city} {state}"')
+    q = " ".join(q_parts)
+
+    s = serpapi_google_search(q, logger=logger)
+    if not s.get("_attempted"):
+        return {"attempted": False, "notes": s.get("notes")}
+
+    js = s.get("json") or {}
+    organic = js.get("organic_results") or []
+    link = _first_matching_link(organic, "yellowpages.com/")
+    return {"attempted": True, "notes": s.get("notes"), "url": link, "serp": s}
+
+def find_oc_url(company: str, city: Optional[str], state: Optional[str], logger=None) -> Dict[str, Any]:
+    q_parts = [f"site:opencorporates.com", f'"{company}"']
+    if city and state:
+        q_parts.append(f'"{state}"')
+    q = " ".join(q_parts)
+
+    s = serpapi_google_search(q, logger=logger)
+    if not s.get("_attempted"):
+        return {"attempted": False, "notes": s.get("notes")}
+
+    js = s.get("json") or {}
+    organic = js.get("organic_results") or []
+    link = _first_matching_link(organic, "opencorporates.com/companies/")
+    return {"attempted": True, "notes": s.get("notes"), "url": link}
+
+def fetch_html(url: str, logger=None, timeout: int = 25) -> Tuple[Optional[str], str]:
+    if not url:
+        return None, "no_url"
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            if logger:
+                logger.info(f"PHASE2 fetch status={r.status_code} url={url}")
+            return None, f"http_{r.status_code}"
+        return r.text or "", "ok"
+    except Exception as e:
+        return None, f"exception={repr(e)}"
+
+def bbb_extract_contact_data(bbb_url: str, logger=None) -> Dict[str, Any]:
+    html_text, status = fetch_html(bbb_url, logger=logger)
+    if status != "ok" or not html_text:
+        return {"attempted": True, "notes": status, "bbb_phones": [], "bbb_emails": [], "bbb_contact_name": None}
+
+    phones = _extract_phones(html_text)
+    emails = _extract_emails(html_text)
+
+    # crude candidate list for names
+    candidates = []
+    for label in ["Principal", "Owner", "President", "CEO", "Manager", "Contact", "Business Management"]:
+        idx = html_text.lower().find(label.lower())
+        if idx != -1:
+            window = html.unescape(html_text[idx:idx+400])
+            maybe = re.findall(r">([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})<", window)
+            candidates.extend(maybe)
+
+    contact_name = _pick_contact_name(candidates)
+
+    return {
+        "attempted": True,
+        "notes": "ok",
+        "bbb_phones": phones,
+        "bbb_emails": emails,
+        "bbb_contact_name": contact_name,
+    }
+
+def yp_extract_from_serp(serp_json: Dict[str, Any]) -> Dict[str, Any]:
+    organic = (serp_json or {}).get("organic_results") or []
+    # Combine title + snippet for extraction
+    blob = " ".join([(r.get("title") or "") + " " + (r.get("snippet") or "") for r in organic[:5]])
+    phones = _extract_phones(blob)
+    emails = _extract_emails(blob)
+    # Name candidates from titles (weak, but better than nothing)
+    titles = [r.get("title") for r in organic[:5] if r.get("title")]
+    contact_name = _pick_contact_name(titles)
+    return {"yp_phones": phones, "yp_emails": emails, "yp_contact_name": contact_name}
+
+def apply_phase2_contact_boost(
+    business_name: str,
+    google_payload: Dict[str, Any],
+    logger=None
+) -> Dict[str, Any]:
+    """
+    Returns a minimal set of NEW enrichment fields:
+      - phase2_bbb_phone, phase2_bbb_email, phase2_bbb_contact_name
+      - phase2_yp_phone,  phase2_yp_email,  phase2_yp_contact_name
+      - phase2_oc_match (bool-ish) + phase2_oc_company_url (optional)
+    """
+    out: Dict[str, Any] = {}
+
+    city = google_payload.get("city")
+    state = google_payload.get("state_region") or google_payload.get("state")
+
+    if logger:
+        logger.info(f"PHASE2 CONTACT BOOST START | business={business_name} city={city} state={state}")
+
+    # 1) BBB
+    bbb = find_bbb_profile_url(business_name, city, state, logger=logger)
+    if logger:
+        logger.info(f"PHASE2 BBB: serp attempted={bbb.get('attempted')} notes={bbb.get('notes')} link={bbb.get('url')}")
+    if bbb.get("url"):
+        bdata = bbb_extract_contact_data(bbb["url"], logger=logger)
+        if logger:
+            logger.info(f"PHASE2 BBB extract: notes={bdata.get('notes')} phones={len(bdata.get('bbb_phones') or [])} emails={len(bdata.get('bbb_emails') or [])} name={bool(bdata.get('bbb_contact_name'))}")
+        out["phase2_bbb_phone"] = (bdata.get("bbb_phones") or [None])[0]
+        out["phase2_bbb_email"] = (bdata.get("bbb_emails") or [None])[0]
+        out["phase2_bbb_contact_name"] = bdata.get("bbb_contact_name")
+
+    # 2) YellowPages (Serp only)
+    yp = find_yp_url(business_name, city, state, logger=logger)
+    if logger:
+        logger.info(f"PHASE2 YP: serp attempted={yp.get('attempted')} notes={yp.get('notes')} link={yp.get('url')}")
+    serp_json = (yp.get("serp") or {}).get("json") if yp.get("serp") else None
+    if serp_json:
+        yp_data = yp_extract_from_serp(serp_json)
+        out["phase2_yp_phone"] = (yp_data.get("yp_phones") or [None])[0]
+        out["phase2_yp_email"] = (yp_data.get("yp_emails") or [None])[0]
+        out["phase2_yp_contact_name"] = yp_data.get("yp_contact_name")
+
+    # 3) OpenCorporates (verification only)
+    oc = find_oc_url(business_name, city, state, logger=logger)
+    if logger:
+        logger.info(f"PHASE2 OC: attempted={oc.get('attempted')} notes={oc.get('notes')} link={oc.get('url')}")
+    out["phase2_oc_match"] = bool(oc.get("url"))
+    out["phase2_oc_company_url"] = oc.get("url")
+
+    # final log summary
+    if logger:
+        logger.info(
+            "PHASE2 CONTACT BOOST END | "
+            f"bbb_phone={bool(out.get('phase2_bbb_phone'))} "
+            f"bbb_email={bool(out.get('phase2_bbb_email'))} "
+            f"bbb_name={bool(out.get('phase2_bbb_contact_name'))} "
+            f"yp_phone={bool(out.get('phase2_yp_phone'))} "
+            f"yp_email={bool(out.get('phase2_yp_email'))} "
+            f"yp_name={bool(out.get('phase2_yp_contact_name'))} "
+            f"oc_match={bool(out.get('phase2_oc_match'))}"
+        )
+    return out
 
 # Hunter env debug alias for backward compatibility
 def hunter_env_debug(logger=None) -> None:
