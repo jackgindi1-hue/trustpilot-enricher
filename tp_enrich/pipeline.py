@@ -439,12 +439,78 @@ def run_pipeline(
     # Add row_id if not present
     if 'row_id' not in df.columns:
         df['row_id'] = range(1, len(df) + 1)
-    # Classify each row
-    logger.info("Step 2: Classifying display names...")
-    # Note: raw_display_name is already mapped in load_input_csv()
-    df['name_classification'] = df['raw_display_name'].apply(classify_name)
+
+    # ============================================================
+    # PATCH 1 — HOTFIX v3: Ensure raw_display_name populated + safer classification
+    # ============================================================
+    def _pick_first_existing_col(df_inner, candidates):
+        for c in candidates:
+            if c in df_inner.columns:
+                return c
+        return None
+
+    # --- ensure raw_display_name exists + is filled ---
+    if "raw_display_name" not in df.columns:
+        src = _pick_first_existing_col(df, [
+            "consumer.displayName",
+            "displayName",
+            "business_name",
+            "businessName",
+            "company",
+            "company_name",
+            "name",
+            "Business Name",
+            "Company",
+        ])
+        if src:
+            df["raw_display_name"] = df[src]
+        else:
+            # last resort: first column
+            df["raw_display_name"] = df.iloc[:, 0]
+
+    # Fill NaNs / non-strings
+    df["raw_display_name"] = df["raw_display_name"].fillna("").astype(str).str.strip()
+
+    # If you have a "business display name" but it came in another column, backfill it
+    alt = _pick_first_existing_col(df, ["consumer.displayName", "displayName"])
+    if alt:
+        m = df["raw_display_name"].eq("") & df[alt].notna()
+        if m.any():
+            df.loc[m, "raw_display_name"] = df.loc[m, alt].astype(str).str.strip()
+
+    # --- classification hardening: business by default ---
+    # Only classify as person when it's very likely a human name; otherwise business.
+    import re as re_classify
+
+    _PERSON_RE = re_classify.compile(r"^[A-Za-z]+(?:\s+[A-Za-z]+){0,2}$")  # "John" / "John Smith" / "John A Smith"
+    _BUSINESS_HINTS = re_classify.compile(
+        r"\b(llc|inc|ltd|corp|co\.?|company|pllc|pc|lp|llp|construction|roof|roofing|plumbing|electric|hvac|transport|trucking|logistics|restaurant|cafe|bakery|fitness|gym|auto|detailing|repair|sewer|drain|florist|shop|store|market|bar|grill|salon|spa)\b",
+        re_classify.I,
+    )
+
+    def classify_name_sane(s: str) -> str:
+        s = (s or "").strip()
+        if not s:
+            return "business"   # for this pipeline, empty should not kill enrichment
+        # very likely person (simple 1-3 word alpha name, no business hints)
+        if _PERSON_RE.match(s) and not _BUSINESS_HINTS.search(s):
+            return "person"
+        return "business"
+
+    # Classify each row with new safer logic
+    logger.info("Step 2: Classifying display names (HOTFIX v3)...")
+    df["name_classification"] = df["raw_display_name"].apply(classify_name_sane)
     classification_counts = df['name_classification'].value_counts()
     logger.info(f"  Classification results: {dict(classification_counts)}")
+
+    # If somehow everything is still "other" from older code paths, force business
+    if (df["name_classification"] == "other").all():
+        df["name_classification"] = "business"
+        logger.warning("HOTFIX v3: All rows classified as 'other' — forced to 'business' to avoid empty pipeline.")
+    # ============================================================
+    # END PATCH 1 — HOTFIX v3
+    # ============================================================
+
     # ============================================================
     # POST-CLASSIFICATION OVERRIDES (business pattern boosts)
     # ============================================================
