@@ -1003,3 +1003,105 @@ def apply_phase2_data_enrichment_SAFE(company: str, google_payload: Dict[str, An
             out[k] = v
 
     return out
+
+# ============================================================
+# PHASE 2 CRASH-PROOF WRAPPER - ENHANCED VERSION
+# Goal: Phase 2 can NEVER crash the run, even if BBB/YP/OC parsing fails.
+# - Always returns all expected phase2_* fields
+# - Converts lists/dicts -> JSON strings for CSV safety
+# - Hard try/except around the Phase2 call-site
+# ============================================================
+
+PHASE2_EXPECTED_KEYS = [
+    # urls (ok to keep, but we'll also keep data fields)
+    "phase2_bbb_url", "phase2_yp_url", "phase2_oc_url",
+
+    # data fields (names/owners/etc)
+    "phase2_bbb_names", "phase2_bbb_owner", "phase2_bbb_contact_name",
+    "phase2_yp_names", "phase2_yp_owner", "phase2_yp_contact_name",
+    "phase2_oc_names", "phase2_oc_owner", "phase2_oc_contact_name",
+
+    # extracted phones/emails from those sources (IF found)
+    "phase2_bbb_phone", "phase2_bbb_email",
+    "phase2_yp_phone", "phase2_yp_email",
+    "phase2_oc_phone", "phase2_oc_email",
+
+    # websites
+    "phase2_bbb_website", "phase2_yp_website",
+
+    # notes / debug
+    "phase2_bbb_notes", "phase2_yp_notes", "phase2_oc_notes",
+]
+
+def _phase2_defaults() -> Dict[str, Any]:
+    """Default empty values for all Phase 2 fields"""
+    d = {k: "" for k in PHASE2_EXPECTED_KEYS}
+    return d
+
+def _csv_safe(v: Any) -> Any:
+    """
+    Ensure we never crash CSV writing:
+    - lists/dicts -> JSON string
+    - None -> ""
+    - numbers/strings -> keep
+    """
+    if v is None:
+        return ""
+    if isinstance(v, (list, dict)):
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
+    return v
+
+def _merge_phase2(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge Phase 2 results with safe CSV serialization"""
+    out = dict(base)
+    for k, v in (patch or {}).items():
+        if k not in out:
+            # allow additional fields but still CSV-safe
+            out[k] = _csv_safe(v)
+        else:
+            out[k] = _csv_safe(v)
+    # guarantee all expected keys exist
+    for k in PHASE2_EXPECTED_KEYS:
+        if k not in out:
+            out[k] = ""
+        else:
+            out[k] = _csv_safe(out[k])
+    return out
+
+def run_phase2_safely(
+    business_name: str,
+    google_payload: Dict[str, Any],
+    logger=None,
+    phase2_func=None,
+) -> Dict[str, Any]:
+    """
+    Crash-proof wrapper for Phase 2 enrichment.
+    
+    Args:
+        business_name: Company name to enrich
+        google_payload: Google Places data with city, state, etc.
+        logger: Logger instance
+        phase2_func: The Phase 2 function to call (apply_phase2_data_enrichment_SAFE)
+    
+    Returns:
+        Dict with all phase2_* fields guaranteed to exist and be CSV-safe
+    
+    This wrapper guarantees Phase 2 never crashes the pipeline.
+    """
+    base = _phase2_defaults()
+
+    if not phase2_func:
+        if logger:
+            logger.info("PHASE2 SAFE: skipped (phase2_func not provided)")
+        return base
+
+    try:
+        p2 = phase2_func(company=business_name, google_payload=google_payload, logger=logger) or {}
+        return _merge_phase2(base, p2)
+    except Exception as e:
+        if logger:
+            logger.exception(f"PHASE2 CRASHPROOF: swallowed exception so pipeline continues: {repr(e)}")
+        return base
