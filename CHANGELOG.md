@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added - 2025-12-17
+
+#### Phase 2 Contact Data Patch - ACTUAL DATA EXTRACTION
+
+**Goal:** Transform Phase 2 from URL-only outputs to actual contact data extraction.
+
+**New Features:**
+- BBB contact data extraction: phones, emails, contact/owner names
+- YellowPages snippet parsing: phones, emails, names (no HTML fetch to avoid bot blocks)
+- OpenCorporates verification: company match yes/no
+
+**New CSV Output Fields:**
+- `phase2_bbb_phone` - Phone number from BBB profile
+- `phase2_bbb_email` - Email address from BBB profile
+- `phase2_bbb_contact_name` - Contact/owner name from BBB profile
+- `phase2_yp_phone` - Phone number from YellowPages snippet
+- `phase2_yp_email` - Email address from YellowPages snippet
+- `phase2_yp_contact_name` - Contact name from YellowPages snippet
+- `phase2_oc_match` - Boolean: company found in OpenCorporates
+- `phase2_oc_company_url` - OpenCorporates company URL
+
+**Files Changed:**
+- `tp_enrich/phase2_enrichment.py` - Added `apply_phase2_contact_boost_DATA()` function
+- `tp_enrich/pipeline.py` - Integrated Phase 2 contact data extraction
+- `tp_enrich/io_utils.py` - Added new output schema fields
+
+**Performance:**
+- BBB: ~3-5 seconds (SerpApi + HTML fetch + extraction)
+- YP: ~2-3 seconds (SerpApi snippet parsing only)
+- OC: ~2 seconds (SerpApi verification)
+- Total: ~7-10 seconds per business (only when Phase 2 triggered)
+
+**Credits:** 3 SerpApi credits per business with Phase 2 triggered (BBB + YP + OC searches)
+
+**Documentation:** See `.same/PHASE2_CONTACT_DATA_PATCH.md` for full details.
+
+---
+
 ### Fixed - 2025-12-17
 
 #### Phase 2 Enrichment Fixes (v3)
