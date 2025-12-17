@@ -1,1 +1,633 @@
-"""\nCore enrichment pipeline - reusable function for CLI and API\nExtracted from main.py to enable both CLI and API access\n"""\nimport os\nimport json\nimport uuid\nimport datetime\nimport pandas as pd\nimport numpy as np\nfrom typing import Dict, Optional, Any\nfrom urllib.parse import urlparse\nfrom .logging_utils import setup_logger\nfrom .io_utils import load_input_csv, write_output_csv, get_output_schema\nfrom .classification import classify_name\nfrom .normalization import normalize_business_name, ensure_company_search_name\nfrom .dedupe import identify_unique_businesses, get_enrichment_context\nfrom .cache import EnrichmentCache\nfrom . import local_enrichment\nfrom .email_enrichment import enrich_emails_for_domain\nfrom .phone_enrichment import enrich_business_phone_waterfall\nfrom .merge_results import merge_enrichment_results\nlogger = setup_logger(__name__)\ndef _safe_str(x):\n    \"\"\"Safely convert value to string, handling None and NaN.\"\"\"\n    if x is None:\n        return \"\"\n    try:\n        if pd.isna(x):\n            return \"\"\n    except Exception:\n        pass\n    s = str(x).strip()\n    return s\ndef _norm_key(x: str) -> str:\n    \"\"\"Normalize key: keep it simple + stable; match how company_search_name is generated.\"\"\"\n    if x is None or (isinstance(x, float) and np.isnan(x)):\n        return \"\"\n    s = str(x).strip().lower()\n    # light normalization to make join stable\n    s = \" \".join(s.split())\n    return s\ndef _get(res, *keys, default=None):\n    \"\"\"\n    Works with:\n      - dict results\n      - dataclass/obj results (attributes)\n      - nested dicts/objs\n    \"\"\"\n    cur = res\n    for k in keys:\n        if cur is None:\n            return default\n        # dict\n        if isinstance(cur, dict):\n            cur = cur.get(k, None)\n        else:\n            cur = getattr(cur, k, None)\n    return default if cur is None else cur\ndef merge_enrichment_back_to_rows(df: pd.DataFrame, enriched_businesses: list) -> pd.DataFrame:\n    \"\"\"\n    PATCH: Robust merge-back function\n    df: row-level dataframe (all rows including business + person + other)\n    enriched_businesses: list of dicts, each dict contains business-level enrichment fields\n    Returns df with enrichment columns filled.\n    Key improvements:\n    - Uses company_search_name as primary join key (works even if company_normalized_key is NaN)\n    - Handles missing columns gracefully\n    - Deduplicates businesses by join key (keeps best record by data completeness)\n    - Forces object dtype to avoid pandas FutureWarning\n    \"\"\"\n    logger.info(\"Step 6: Merging enrichment results back to rows...\")\n    if df is None or df.empty:\n        logger.warning(\"  Empty dataframe, nothing to merge\")\n        return df\n    # Ensure join columns exist\n    if \"company_search_name\" not in df.columns:\n        # fall back to raw_display_name if that exists\n        if \"raw_display_name\" in df.columns:\n            df[\"company_search_name\"] = df[\"raw_display_name\"]\n        else:\n            logger.error(\"  Missing company_search_name and raw_display_name columns\")\n            raise ValueError(\"merge_enrichment_back_to_rows: missing company_search_name and raw_display_name\")\n    # Create a stable join key on rows\n    df = df.copy()\n    df[\"_join_key\"] = df[\"company_search_name\"].apply(_norm_key)\n    # Build business-level table\n    biz_df = pd.DataFrame(enriched_businesses or [])\n    if biz_df.empty:\n        # Nothing to merge\n        logger.info(\"  No enrichment results to merge\")\n        return df.drop(columns=[\"_join_key\"], errors=\"ignore\")\n    # Create stable join key on businesses\n    # Prefer company_search_name; fallback to company_normalized_key; fallback to company_name\n    for cand in [\"company_search_name\", \"company_normalized_key\", \"company_name\", \"name\"]:\n        if cand in biz_df.columns:\n            biz_df[\"_join_key\"] = biz_df[cand].apply(_norm_key)\n            # If we got at least some non-empty keys, use it\n            if (biz_df[\"_join_key\"] != \"\").any():\n                break\n    if \"_join_key\" not in biz_df.columns:\n        biz_df[\"_join_key\"] = \"\"\n    logger.info(\"  Built enrichment index for %d businesses\", len(biz_df))\n    # Deduplicate businesses by join key (keep best record: prefer ones with phone/email)\n    def _score_row(r):\n        score = 0\n        if str(r.get(\"primary_phone\") or \"\").strip(): score += 2\n        if str(r.get(\"primary_email\") or \"\").strip(): score += 2\n        if str(r.get(\"business_address\") or \"\").strip(): score += 1\n        if str(r.get(\"company_domain\") or \"\").strip(): score += 1\n        return score\n    biz_df[\"_score\"] = biz_df.apply(_score_row, axis=1)\n    biz_df = biz_df.sort_values([\"_join_key\", \"_score\"], ascending=[True, False])\n    biz_df = biz_df.drop_duplicates(subset=[\"_join_key\"], keep=\"first\").drop(columns=[\"_score\"])\n    logger.info(\"  After deduplication: %d unique businesses\", len(biz_df))\n    # Columns we want to bring back (only if present in business table)\n    wanted = [\n        \"company_domain\",\n        \"domain_confidence\",\n        \"primary_phone\",\n        \"primary_phone_display\",\n        \"primary_phone_source\",\n        \"primary_phone_confidence\",\n        \"primary_email\",\n        \"primary_email_type\",\n        \"primary_email_source\",\n        \"primary_email_confidence\",\n        \"business_address\",\n        \"business_city\",\n        \"business_state_region\",\n        \"business_postal_code\",\n        \"business_country\",\n        \"all_phones_json\",\n        \"generic_emails_json\",\n        \"person_emails_json\",\n        \"catchall_emails_json\",\n        \"overall_lead_confidence\",\n        \"enrichment_status\",\n        \"enrichment_notes\",\n    ]\n    present = [c for c in wanted if c in biz_df.columns]\n    logger.info(\"  Merging %d enrichment columns: %s\", len(present), present)\n    # Prepare minimal merge frame\n    merge_df = biz_df[[\"_join_key\"] + present].copy()\n    # Merge\n    out = df.merge(merge_df, on=\"_join_key\", how=\"left\", suffixes=(\"\", \"_biz\"))\n    # IMPORTANT: pandas dtype safety (avoid FutureWarning & \"incompatible dtype\" issues)\n    # Ensure target columns are object so assignment doesn't silently fail / coerce weirdly.\n    for c in present:\n        if c not in out.columns:\n            out[c] = \"\"\n        out[c] = out[c].astype(\"object\")\n    # Cleanup\n    out = out.drop(columns=[\"_join_key\"], errors=\"ignore\")\n    logger.info(\"  Finished merging enrichment results into %d rows\", len(out))\n    return out\ndef _compute_confidence(row: Dict[str, Any]) -> str:\n    \"\"\"Compute overall confidence based on phone and email presence.\"\"\"\n    has_phone = bool(row.get(\"primary_phone\"))\n    has_email = bool(row.get(\"primary_email\"))\n    if has_phone and has_email:\n        return \"high\"\n    if has_phone or has_email:\n        return \"medium\"\n    return \"failed\"\ndef enrich_single_business(name: str, region: str | None = None) -> Dict[str, Any]:\n    \"\"\"\n    PHASE 2: Enhanced enrichment function with phone waterfall.\n    Flow:\n    1. Google Places for address/website (phone extracted but not used directly)\n    2. Extract domain from website\n    3. Phone waterfall (Google → Yelp → Website → Apollo) with validation\n    4. Email enrichment (Hunter only)\n    5. Compute overall confidence\n    Args:\n        name: Business name\n        region: Optional region/location\n    Returns:\n        Dict with enriched business data including validated phone\n    \"\"\"\n    logger.info(\"Enriching business: %s\", name)\n    row = {\n        \"business_name\": name,\n        \"primary_phone\": None,\n        \"phone\": None,\n        \"primary_email\": None,\n        \"email\": None,\n        \"emails\": [],\n        \"email_source\": None,\n        \"website\": None,\n        \"domain\": None,\n        \"address\": None,\n        \"city\": None,\n        \"state_region\": None,\n        \"postal_code\": None,\n        \"country\": None,\n    }\n    local = local_enrichment.enrich_local_business(name, region)\n    # Store address/location data\n    if local:\n        for f in [\"address\", \"city\", \"state_region\", \"postal_code\", \"country\"]:\n            if local.get(f):\n                row[f] = local[f]\n        if local.get(\"website\"):\n            row[\"website\"] = local[\"website\"]\n    website = row.get(\"website\")\n    if website:\n        try:\n            parsed = urlparse(website)\n            host = parsed.netloc or parsed.path\n            if host.startswith(\"www.\"):\n                host = host[4:]\n            row[\"domain\"] = host.lower()\n        except Exception:\n            row[\"domain\"] = None\n    domain = row.get(\"domain\")\n    phone_layer = enrich_business_phone_waterfall(\n        biz_name=name,\n        google_hit=local or {},\n        domain=domain\n    )\n    # Map phone results\n    row[\"primary_phone\"] = phone_layer.get(\"primary_phone\")\n    row[\"phone\"] = phone_layer.get(\"primary_phone\")\n    row[\"phone_source\"] = phone_layer.get(\"primary_phone_source\")\n    row[\"phone_confidence\"] = phone_layer.get(\"primary_phone_confidence\")\n    row[\"all_phones_json\"] = phone_layer.get(\"all_phones_json\")\n    # ============================================================\n    # EMAIL WATERFALL (Hunter → Snov → Apollo → FullEnrich)\n    # ============================================================\n    from tp_enrich.email_enrichment import run_email_waterfall\n    logger.info(f\"   -> Email enrichment (Hunter → Snov → Apollo → FullEnrich) for {name} domain={domain}\")\n    email_result = run_email_waterfall(domain, logger=logger, company_name=name)\n    # Always log one line proving what happened (super useful for debugging credits)\n    # Use self-proving fields from run_email_waterfall (these CANNOT be blank)\n    logger.info(f\"   -> Email providers attempted: {email_result.get('email_waterfall_tried')}\")\n    logger.info(f\"   -> Email waterfall tracking: tried={email_result.get('email_waterfall_tried')} winner={email_result.get('email_waterfall_winner')}\")\n    primary_email = email_result.get(\"primary_email\")\n    primary_email_source = email_result.get(\"primary_email_source\")\n    primary_email_confidence = email_result.get(\"primary_email_confidence\")\n    logger.info(f\"   -> Email enrichment complete: primary_email={primary_email} source={primary_email_source} confidence={primary_email_confidence}\")\n    # Make sure you store these into row so they get returned\n    row[\"primary_email\"] = primary_email\n    row[\"primary_email_source\"] = primary_email_source\n    row[\"primary_email_confidence\"] = primary_email_confidence\n    # SELF-PROVING WATERFALL TRACKING: These fields come directly from run_email_waterfall\n    row[\"email_waterfall_tried\"] = email_result.get(\"email_waterfall_tried\", \"\")\n    row[\"email_waterfall_winner\"] = email_result.get(\"email_waterfall_winner\")\n    row[\"provider_status_json\"] = email_result.get(\"provider_status_json\", \"{}\")\n    # CRITICAL: Ensure primary_email_source is correctly mapped\n    # CSV writer expects: primary_email_source (NOT email_source)\n    if row.get(\"email_source\") and not row.get(\"primary_email_source\"):\n        row[\"primary_email_source\"] = row[\"email_source\"]\n    # ============================================================\n    # END EMAIL WATERFALL\n    # ============================================================\n    # ============================================================\n    # PHASE 2: Apply fallback enrichment for phone/website coverage\n    # ============================================================\n    from tp_enrich.phase2_enrichment import apply_phase2_fallbacks_v2\n    logger.info(f\"   -> Applying Phase 2 fallbacks for {name}\")\n    # Build google_payload from local enrichment data\n    google_payload = {\n        \"lat\": local.get(\"lat\") if local else None,\n        \"lng\": local.get(\"lng\") if local else None,\n        \"lon\": local.get(\"lon\") if local else None,\n        \"city\": row.get(\"city\"),\n        \"state_region\": row.get(\"state_region\"),\n        \"state\": row.get(\"state_region\"),\n        \"postal_code\": row.get(\"postal_code\"),\n    }\n    p2 = apply_phase2_fallbacks_v2(\n        business_name=name,\n        google_payload=google_payload,\n        current_phone=row.get(\"primary_phone\"),\n        current_website=row.get(\"website\"),\n        logger=logger\n    )\n    # Apply phone fallback if we didn't have one\n    if not row.get(\"primary_phone\") and p2.get(\"normalized_phone\"):\n        row[\"primary_phone\"] = p2[\"normalized_phone\"]\n        row[\"phone\"] = p2[\"normalized_phone\"]\n        row[\"phone_source\"] = p2.get(\"phone_source\", \"phase2_fallback\")\n        row[\"phone_confidence\"] = p2.get(\"phone_confidence\", \"low\")\n        logger.info(f\"   -> Phase 2 phone fallback: {p2['phone_final']} from {p2.get('phone_source')}\")\n    # Apply website fallback if we didn't have one\n    if not row.get(\"website\") and p2.get(\"website_final\"):\n        row[\"website\"] = p2[\"website_final\"]\n        logger.info(f\"   -> Phase 2 website fallback: {p2['website_final']}\")\n        # NEW: Store contact names extracted from BBB/YP/OC scrapers\n    contact_names = p2.get(\"contact_names\", [])\n    if contact_names:\n        row[\"phase2_bbb_names_json\"] = str(contact_names)\n        logger.info(f\"   -> Phase 2 extracted {len(contact_names)} contact names: {contact_names}\")\n    else:\n        row[\"phase2_bbb_names_json\"] = \"[]\"\n    # Add discovery URLs (optional but useful)\n    row[\"phase2_bbb_link\"] = p2.get(\"bbb_url\")\n    row[\"phase2_yp_link\"] = p2.get(\"yp_url\")\n    row[\"yelp_url\"] = p2.get(\"yelp_url\")\n    # Add OpenCorporates validation (optional)\n    row[\"oc_company_number\"] = p2.get(\"oc_company_number\")\n    row[\"oc_status\"] = p2.get(\"oc_status\")\n    # Add notes for debugging\n    row[\"phase2_notes\"] = f\"yelp:{p2.get('yelp_notes')} serp:{p2.get('serp_notes')} oc:{p2.get('oc_notes')}\"\n    logger.info(f\"   -> Phase 2 fallbacks complete\")\n    # ============================================================\n    # PHASE 2 DATA ENRICHMENT - HOTFIX v2\n    # Fixes: Hunter key detection, YP category pages, data extraction\n    # ============================================================\n    from tp_enrich.phase2_enrichment import apply_phase2_data_enrichment\n    logger.info(f\"   -> Applying Phase 2 data enrichment (HOTFIX v2) for {name}\")\n    p2_data = apply_phase2_data_enrichment(\n        company=name,\n        google_payload=google_payload,\n        logger=logger\n    )\n    # Store extracted contact data (with website fields)\n    row[\"phase2_bbb_phone\"] = p2_data.get(\"phase2_bbb_phone\")\n    row[\"phase2_bbb_email\"] = p2_data.get(\"phase2_bbb_email\")\n    row[\"phase2_bbb_website\"] = p2_data.get(\"phase2_bbb_website\")\n    row[\"phase2_bbb_names\"] = p2_data.get(\"phase2_bbb_names\", [])\n    row[\"phase2_yp_phone\"] = p2_data.get(\"phase2_yp_phone\")\n    row[\"phase2_yp_email\"] = p2_data.get(\"phase2_yp_email\")\n    row[\"phase2_yp_website\"] = p2_data.get(\"phase2_yp_website\")\n    row[\"phase2_yp_names\"] = p2_data.get(\"phase2_yp_names\", [])\n    logger.info(f\"   -> Phase 2 data enrichment (HOTFIX v2) complete\")\n    # ============================================================\n    # END PHASE 2\n    # ============================================================\n    row[\"confidence\"] = _compute_confidence(row)\n    return row\ndef enrich_business(business_info: Dict, cache: EnrichmentCache, run_id: str = None) -> Dict:\n    \"\"\"\n    Enrich a single business through all sources\n    Args:\n        business_info: Business information dict\n        cache: Enrichment cache\n        run_id: Optional RUN_ID for tracing this enrichment run\n    Returns:\n        Complete enrichment result\n    \"\"\"\n    normalized_key = business_info['company_normalized_key']\n    company_name = business_info['company_search_name']\n    # Check cache\n    if cache.has(normalized_key):\n        logger.info(f\"  -> Using cached result for {company_name}\")\n        return cache.get(normalized_key)\n    # Get enrichment context\n    context = get_enrichment_context(business_info)\n    region = context.get('state') or context.get('region')\n    # Use the simplified enrichment function\n    enriched_data = enrich_single_business(company_name, region=region)\n    enriched_row = {\n        # identity / keys\n        \"company_normalized_key\": normalized_key,\n        \"company_search_name\": company_name,\n        \"company_domain\": enriched_data.get(\"domain\"),\n        \"domain_confidence\": \"high\" if enriched_data.get(\"domain\") else \"none\",\n        # primary phone\n        \"primary_phone\": enriched_data.get(\"primary_phone\"),\n        \"primary_phone_display\": enriched_data.get(\"primary_phone\"),\n        \"primary_phone_source\": enriched_data.get(\"phone_source\"),\n        \"primary_phone_confidence\": enriched_data.get(\"phone_confidence\"),\n        # primary email\n        \"primary_email\": enriched_data.get(\"primary_email\"),\n        \"primary_email_type\": \"generic\",\n        \"primary_email_source\": enriched_data.get(\"primary_email_source\") or enriched_data.get(\"email_source\"),\n        \"primary_email_confidence\": enriched_data.get(\"primary_email_confidence\") or (\"medium\" if enriched_data.get(\"primary_email\") else \"none\"),\n        # address\n        \"business_address\": enriched_data.get(\"address\"),\n        \"business_city\": enriched_data.get(\"city\"),\n        \"business_state_region\": enriched_data.get(\"state_region\"),\n        \"business_postal_code\": enriched_data.get(\"postal_code\"),\n        \"business_country\": enriched_data.get(\"country\"),\n        # metadata\n        \"overall_lead_confidence\": enriched_data.get(\"confidence\", \"failed\"),\n        \"enrichment_status\": \"completed\",\n        \"enrichment_notes\": \"\",\n        # debug payloads\n        \"all_phones_json\": enriched_data.get(\"all_phones_json\", \"{}\"),\n        \"generic_emails_json\": \"[]\",\n        \"person_emails_json\": \"[]\",\n        \"catchall_emails_json\": \"[]\",\n        # PHASE 1 PROOF: waterfall tracking fields\n        \"email_providers_tried\": enriched_data.get(\"email_providers_tried\", \"\"),\n        \"email_provider_errors_json\": enriched_data.get(\"email_provider_errors_json\", \"{}\"),\n        \"email_waterfall_winner\": enriched_data.get(\"email_waterfall_winner\"),\n        \"source_platform\": \"trustpilot\",\n        # RUN_ID for tracing this enrichment run\n        \"run_id\": run_id or \"\",\n    }\n    # Save to cache\n    cache.set(normalized_key, enriched_row)\n    logger.info(f\"  -> Completed enrichment for {company_name} (confidence: {enriched_row.get('overall_lead_confidence')})\")\n    return enriched_row\ndef run_pipeline(\n    input_csv_path: str,\n    output_csv_path: str,\n    cache_file: str = \"enrichment_cache.json\",\n    config: Optional[Dict] = None\n) -> Dict:\n    \"\"\"\n    Core enrichment pipeline - reusable function for CLI and API\n    Args:\n        input_csv_path: Path to input Trustpilot CSV\n        output_csv_path: Path to output enriched CSV\n        cache_file: Path to enrichment cache file\n        config: Optional configuration dict (e.g., lender_name_override)\n    Returns:\n        Dict with statistics about the run\n    \"\"\"\n    logger.info(\"=\"*60)\n    logger.info(\"Starting Trustpilot Enrichment Pipeline\")\n    logger.info(\"=\"*60)\n    # ============================================================\n    # RUN ID (trace one CSV run across logs + output)\n    # ============================================================\n    RUN_ID = f\"{datetime.datetime.utcnow().isoformat()}_{uuid.uuid4().hex[:8]}\"\n    logger.info(f\"RUN_ID={RUN_ID}\")\n    config = config or {}\n    # Load input CSV\n    logger.info(\"Step 1: Loading input CSV...\")\n    df = load_input_csv(input_csv_path)\n    # Add row_id if not present\n    if 'row_id' not in df.columns:\n        df['row_id'] = range(1, len(df) + 1)\n    # Classify each row\n    logger.info(\"Step 2: Classifying display names...\")\n    # Note: raw_display_name is already mapped in load_input_csv()\n    df['name_classification'] = df['raw_display_name'].apply(classify_name)\n    classification_counts = df['name_classification'].value_counts()\n    logger.info(f\"  Classification results: {dict(classification_counts)}\")\n    # ============================================================\n    # POST-CLASSIFICATION OVERRIDES (business pattern boosts)\n    # ============================================================\n    import re\n    BUSINESS_KEYWORDS = [\n        \"llc\", \"inc\", \"ltd\", \"corp\", \"company\", \"co.\", \"co \",\n        \"plumbing\", \"roofing\", \"construction\", \"landscapes\", \"landscaping\",\n        \"cosmetics\", \"detailing\", \"transport\", \"logistics\", \"trucking\",\n        \"restaurant\", \"bistro\", \"sushi\", \"fitness\", \"academy\", \"institute\",\n        \"services\", \"service\", \"shop\", \"auto\", \"glass\", \"appliance\", \"spa\",\n    ]\n    def _looks_like_business(name: str) -> bool:\n        s = (name or \"\").strip().lower()\n        if not s:\n            return False\n        s2 = re.sub(r\"[^a-z0-9]+\", \" \", s).strip()\n        # glued suffixes like westerstatepainllc\n        if re.search(r\"(llc|inc|ltd|corp)$\", s):\n            return True\n        for kw in BUSINESS_KEYWORDS:\n            if kw in s2:\n                return True\n        # patterns like \"X - Y\" where Y contains a business noun\n        if \" - \" in s2 or \"-\" in s:\n            return any(kw in s2 for kw in [\"llc\", \"inc\", \"plumbing\", \"appliance\", \"landscap\", \"cosmetic\", \"institute\"])\n        return False\n    def _extract_company_search_name(raw_name: str) -> str:\n        s = (raw_name or \"\").strip()\n        # If format \"Owner - Company\", take the RHS as the company search name\n        if \" - \" in s:\n            left, right = s.split(\" - \", 1)\n            # If right side isn't empty, prefer it\n            if right.strip():\n                return right.strip()\n        # If \"Name, LLC\" etc. leave as-is\n        return s\n    if \"raw_display_name\" in df.columns:\n        raw_col = df[\"raw_display_name\"].astype(str)\n    else:\n        # fall back to your display name column\n        raw_col = df[\"consumer.displayname\"].astype(str) if \"consumer.displayname\" in df.columns else df.iloc[:, 0].astype(str)\n    mask = raw_col.apply(_looks_like_business)\n    # Upgrade misclassified rows to business\n    df.loc[mask, \"name_classification\"] = \"business\"\n    # Ensure company_search_name is populated with best guess for search\n    if \"company_search_name\" in df.columns:\n        df.loc[mask, \"company_search_name\"] = raw_col[mask].apply(_extract_company_search_name)\n    # ============================================================\n    # END POST-CLASSIFICATION OVERRIDES\n    # ============================================================\n    # Normalize business names\n    logger.info(\"Step 3: Normalizing business names...\")\n    business_mask = df['name_classification'] == 'business'\n    df.loc[business_mask, ['company_search_name', 'company_normalized_key']] = df.loc[business_mask, 'raw_display_name'].apply(\n        lambda x: pd.Series(normalize_business_name(x))\n    )\n    # Ensure company_search_name is populated for all business rows\n    df = ensure_company_search_name(df)\n    # Debug logging\n    logger.info(\n        \"Post-normalization: business rows=%s, business with company_search_name=%s\",\n        int((df[\"name_classification\"] == \"business\").sum()),\n        int(\n            (\n                (df[\"name_classification\"] == \"business\")\n                & df[\"company_search_name\"].notna()\n                & (df[\"company_search_name\"].astype(\"string\").str.strip() != \"\")\n            ).sum()\n        ),\n    )\n    # Dedup by company_normalized_key\n    logger.info(\"Step 4: Identifying unique businesses...\")\n    unique_businesses = identify_unique_businesses(df)\n    logger.info(f\"  Found {len(unique_businesses)} unique businesses to enrich\")\n    # Initialize cache\n    cache = EnrichmentCache(cache_file)\n    # Enrich each unique business\n    logger.info(\"Step 5: Enriching businesses...\")\n    enrichment_results = {}\n    for idx, (normalized_key, business_info) in enumerate(unique_businesses.items(), 1):\n        logger.info(f\"  [{idx}/{len(unique_businesses)}] Processing: {business_info['company_search_name']}\")\n        try:\n            result = enrich_business(business_info, cache, run_id=RUN_ID)\n            enrichment_results[normalized_key] = result\n        except Exception as e:\n            logger.error(f\"  Error enriching {business_info['company_search_name']}: {e}\")\n            enrichment_results[normalized_key] = {\n                'enrichment_status': 'error',\n                'enrichment_notes': str(e),\n                'overall_lead_confidence': 'failed',\n                'run_id': RUN_ID\n            }\n    # Save cache\n    cache.save_cache()\n    # Calculate enrichment statistics\n    logger.info(\"=\"*60)\n    logger.info(\"ENRICHMENT SUMMARY\")\n    logger.info(\"=\"*60)\n    logger.info(f\"  Total unique businesses processed: {len(enrichment_results)}\")\n    # Count results with domains, phones, emails\n    with_domain = sum(1 for r in enrichment_results.values() if r.get('company_domain'))\n    with_phone = sum(1 for r in enrichment_results.values() if r.get('primary_phone'))\n    with_email = sum(1 for r in enrichment_results.values() if r.get('primary_email'))\n    logger.info(f\"  Businesses with domain: {with_domain}/{len(enrichment_results)}\")\n    logger.info(f\"  Businesses with phone: {with_phone}/{len(enrichment_results)}\")\n    logger.info(f\"  Businesses with email: {with_email}/{len(enrichment_results)}\")\n    # Count by confidence\n    conf_counts = {}\n    for r in enrichment_results.values():\n        conf = r.get('overall_lead_confidence', 'unknown')\n        conf_counts[conf] = conf_counts.get(conf, 0) + 1\n    logger.info(f\"  Confidence breakdown: {conf_counts}\")\n    logger.info(\"=\"*60)\n    # Merge back to rows using robust matching function\n    # Convert dict values to list for new merge function signature\n    df = merge_enrichment_back_to_rows(df, list(enrichment_results.values()))\n    # Map source columns from input\n    if 'url' in df.columns:\n        df['source_review_url'] = df['url']\n    if 'date' in df.columns or 'review_date' in df.columns:\n        df['review_date'] = df.get('date', df.get('review_date'))\n    if 'rating' in df.columns or 'stars' in df.columns:\n        df['review_rating'] = df.get('rating', df.get('stars'))\n    df['source_platform'] = 'trustpilot'\n    # Apply lender name override if provided\n    if config.get('lender_name_override'):\n        df['source_lender_name'] = config['lender_name_override']\n    else:\n        # Extract lender name from URL if available\n        if 'source_review_url' in df.columns:\n            df['source_lender_name'] = df['source_review_url'].apply(\n                lambda x: x.split('/')[3] if isinstance(x, str) and '/' in x else None\n            )\n    # ============================================================\n    # PROVIDER SCOREBOARD (WINS BY SOURCE) - SAFE, NO API CALLS\n    # ============================================================\n    try:\n        # Email winners\n        if \"primary_email\" in df.columns:\n            email_populated = df[df[\"primary_email\"].notna() & (df[\"primary_email\"].astype(str).str.strip() != \"\")]\n            if \"primary_email_source\" in df.columns:\n                email_wins = email_populated[\"primary_email_source\"].fillna(\"unknown\").astype(str).str.lower().value_counts()\n                logger.info(f\"EMAIL WINNERS (primary_email_source): {email_wins.to_dict()}\")\n            else:\n                logger.info(\"EMAIL WINNERS: primary_email_source column missing\")\n            logger.info(f\"EMAIL POPULATED ROWS: {len(email_populated)}/{len(df)}\")\n        else:\n            logger.info(\"EMAIL WINNERS: primary_email column missing\")\n        # Phone winners\n        if \"primary_phone\" in df.columns:\n            phone_populated = df[df[\"primary_phone\"].notna() & (df[\"primary_phone\"].astype(str).str.strip() != \"\")]\n            if \"primary_phone_source\" in df.columns:\n                phone_wins = phone_populated[\"primary_phone_source\"].fillna(\"unknown\").astype(str).str.lower().value_counts()\n                logger.info(f\"PHONE WINNERS (primary_phone_source): {phone_wins.to_dict()}\")\n            else:\n                logger.info(\"PHONE WINNERS: primary_phone_source column missing\")\n            logger.info(f\"PHONE POPULATED ROWS: {len(phone_populated)}/{len(df)}\")\n        else:\n            logger.info(\"PHONE WINNERS: primary_phone column missing\")\n    except Exception as e:\n        logger.warning(f\"Provider scoreboard logging failed: {e}\")\n    # ============================================================\n    # END PROVIDER SCOREBOARD\n    # ============================================================\n    # Write final CSV\n    logger.info(\"Step 7: Writing output CSV...\")\n    output_schema = get_output_schema()\n    write_output_csv(df, output_csv_path, output_schema)\n    # Calculate statistics\n    stats = {\n        'total_rows': len(df),\n        'businesses': int(classification_counts.get('business', 0)),\n        'persons': int(classification_counts.get('person', 0)),\n        'others': int(classification_counts.get('other', 0)),\n        'unique_businesses': len(unique_businesses),\n        'enriched': len([r for r in enrichment_results.values() if r.get('enrichment_status') != 'error']),\n        'errors': len([r for r in enrichment_results.values() if r.get('enrichment_status') == 'error'])\n    }\n    logger.info(\"=\"*60)\n    logger.info(\"Pipeline completed successfully!\")\n    logger.info(f\"  Total rows: {stats['total_rows']}\")\n    logger.info(f\"  Businesses: {stats['businesses']}\")\n    logger.info(f\"  Unique businesses enriched: {stats['enriched']}/{stats['unique_businesses']}\")\n    logger.info(f\"  Output file: {output_csv_path}\")\n    logger.info(\"=\"*60)\n    return stats\n
+"""
+Core enrichment pipeline - reusable function for CLI and API
+Extracted from main.py to enable both CLI and API access
+"""
+import os
+import json
+import uuid
+import datetime
+import pandas as pd
+import numpy as np
+from typing import Dict, Optional, Any
+from urllib.parse import urlparse
+from .logging_utils import setup_logger
+from .io_utils import load_input_csv, write_output_csv, get_output_schema
+from .classification import classify_name
+from .normalization import normalize_business_name, ensure_company_search_name
+from .dedupe import identify_unique_businesses, get_enrichment_context
+from .cache import EnrichmentCache
+from . import local_enrichment
+from .email_enrichment import enrich_emails_for_domain
+from .phone_enrichment import enrich_business_phone_waterfall
+from .merge_results import merge_enrichment_results
+
+logger = setup_logger(__name__)
+
+def _safe_str(x):
+    """Safely convert value to string, handling None and NaN."""
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    s = str(x).strip()
+    return s
+
+def _norm_key(x: str) -> str:
+    """Normalize key: keep it simple + stable; match how company_search_name is generated."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    s = str(x).strip().lower()
+    # light normalization to make join stable
+    s = " ".join(s.split())
+    return s
+
+def _get(res, *keys, default=None):
+    """
+    Works with:
+      - dict results
+      - dataclass/obj results (attributes)
+      - nested dicts/objs
+    """
+    cur = res
+    for k in keys:
+        if cur is None:
+            return default
+        # dict
+        if isinstance(cur, dict):
+            cur = cur.get(k, None)
+        else:
+            cur = getattr(cur, k, None)
+    return default if cur is None else cur
+
+def merge_enrichment_back_to_rows(df: pd.DataFrame, enriched_businesses: list) -> pd.DataFrame:
+    """
+    PATCH: Robust merge-back function
+    df: row-level dataframe (all rows including business + person + other)
+    enriched_businesses: list of dicts, each dict contains business-level enrichment fields
+    Returns df with enrichment columns filled.
+    Key improvements:
+    - Uses company_search_name as primary join key (works even if company_normalized_key is NaN)
+    - Handles missing columns gracefully
+    - Deduplicates businesses by join key (keeps best record by data completeness)
+    - Forces object dtype to avoid pandas FutureWarning
+    """
+    logger.info("Step 6: Merging enrichment results back to rows...")
+    if df is None or df.empty:
+        logger.warning("  Empty dataframe, nothing to merge")
+        return df
+    # Ensure join columns exist
+    if "company_search_name" not in df.columns:
+        # fall back to raw_display_name if that exists
+        if "raw_display_name" in df.columns:
+            df["company_search_name"] = df["raw_display_name"]
+        else:
+            logger.error("  Missing company_search_name and raw_display_name columns")
+            raise ValueError("merge_enrichment_back_to_rows: missing company_search_name and raw_display_name")
+    # Create a stable join key on rows
+    df = df.copy()
+    df["_join_key"] = df["company_search_name"].apply(_norm_key)
+    # Build business-level table
+    biz_df = pd.DataFrame(enriched_businesses or [])
+    if biz_df.empty:
+        # Nothing to merge
+        logger.info("  No enrichment results to merge")
+        return df.drop(columns=["_join_key"], errors="ignore")
+    # Create stable join key on businesses
+    # Prefer company_search_name; fallback to company_normalized_key; fallback to company_name
+    for cand in ["company_search_name", "company_normalized_key", "company_name", "name"]:
+        if cand in biz_df.columns:
+            biz_df["_join_key"] = biz_df[cand].apply(_norm_key)
+            # If we got at least some non-empty keys, use it
+            if (biz_df["_join_key"] != "").any():
+                break
+    if "_join_key" not in biz_df.columns:
+        biz_df["_join_key"] = ""
+    logger.info("  Built enrichment index for %d businesses", len(biz_df))
+    # Deduplicate businesses by join key (keep best record: prefer ones with phone/email)
+    def _score_row(r):
+        score = 0
+        if str(r.get("primary_phone") or "").strip(): score += 2
+        if str(r.get("primary_email") or "").strip(): score += 2
+        if str(r.get("business_address") or "").strip(): score += 1
+        if str(r.get("company_domain") or "").strip(): score += 1
+        return score
+    biz_df["_score"] = biz_df.apply(_score_row, axis=1)
+    biz_df = biz_df.sort_values(["_join_key", "_score"], ascending=[True, False])
+    biz_df = biz_df.drop_duplicates(subset=["_join_key"], keep="first").drop(columns=["_score"])
+    logger.info("  After deduplication: %d unique businesses", len(biz_df))
+    # Columns we want to bring back (only if present in business table)
+    wanted = [
+        "company_domain",
+        "domain_confidence",
+        "primary_phone",
+        "primary_phone_display",
+        "primary_phone_source",
+        "primary_phone_confidence",
+        "primary_email",
+        "primary_email_type",
+        "primary_email_source",
+        "primary_email_confidence",
+        "business_address",
+        "business_city",
+        "business_state_region",
+        "business_postal_code",
+        "business_country",
+        "all_phones_json",
+        "generic_emails_json",
+        "person_emails_json",
+        "catchall_emails_json",
+        "overall_lead_confidence",
+        "enrichment_status",
+        "enrichment_notes",
+    ]
+    present = [c for c in wanted if c in biz_df.columns]
+    logger.info("  Merging %d enrichment columns: %s", len(present), present)
+    # Prepare minimal merge frame
+    merge_df = biz_df[["_join_key"] + present].copy()
+    # Merge
+    out = df.merge(merge_df, on="_join_key", how="left", suffixes=("", "_biz"))
+    # IMPORTANT: pandas dtype safety (avoid FutureWarning & "incompatible dtype" issues)
+    # Ensure target columns are object so assignment doesn't silently fail / coerce weirdly.
+    for c in present:
+        if c not in out.columns:
+            out[c] = ""
+        out[c] = out[c].astype("object")
+    # Cleanup
+    out = out.drop(columns=["_join_key"], errors="ignore")
+    logger.info("  Finished merging enrichment results into %d rows", len(out))
+    return out
+
+def _compute_confidence(row: Dict[str, Any]) -> str:
+    """Compute overall confidence based on phone and email presence."""
+    has_phone = bool(row.get("primary_phone"))
+    has_email = bool(row.get("primary_email"))
+    if has_phone and has_email:
+        return "high"
+    if has_phone or has_email:
+        return "medium"
+    return "failed"
+
+def enrich_single_business(name: str, region: str | None = None) -> Dict[str, Any]:
+    """
+    PHASE 2: Enhanced enrichment function with phone waterfall.
+    Flow:
+    1. Google Places for address/website (phone extracted but not used directly)
+    2. Extract domain from website
+    3. Phone waterfall (Google → Yelp → Website → Apollo) with validation
+    4. Email enrichment (Hunter only)
+    5. Compute overall confidence
+    Args:
+        name: Business name
+        region: Optional region/location
+    Returns:
+        Dict with enriched business data including validated phone
+    """
+    logger.info("Enriching business: %s", name)
+    row = {
+        "business_name": name,
+        "primary_phone": None,
+        "phone": None,
+        "primary_email": None,
+        "email": None,
+        "emails": [],
+        "email_source": None,
+        "website": None,
+        "domain": None,
+        "address": None,
+        "city": None,
+        "state_region": None,
+        "postal_code": None,
+        "country": None,
+    }
+    local = local_enrichment.enrich_local_business(name, region)
+    # Store address/location data
+    if local:
+        for f in ["address", "city", "state_region", "postal_code", "country"]:
+            if local.get(f):
+                row[f] = local[f]
+        if local.get("website"):
+            row["website"] = local["website"]
+    website = row.get("website")
+    if website:
+        try:
+            parsed = urlparse(website)
+            host = parsed.netloc or parsed.path
+            if host.startswith("www."):
+                host = host[4:]
+            row["domain"] = host.lower()
+        except Exception:
+            row["domain"] = None
+    domain = row.get("domain")
+    phone_layer = enrich_business_phone_waterfall(
+        biz_name=name,
+        google_hit=local or {},
+        domain=domain
+    )
+    # Map phone results
+    row["primary_phone"] = phone_layer.get("primary_phone")
+    row["phone"] = phone_layer.get("primary_phone")
+    row["phone_source"] = phone_layer.get("primary_phone_source")
+    row["phone_confidence"] = phone_layer.get("primary_phone_confidence")
+    row["all_phones_json"] = phone_layer.get("all_phones_json")
+    # ============================================================
+    # EMAIL WATERFALL (Hunter → Snov → Apollo → FullEnrich)
+    # ============================================================
+    from tp_enrich.email_enrichment import run_email_waterfall
+    logger.info(f"   -> Email enrichment (Hunter → Snov → Apollo → FullEnrich) for {name} domain={domain}")
+    email_result = run_email_waterfall(domain, logger=logger, company_name=name)
+    # Always log one line proving what happened (super useful for debugging credits)
+    # Use self-proving fields from run_email_waterfall (these CANNOT be blank)
+    logger.info(f"   -> Email providers attempted: {email_result.get('email_waterfall_tried')}")
+    logger.info(f"   -> Email waterfall tracking: tried={email_result.get('email_waterfall_tried')} winner={email_result.get('email_waterfall_winner')}")
+    primary_email = email_result.get("primary_email")
+    primary_email_source = email_result.get("primary_email_source")
+    primary_email_confidence = email_result.get("primary_email_confidence")
+    logger.info(f"   -> Email enrichment complete: primary_email={primary_email} source={primary_email_source} confidence={primary_email_confidence}")
+    # Make sure you store these into row so they get returned
+    row["primary_email"] = primary_email
+    row["primary_email_source"] = primary_email_source
+    row["primary_email_confidence"] = primary_email_confidence
+    # SELF-PROVING WATERFALL TRACKING: These fields come directly from run_email_waterfall
+    row["email_waterfall_tried"] = email_result.get("email_waterfall_tried", "")
+    row["email_waterfall_winner"] = email_result.get("email_waterfall_winner")
+    row["provider_status_json"] = email_result.get("provider_status_json", "{}")
+    # CRITICAL: Ensure primary_email_source is correctly mapped
+    # CSV writer expects: primary_email_source (NOT email_source)
+    if row.get("email_source") and not row.get("primary_email_source"):
+        row["primary_email_source"] = row["email_source"]
+    # ============================================================
+    # END EMAIL WATERFALL
+    # ============================================================
+    # ============================================================
+    # PHASE 2: Apply fallback enrichment for phone/website coverage
+    # ============================================================
+    from tp_enrich.phase2_enrichment import apply_phase2_fallbacks_v2
+    logger.info(f"   -> Applying Phase 2 fallbacks for {name}")
+    # Build google_payload from local enrichment data
+    google_payload = {
+        "lat": local.get("lat") if local else None,
+        "lng": local.get("lng") if local else None,
+        "lon": local.get("lon") if local else None,
+        "city": row.get("city"),
+        "state_region": row.get("state_region"),
+        "state": row.get("state_region"),
+        "postal_code": row.get("postal_code"),
+    }
+    p2 = apply_phase2_fallbacks_v2(
+        business_name=name,
+        google_payload=google_payload,
+        current_phone=row.get("primary_phone"),
+        current_website=row.get("website"),
+        logger=logger
+    )
+    # Apply phone fallback if we didn't have one
+    if not row.get("primary_phone") and p2.get("normalized_phone"):
+        row["primary_phone"] = p2["normalized_phone"]
+        row["phone"] = p2["normalized_phone"]
+        row["phone_source"] = p2.get("phone_source", "phase2_fallback")
+        row["phone_confidence"] = p2.get("phone_confidence", "low")
+        logger.info(f"   -> Phase 2 phone fallback: {p2['phone_final']} from {p2.get('phone_source')}")
+    # Apply website fallback if we didn't have one
+    if not row.get("website") and p2.get("website_final"):
+        row["website"] = p2["website_final"]
+        logger.info(f"   -> Phase 2 website fallback: {p2['website_final']}")
+        # NEW: Store contact names extracted from BBB/YP/OC scrapers
+    contact_names = p2.get("contact_names", [])
+    if contact_names:
+        row["phase2_bbb_names_json"] = str(contact_names)
+        logger.info(f"   -> Phase 2 extracted {len(contact_names)} contact names: {contact_names}")
+    else:
+        row["phase2_bbb_names_json"] = "[]"
+
+    # Add discovery URLs (optional but useful)
+    row["phase2_bbb_link"] = p2.get("bbb_url")
+    row["phase2_yp_link"] = p2.get("yp_url")
+    row["yelp_url"] = p2.get("yelp_url")
+    # Add OpenCorporates validation (optional)
+    row["oc_company_number"] = p2.get("oc_company_number")
+    row["oc_status"] = p2.get("oc_status")
+    # Add notes for debugging
+    row["phase2_notes"] = f"yelp:{p2.get('yelp_notes')} serp:{p2.get('serp_notes')} oc:{p2.get('oc_notes')}"
+    logger.info(f"   -> Phase 2 fallbacks complete")
+
+    # ============================================================
+    # PHASE 2 DATA ENRICHMENT - HOTFIX v2
+    # Fixes: Hunter key detection, YP category pages, data extraction
+    # ============================================================
+    from tp_enrich.phase2_enrichment import apply_phase2_data_enrichment_SAFE
+    logger.info(f"   -> Applying Phase 2 data enrichment (HOTFIX v2 + ANTI-CRASH) for {name}")
+
+    p2_data = apply_phase2_data_enrichment_SAFE(
+        company=name,
+        google_payload=google_payload,
+        logger=logger
+    )
+
+    # Store extracted contact data (with website fields)
+    row["phase2_bbb_phone"] = p2_data.get("phase2_bbb_phone")
+    row["phase2_bbb_email"] = p2_data.get("phase2_bbb_email")
+    row["phase2_bbb_website"] = p2_data.get("phase2_bbb_website")
+    row["phase2_bbb_names"] = p2_data.get("phase2_bbb_names", [])
+    row["phase2_yp_phone"] = p2_data.get("phase2_yp_phone")
+    row["phase2_yp_email"] = p2_data.get("phase2_yp_email")
+    row["phase2_yp_website"] = p2_data.get("phase2_yp_website")
+    row["phase2_yp_names"] = p2_data.get("phase2_yp_names", [])
+
+    logger.info(f"   -> Phase 2 data enrichment (HOTFIX v2 + ANTI-CRASH) complete")
+    # ============================================================
+    # END PHASE 2
+    # ============================================================
+    row["confidence"] = _compute_confidence(row)
+    return row
+
+def enrich_business(business_info: Dict, cache: EnrichmentCache, run_id: str = None) -> Dict:
+    """
+    Enrich a single business through all sources
+    Args:
+        business_info: Business information dict
+        cache: Enrichment cache
+        run_id: Optional RUN_ID for tracing this enrichment run
+    Returns:
+        Complete enrichment result
+    """
+    normalized_key = business_info['company_normalized_key']
+    company_name = business_info['company_search_name']
+    # Check cache
+    if cache.has(normalized_key):
+        logger.info(f"  -> Using cached result for {company_name}")
+        return cache.get(normalized_key)
+    # Get enrichment context
+    context = get_enrichment_context(business_info)
+    region = context.get('state') or context.get('region')
+    # Use the simplified enrichment function
+    enriched_data = enrich_single_business(company_name, region=region)
+    enriched_row = {
+        # identity / keys
+        "company_normalized_key": normalized_key,
+        "company_search_name": company_name,
+        "company_domain": enriched_data.get("domain"),
+        "domain_confidence": "high" if enriched_data.get("domain") else "none",
+        # primary phone
+        "primary_phone": enriched_data.get("primary_phone"),
+        "primary_phone_display": enriched_data.get("primary_phone"),
+        "primary_phone_source": enriched_data.get("phone_source"),
+        "primary_phone_confidence": enriched_data.get("phone_confidence"),
+        # primary email
+        "primary_email": enriched_data.get("primary_email"),
+        "primary_email_type": "generic",
+        "primary_email_source": enriched_data.get("primary_email_source") or enriched_data.get("email_source"),
+        "primary_email_confidence": enriched_data.get("primary_email_confidence") or ("medium" if enriched_data.get("primary_email") else "none"),
+        # address
+        "business_address": enriched_data.get("address"),
+        "business_city": enriched_data.get("city"),
+        "business_state_region": enriched_data.get("state_region"),
+        "business_postal_code": enriched_data.get("postal_code"),
+        "business_country": enriched_data.get("country"),
+        # metadata
+        "overall_lead_confidence": enriched_data.get("confidence", "failed"),
+        "enrichment_status": "completed",
+        "enrichment_notes": "",
+        # debug payloads
+        "all_phones_json": enriched_data.get("all_phones_json", "{}"),
+        "generic_emails_json": "[]",
+        "person_emails_json": "[]",
+        "catchall_emails_json": "[]",
+        # PHASE 1 PROOF: waterfall tracking fields
+        "email_providers_tried": enriched_data.get("email_providers_tried", ""),
+        "email_provider_errors_json": enriched_data.get("email_provider_errors_json", "{}"),
+        "email_waterfall_winner": enriched_data.get("email_waterfall_winner"),
+        "source_platform": "trustpilot",
+        # RUN_ID for tracing this enrichment run
+        "run_id": run_id or "",
+    }
+    # Save to cache
+    cache.set(normalized_key, enriched_row)
+    logger.info(f"  -> Completed enrichment for {company_name} (confidence: {enriched_row.get('overall_lead_confidence')})")
+    return enriched_row
+
+def run_pipeline(
+    input_csv_path: str,
+    output_csv_path: str,
+    cache_file: str = "enrichment_cache.json",
+    config: Optional[Dict] = None
+) -> Dict:
+    """
+    Core enrichment pipeline - reusable function for CLI and API
+    Args:
+        input_csv_path: Path to input Trustpilot CSV
+        output_csv_path: Path to output enriched CSV
+        cache_file: Path to enrichment cache file
+        config: Optional configuration dict (e.g., lender_name_override)
+    Returns:
+        Dict with statistics about the run
+    """
+    logger.info("="*60)
+    logger.info("Starting Trustpilot Enrichment Pipeline")
+    logger.info("="*60)
+    # ============================================================
+    # RUN ID (trace one CSV run across logs + output)
+    # ============================================================
+    RUN_ID = f"{datetime.datetime.utcnow().isoformat()}_{uuid.uuid4().hex[:8]}"
+    logger.info(f"RUN_ID={RUN_ID}")
+    config = config or {}
+    # Load input CSV
+    logger.info("Step 1: Loading input CSV...")
+    df = load_input_csv(input_csv_path)
+    # Add row_id if not present
+    if 'row_id' not in df.columns:
+        df['row_id'] = range(1, len(df) + 1)
+    # Classify each row
+    logger.info("Step 2: Classifying display names...")
+    # Note: raw_display_name is already mapped in load_input_csv()
+    df['name_classification'] = df['raw_display_name'].apply(classify_name)
+    classification_counts = df['name_classification'].value_counts()
+    logger.info(f"  Classification results: {dict(classification_counts)}")
+    # ============================================================
+    # POST-CLASSIFICATION OVERRIDES (business pattern boosts)
+    # ============================================================
+    import re
+    BUSINESS_KEYWORDS = [
+        "llc", "inc", "ltd", "corp", "company", "co.", "co ",
+        "plumbing", "roofing", "construction", "landscapes", "landscaping",
+        "cosmetics", "detailing", "transport", "logistics", "trucking",
+        "restaurant", "bistro", "sushi", "fitness", "academy", "institute",
+        "services", "service", "shop", "auto", "glass", "appliance", "spa",
+    ]
+    def _looks_like_business(name: str) -> bool:
+        s = (name or "").strip().lower()
+        if not s:
+            return False
+        s2 = re.sub(r"[^a-z0-9]+", " ", s).strip()
+        # glued suffixes like westerstatepainllc
+        if re.search(r"(llc|inc|ltd|corp)$", s):
+            return True
+        for kw in BUSINESS_KEYWORDS:
+            if kw in s2:
+                return True
+        # patterns like "X - Y" where Y contains a business noun
+        if " - " in s2 or "-" in s:
+            return any(kw in s2 for kw in ["llc", "inc", "plumbing", "appliance", "landscap", "cosmetic", "institute"])
+        return False
+    def _extract_company_search_name(raw_name: str) -> str:
+        s = (raw_name or "").strip()
+        # If format "Owner - Company", take the RHS as the company search name
+        if " - " in s:
+            left, right = s.split(" - ", 1)
+            # If right side isn't empty, prefer it
+            if right.strip():
+                return right.strip()
+        # If "Name, LLC" etc. leave as-is
+        return s
+    if "raw_display_name" in df.columns:
+        raw_col = df["raw_display_name"].astype(str)
+    else:
+        # fall back to your display name column
+        raw_col = df["consumer.displayname"].astype(str) if "consumer.displayname" in df.columns else df.iloc[:, 0].astype(str)
+    mask = raw_col.apply(_looks_like_business)
+    # Upgrade misclassified rows to business
+    df.loc[mask, "name_classification"] = "business"
+    # Ensure company_search_name is populated with best guess for search
+    if "company_search_name" in df.columns:
+        df.loc[mask, "company_search_name"] = raw_col[mask].apply(_extract_company_search_name)
+    # ============================================================
+    # END POST-CLASSIFICATION OVERRIDES
+    # ============================================================
+    # Normalize business names
+    logger.info("Step 3: Normalizing business names...")
+    business_mask = df['name_classification'] == 'business'
+    df.loc[business_mask, ['company_search_name', 'company_normalized_key']] = df.loc[business_mask, 'raw_display_name'].apply(
+        lambda x: pd.Series(normalize_business_name(x))
+    )
+    # Ensure company_search_name is populated for all business rows
+    df = ensure_company_search_name(df)
+    # Debug logging
+    logger.info(
+        "Post-normalization: business rows=%s, business with company_search_name=%s",
+        int((df["name_classification"] == "business").sum()),
+        int(
+            (
+                (df["name_classification"] == "business")
+                & df["company_search_name"].notna()
+                & (df["company_search_name"].astype("string").str.strip() != "")
+            ).sum()
+        ),
+    )
+    # Dedup by company_normalized_key
+    logger.info("Step 4: Identifying unique businesses...")
+    unique_businesses = identify_unique_businesses(df)
+    logger.info(f"  Found {len(unique_businesses)} unique businesses to enrich")
+    # Initialize cache
+    cache = EnrichmentCache(cache_file)
+    # Enrich each unique business
+    logger.info("Step 5: Enriching businesses...")
+    enrichment_results = {}
+    for idx, (normalized_key, business_info) in enumerate(unique_businesses.items(), 1):
+        logger.info(f"  [{idx}/{len(unique_businesses)}] Processing: {business_info['company_search_name']}")
+        try:
+            result = enrich_business(business_info, cache, run_id=RUN_ID)
+            enrichment_results[normalized_key] = result
+        except Exception as e:
+            logger.error(f"  Error enriching {business_info['company_search_name']}: {e}")
+            enrichment_results[normalized_key] = {
+                'enrichment_status': 'error',
+                'enrichment_notes': str(e),
+                'overall_lead_confidence': 'failed',
+                'run_id': RUN_ID
+            }
+    # Save cache
+    cache.save_cache()
+    # Calculate enrichment statistics
+    logger.info("="*60)
+    logger.info("ENRICHMENT SUMMARY")
+    logger.info("="*60)
+    logger.info(f"  Total unique businesses processed: {len(enrichment_results)}")
+    # Count results with domains, phones, emails
+    with_domain = sum(1 for r in enrichment_results.values() if r.get('company_domain'))
+    with_phone = sum(1 for r in enrichment_results.values() if r.get('primary_phone'))
+    with_email = sum(1 for r in enrichment_results.values() if r.get('primary_email'))
+    logger.info(f"  Businesses with domain: {with_domain}/{len(enrichment_results)}")
+    logger.info(f"  Businesses with phone: {with_phone}/{len(enrichment_results)}")
+    logger.info(f"  Businesses with email: {with_email}/{len(enrichment_results)}")
+    # Count by confidence
+    conf_counts = {}
+    for r in enrichment_results.values():
+        conf = r.get('overall_lead_confidence', 'unknown')
+        conf_counts[conf] = conf_counts.get(conf, 0) + 1
+    logger.info(f"  Confidence breakdown: {conf_counts}")
+    logger.info("="*60)
+    # Merge back to rows using robust matching function
+    # Convert dict values to list for new merge function signature
+    df = merge_enrichment_back_to_rows(df, list(enrichment_results.values()))
+    # Map source columns from input
+    if 'url' in df.columns:
+        df['source_review_url'] = df['url']
+    if 'date' in df.columns or 'review_date' in df.columns:
+        df['review_date'] = df.get('date', df.get('review_date'))
+    if 'rating' in df.columns or 'stars' in df.columns:
+        df['review_rating'] = df.get('rating', df.get('stars'))
+    df['source_platform'] = 'trustpilot'
+    # Apply lender name override if provided
+    if config.get('lender_name_override'):
+        df['source_lender_name'] = config['lender_name_override']
+    else:
+        # Extract lender name from URL if available
+        if 'source_review_url' in df.columns:
+            df['source_lender_name'] = df['source_review_url'].apply(
+                lambda x: x.split('/')[3] if isinstance(x, str) and '/' in x else None
+            )
+    # ============================================================
+    # PROVIDER SCOREBOARD (WINS BY SOURCE) - SAFE, NO API CALLS
+    # ============================================================
+    try:
+        # Email winners
+        if "primary_email" in df.columns:
+            email_populated = df[df["primary_email"].notna() & (df["primary_email"].astype(str).str.strip() != "")]
+            if "primary_email_source" in df.columns:
+                email_wins = email_populated["primary_email_source"].fillna("unknown").astype(str).str.lower().value_counts()
+                logger.info(f"EMAIL WINNERS (primary_email_source): {email_wins.to_dict()}")
+            else:
+                logger.info("EMAIL WINNERS: primary_email_source column missing")
+            logger.info(f"EMAIL POPULATED ROWS: {len(email_populated)}/{len(df)}")
+        else:
+            logger.info("EMAIL WINNERS: primary_email column missing")
+        # Phone winners
+        if "primary_phone" in df.columns:
+            phone_populated = df[df["primary_phone"].notna() & (df["primary_phone"].astype(str).str.strip() != "")]
+            if "primary_phone_source" in df.columns:
+                phone_wins = phone_populated["primary_phone_source"].fillna("unknown").astype(str).str.lower().value_counts()
+                logger.info(f"PHONE WINNERS (primary_phone_source): {phone_wins.to_dict()}")
+            else:
+                logger.info("PHONE WINNERS: primary_phone_source column missing")
+            logger.info(f"PHONE POPULATED ROWS: {len(phone_populated)}/{len(df)}")
+        else:
+            logger.info("PHONE WINNERS: primary_phone column missing")
+    except Exception as e:
+        logger.warning(f"Provider scoreboard logging failed: {e}")
+    # ============================================================
+    # END PROVIDER SCOREBOARD
+    # ============================================================
+    # Write final CSV
+    logger.info("Step 7: Writing output CSV...")
+    output_schema = get_output_schema()
+    write_output_csv(df, output_csv_path, output_schema)
+    # Calculate statistics
+    stats = {
+        'total_rows': len(df),
+        'businesses': int(classification_counts.get('business', 0)),
+        'persons': int(classification_counts.get('person', 0)),
+        'others': int(classification_counts.get('other', 0)),
+        'unique_businesses': len(unique_businesses),
+        'enriched': len([r for r in enrichment_results.values() if r.get('enrichment_status') != 'error']),
+        'errors': len([r for r in enrichment_results.values() if r.get('enrichment_status') == 'error'])
+    }
+    logger.info("="*60)
+    logger.info("Pipeline completed successfully!")
+    logger.info(f"  Total rows: {stats['total_rows']}")
+    logger.info(f"  Businesses: {stats['businesses']}")
+    logger.info(f"  Unique businesses enriched: {stats['enriched']}/{stats['unique_businesses']}")
+    logger.info(f"  Output file: {output_csv_path}")
+    logger.info("="*60)
+    return stats
