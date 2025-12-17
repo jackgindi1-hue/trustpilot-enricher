@@ -1,31 +1,22 @@
 # ============================================================
-# PHASE 2 "FIX ALL" PATCH (single paste)
-# Fixes:
-#  1) Yelp 400 in phone_enrichment.py (root cause: missing location/lat/lon)
-#  2) YellowPages: force Serp to return *business listing* URLs + avoid 403 pain
-#  3) BBB: extract REAL contact names only (Principal / Owner / President / etc.)
-#  4) OpenCorporates: tighten Serp query + only run AFTER we have state
-#  5) Logs: always show WHY something ran / skipped
+# PHASE 2 FIX-ALL PATCH v3 (NO DEBUG HELL)
+# Fixes confirmed from your logs:
+#  - Yelp 400 STILL happening -> phone_enrichment.py is still calling OLD Yelp code
+#    This patch gives you a drop-in function AND a safe wrapper you can call.
+#  - YellowPages link=None -> Serp returned ok but our link picker was too strict
+#    This patch makes link picking robust and adjusts the YP query to force listings.
+#  - OpenCorporates link=None -> make link picking more forgiving (domain match)
 #
-# REQUIRED Railway Vars:
-#   - YELP_API_KEY   = <Yelp Fusion key>
-#   - SERP_API_KEY   = <SerpApi key>  (aliases supported)
-#
-# OPTIONAL:
-#   - OPENCORPORATES_API_TOKEN = <token>  (ONLY if you later want OC API; scraping uses Serp here)
-#
-# WHERE TO PASTE
-#   1) Paste this whole block into: tp_enrich/phase2_fixes.py  (new file is fine)
-#   2) Then apply the 2 small integration edits at bottom:
-#        A) phone_enrichment.py (Yelp call)
-#        B) pipeline/local_enrichment.py (call apply_phase2_fallbacks_v2)
+# REQUIRED ENV VARS:
+#   YELP_API_KEY=<yelp fusion key>
+#   SERP_API_KEY=<serpapi key>   (aliases supported)
 # ============================================================
 
-import os, re, time, requests
-from typing import Any, Dict, Optional, List, Tuple
+import os, re, requests
+from typing import Any, Dict, Optional, Tuple, List
 
 # -----------------------------
-# ENV helpers (anti "Hunter key" fiasco)
+# ENV + helpers
 # -----------------------------
 def _env_first(*names: str) -> Optional[str]:
     for n in names:
@@ -50,9 +41,6 @@ def phase2_env_debug(logger=None) -> None:
             f"SerpApi={bool(serp)}({_mask(serp)})"
         )
 
-# -----------------------------
-# Phone normalization
-# -----------------------------
 _US_PHONE_RE = re.compile(r"\+?1?\s*[\(\-\.]?\s*(\d{3})\s*[\)\-\.]?\s*(\d{3})\s*[\-\.]?\s*(\d{4})")
 
 def normalize_us_phone(raw: Optional[str]) -> Optional[str]:
@@ -75,7 +63,7 @@ def _build_location_from_google_payload(g: Dict[str, Any]) -> Optional[str]:
     return ", ".join(parts) if parts else None
 
 # ============================================================
-# (1) YELP FIX (guaranteed no 400 as long as Google gave city/state OR lat/lon)
+# (A) YELP: GUARANTEED "location OR lat/lon" => NO MORE 400
 # ============================================================
 
 def yelp_fusion_search_business(
@@ -83,19 +71,13 @@ def yelp_fusion_search_business(
     google_payload: Dict[str, Any],
     logger=None,
 ) -> Dict[str, Any]:
-    """
-    Yelp Fusion v3 businesses/search:
-    MUST send either:
-      - location=<string>  OR
-      - latitude + longitude
-    """
     key = _env_first("YELP_API_KEY", "YELP_FUSION_API_KEY", "YELP_KEY")
     if not key:
-        return {"_attempted": False, "notes": "missing YELP_API_KEY"}
+        return {"_attempted": False, "notes": "missing_key"}
 
     term = (business_name or "").strip()[:80]
     if not term:
-        return {"_attempted": False, "notes": "missing term"}
+        return {"_attempted": False, "notes": "missing_term"}
 
     lat = google_payload.get("lat")
     lon = google_payload.get("lng") or google_payload.get("lon")
@@ -107,7 +89,7 @@ def yelp_fusion_search_business(
     else:
         loc = _build_location_from_google_payload(google_payload)
         if not loc:
-            return {"_attempted": False, "notes": "no lat/lon and no location fields from Google"}
+            return {"_attempted": False, "notes": "missing_location_fields"}
         params["location"] = loc
 
     url = "https://api.yelp.com/v3/businesses/search"
@@ -123,28 +105,32 @@ def yelp_fusion_search_business(
         js = r.json() or {}
         biz = (js.get("businesses") or [None])[0] or {}
         phone = normalize_us_phone(biz.get("display_phone") or biz.get("phone"))
-        yelp_url = biz.get("url")
-        return {
-            "_attempted": True,
-            "notes": "ok" if (phone or yelp_url) else "ok_no_fields",
-            "phone": phone,
-            "yelp_url": yelp_url,
-        }
+        return {"_attempted": True, "notes": "ok" if phone else "ok_no_phone", "phone": phone, "yelp_url": biz.get("url")}
     except Exception as e:
         return {"_attempted": True, "notes": f"exception={repr(e)}"}
 
+def yelp_phone_lookup_safe(business_name: str, google_payload: Dict[str, Any], logger=None) -> Optional[str]:
+    """
+    Use THIS inside tp_enrich/phone_enrichment.py (PHONE WATERFALL).
+    It will never call Yelp without location/latlon.
+    """
+    y = yelp_fusion_search_business(business_name, google_payload, logger=logger)
+    if logger:
+        logger.info(f"Yelp FIX400 attempted={y.get('_attempted')} notes={y.get('notes')}")
+    return y.get("phone")
+
 # ============================================================
-# (2) SERPAPI helpers (we'll use Serp for BBB/YP/OC "scrape now")
+# (B) SERP: fix YP link=None by making link picking less strict
 # ============================================================
 
 def _serp_key() -> Optional[str]:
-    # accept aliases so you can't get burned
     return _env_first("SERP_API_KEY", "SERPAPI_API_KEY", "SERPAPI_KEY")
 
 def _serp_search(q: str, engine: str = "google", logger=None) -> Dict[str, Any]:
     key = _serp_key()
     if not key:
-        return {"_attempted": False, "notes": "missing SERP_API_KEY"}
+        return {"_attempted": False, "notes": "missing_serp_key"}
+
     url = "https://serpapi.com/search.json"
     params = {"engine": engine, "q": q, "api_key": key}
     try:
@@ -157,18 +143,34 @@ def _serp_search(q: str, engine: str = "google", logger=None) -> Dict[str, Any]:
     except Exception as e:
         return {"_attempted": True, "notes": f"exception={repr(e)}"}
 
-def _pick_best_link(js: Dict[str, Any], domain_contains: str) -> Optional[str]:
-    # Prefer organic_results links
+def _domain_match(link: str, domain: str) -> bool:
+    if not link:
+        return False
+    try:
+        return domain.lower().strip("/") in link.lower()
+    except Exception:
+        return False
+
+def _pick_best_link_any(js: Dict[str, Any], domain: str) -> Optional[str]:
+    # 1) organic_results
     for item in (js.get("organic_results") or []):
         link = item.get("link")
-        if link and domain_contains in link:
+        if link and _domain_match(link, domain):
             return link
-    # Fallback: inline "knowledge_graph" style
-    kg = js.get("knowledge_graph") or {}
-    if isinstance(kg, dict):
-        for k in ("website", "source", "link"):
-            if kg.get(k) and domain_contains in str(kg.get(k)):
-                return str(kg.get(k))
+
+    # 2) sometimes Serp puts "inline_results" / "inline_images" etc — scan shallowly
+    for k in ("inline_results", "top_stories", "related_results"):
+        for item in (js.get(k) or []):
+            link = item.get("link")
+            if link and _domain_match(link, domain):
+                return link
+
+    # 3) fallback: search_metadata (rare)
+    md = js.get("search_metadata") or {}
+    if isinstance(md, dict):
+        for v in md.values():
+            if isinstance(v, str) and _domain_match(v, domain):
+                return v
     return None
 
 def _fetch_html(url: str, logger=None) -> Tuple[int, str]:
@@ -180,12 +182,7 @@ def _fetch_html(url: str, logger=None) -> Tuple[int, str]:
             logger.warning(f"fetch exception url={url} ex={repr(e)}")
         return 0, ""
 
-# ============================================================
-# (3) BBB "SCRAPE NOW" (good: you already get 200)
-# Extract ONLY real-looking person names from specific BBB sections.
-# ============================================================
-
-# tight patterns: names next to "Principal", "Owner", "President", etc.
+# BBB name extraction patterns (tight)
 _BBB_ROLE_PATTERNS = [
     r"Principal(?:\(s\))?\s*</[^>]+>\s*<[^>]+>\s*([^<]{2,80})<",
     r"Business Management\s*</[^>]+>\s*<[^>]+>\s*([^<]{2,80})<",
@@ -198,11 +195,9 @@ def _clean_person_candidate(s: str) -> Optional[str]:
     if not s:
         return None
     s = re.sub(r"\s+", " ", s).strip()
-    # reject obvious garbage
     bad = ["Business Profile", "Better Business Bureau", "Accredited", "Reviews", "Roofing Contractors", "Gihon", "Profile"]
     if any(b.lower() in s.lower() for b in bad):
         return None
-    # require at least 2 tokens and mostly letters
     toks = s.split()
     if len(toks) < 2 or len(toks) > 5:
         return None
@@ -210,11 +205,7 @@ def _clean_person_candidate(s: str) -> Optional[str]:
         return None
     return s
 
-def bbb_scrape_contacts(
-    business_name: str,
-    google_payload: Dict[str, Any],
-    logger=None,
-) -> Dict[str, Any]:
+def bbb_scrape_contacts(business_name: str, google_payload: Dict[str, Any], logger=None) -> Dict[str, Any]:
     city = google_payload.get("city") or ""
     state = (google_payload.get("state_region") or google_payload.get("state") or "").strip()
     q = f'site:bbb.org "{business_name}" {city} {state}'.strip()
@@ -223,21 +214,21 @@ def bbb_scrape_contacts(
     if logger:
         logger.info(f"PHASE2 BBB: serp attempted={sr.get('_attempted')} notes={sr.get('notes')}")
     if not sr.get("_attempted") or sr.get("notes") != "ok":
-        return {"_attempted": sr.get("_attempted", False), "notes": f"serp_{sr.get('notes')}"}
+        return {"_attempted": sr.get("_attempted", False), "notes": f"serp_{sr.get('notes')}", "link": None, "names": []}
 
     js = sr.get("json") or {}
-    link = _pick_best_link(js, "bbb.org/")
+    link = _pick_best_link_any(js, "bbb.org")
     if logger:
         logger.info(f"PHASE2 BBB: link={link}")
 
     if not link:
-        return {"_attempted": True, "notes": "no_link"}
+        return {"_attempted": True, "notes": "no_link", "link": None, "names": []}
 
     status, html = _fetch_html(link, logger=logger)
     if logger:
         logger.info(f"PHASE2 BBB: fetch status={status} html_len={len(html)}")
     if status != 200 or not html:
-        return {"_attempted": True, "notes": f"fetch_http_{status}", "link": link}
+        return {"_attempted": True, "notes": f"fetch_http_{status}", "link": link, "names": []}
 
     names: List[str] = []
     for pat in _BBB_ROLE_PATTERNS:
@@ -248,45 +239,34 @@ def bbb_scrape_contacts(
 
     return {"_attempted": True, "notes": "ok" if names else "ok_no_names", "link": link, "names": names}
 
-# ============================================================
-# (4) YellowPages "SCRAPE NOW"
-# Fix: query must force a business listing URL, not a category page.
-# Also: YP often 403s server-side. We still try fetch, but also capture link.
-# ============================================================
-
-def yellowpages_scrape_contacts(
-    business_name: str,
-    google_payload: Dict[str, Any],
-    logger=None,
-) -> Dict[str, Any]:
+def yellowpages_link_via_serp(business_name: str, google_payload: Dict[str, Any], logger=None) -> Dict[str, Any]:
     city = google_payload.get("city") or ""
     state = (google_payload.get("state_region") or google_payload.get("state") or "").strip()
 
-    # Force listing URLs (YP often uses /mip/ or /biz/). This avoids category pages.
-    q = f'site:yellowpages.com ("{business_name}") ({city} {state}) (mip OR biz OR "phone")'.strip()
-
+    # Force BUSINESS listings (YP listing patterns vary; include several)
+    q = f'site:yellowpages.com "{business_name}" {city} {state} (mip OR business OR "Get Directions" OR "Phone")'
     sr = _serp_search(q, engine="google", logger=logger)
     if logger:
         logger.info(f"PHASE2 YP: serp attempted={sr.get('_attempted')} notes={sr.get('notes')}")
     if not sr.get("_attempted") or sr.get("notes") != "ok":
-        return {"_attempted": sr.get("_attempted", False), "notes": f"serp_{sr.get('notes')}"}
+        return {"_attempted": sr.get("_attempted", False), "notes": f"serp_{sr.get('notes')}", "link": None, "phone": None, "names": []}
 
     js = sr.get("json") or {}
-    link = _pick_best_link(js, "yellowpages.com/")
+    link = _pick_best_link_any(js, "yellowpages.com")
     if logger:
         logger.info(f"PHASE2 YP: link={link}")
 
     if not link:
-        return {"_attempted": True, "notes": "no_link"}
+        return {"_attempted": True, "notes": "no_link", "link": None, "phone": None, "names": []}
 
+    # Try to fetch and extract phone
     status, html = _fetch_html(link, logger=logger)
     if logger:
         logger.info(f"PHASE2 YP: fetch status={status} html_len={len(html)}")
 
-    # Minimal extraction: try to pull a phone from HTML even if page loads.
     phone = None
+    names: List[str] = []
     if status == 200 and html:
-        # YP pages usually include tel: or obvious phone patterns
         m = re.search(r"tel:\+?1?(\d{10})", html)
         if m:
             phone = normalize_us_phone(m.group(1))
@@ -295,62 +275,46 @@ def yellowpages_scrape_contacts(
             if m2:
                 phone = normalize_us_phone(m2.group(1))
 
-    # Contact name is rare on YP; keep it empty unless we see a "Contact" label.
-    contact_names: List[str] = []
-    if status == 200 and html:
-        # Extremely conservative: only if explicit "Contact:" appears.
         for m in re.finditer(r"Contact[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})", html):
             cand = _clean_person_candidate(m.group(1))
-            if cand and cand not in contact_names:
-                contact_names.append(cand)
+            if cand and cand not in names:
+                names.append(cand)
 
     return {
         "_attempted": True,
         "notes": "ok" if (status == 200) else f"fetch_http_{status}",
         "link": link,
         "phone": phone,
-        "names": contact_names,
+        "names": names,
     }
 
-# ============================================================
-# (5) OpenCorporates "SCRAPE NOW via Serp" (no token needed)
-# Your ask: no paid token. So we DO NOT use OC API here.
-# We use Serp to find OpenCorporates page & scrape minimal info.
-# ============================================================
-
-def opencorporates_serp_scrape(
-    business_name: str,
-    google_payload: Dict[str, Any],
-    logger=None,
-) -> Dict[str, Any]:
+def opencorporates_link_via_serp(business_name: str, google_payload: Dict[str, Any], logger=None) -> Dict[str, Any]:
     st = (google_payload.get("state_region") or google_payload.get("state") or "").strip()
     if not st or len(st) != 2:
-        return {"_attempted": False, "notes": "missing_state"}
+        return {"_attempted": False, "notes": "missing_state", "link": None, "oc_company_number": None, "oc_status": None}
 
     city = google_payload.get("city") or ""
-    q = f'site:opencorporates.com "{business_name}" {city} {st}'.strip()
-
+    q = f'site:opencorporates.com "{business_name}" {city} {st}'
     sr = _serp_search(q, engine="google", logger=logger)
     if logger:
         logger.info(f"PHASE2 OC: serp attempted={sr.get('_attempted')} notes={sr.get('notes')}")
     if not sr.get("_attempted") or sr.get("notes") != "ok":
-        return {"_attempted": sr.get("_attempted", False), "notes": f"serp_{sr.get('notes')}"}
+        return {"_attempted": sr.get("_attempted", False), "notes": f"serp_{sr.get('notes')}", "link": None, "oc_company_number": None, "oc_status": None}
 
     js = sr.get("json") or {}
-    link = _pick_best_link(js, "opencorporates.com/")
+    link = _pick_best_link_any(js, "opencorporates.com")
     if logger:
         logger.info(f"PHASE2 OC: link={link}")
 
     if not link:
-        return {"_attempted": True, "notes": "ok_no_results", "link": None}
+        return {"_attempted": True, "notes": "ok_no_results", "link": None, "oc_company_number": None, "oc_status": None}
 
     status, html = _fetch_html(link, logger=logger)
     if logger:
         logger.info(f"PHASE2 OC: fetch status={status} html_len={len(html)}")
     if status != 200 or not html:
-        return {"_attempted": True, "notes": f"fetch_http_{status}", "link": link}
+        return {"_attempted": True, "notes": f"fetch_http_{status}", "link": link, "oc_company_number": None, "oc_status": None}
 
-    # Very light extraction (safe)
     company_number = None
     m = re.search(r"Company number</dt>\s*<dd[^>]*>\s*([^<]{2,50})<", html, flags=re.I)
     if m:
@@ -370,9 +334,7 @@ def opencorporates_serp_scrape(
     }
 
 # ============================================================
-# (6) ONE ENTRYPOINT: apply_phase2_fallbacks_v2
-# - Runs ALWAYS (but cheaply) and LOGS clearly.
-# - Does NOT add "useless columns"; it tries to increase coverage.
+# Main entrypoint: apply_phase2_fallbacks_v2
 # ============================================================
 
 def apply_phase2_fallbacks_v2(
@@ -382,13 +344,6 @@ def apply_phase2_fallbacks_v2(
     current_website: Optional[str],
     logger=None,
 ) -> Dict[str, Any]:
-    """
-    Output keys (minimal):
-      - phase2_bbb_link, phase2_bbb_names[]
-      - phase2_yp_link,  phase2_yp_phone, phase2_yp_names[]
-      - phase2_oc_link,  phase2_oc_company_number, phase2_oc_status
-      - phase2_notes (summary)
-    """
     phase2_env_debug(logger)
 
     has_phone = bool(normalize_us_phone(current_phone) or current_phone)
@@ -399,21 +354,21 @@ def apply_phase2_fallbacks_v2(
 
     out: Dict[str, Any] = {"phase2_notes": []}
 
-    # BBB (always worth attempting for names)
+    # BBB
     bbb = bbb_scrape_contacts(business_name, google_payload, logger=logger)
     out["phase2_bbb_link"] = bbb.get("link")
     out["phase2_bbb_names"] = bbb.get("names") or []
     out["phase2_notes"].append(f"bbb:{bbb.get('notes')}")
 
-    # YellowPages (attempt; may 403 but Serp link still useful)
-    yp = yellowpages_scrape_contacts(business_name, google_payload, logger=logger)
+    # YellowPages
+    yp = yellowpages_link_via_serp(business_name, google_payload, logger=logger)
     out["phase2_yp_link"] = yp.get("link")
     out["phase2_yp_names"] = yp.get("names") or []
     out["phase2_yp_phone"] = yp.get("phone")
     out["phase2_notes"].append(f"yp:{yp.get('notes')}")
 
-    # OpenCorporates via Serp scrape (no token)
-    oc = opencorporates_serp_scrape(business_name, google_payload, logger=logger)
+    # OpenCorporates
+    oc = opencorporates_link_via_serp(business_name, google_payload, logger=logger)
     out["phase2_oc_link"] = oc.get("link")
     out["phase2_oc_company_number"] = oc.get("oc_company_number")
     out["phase2_oc_status"] = oc.get("oc_status")
@@ -428,7 +383,6 @@ def apply_phase2_fallbacks_v2(
             f"oc_match={bool(out.get('phase2_oc_company_number') or out.get('phase2_oc_link'))}"
         )
 
-    # Flatten notes
     out["phase2_notes"] = "|".join(out["phase2_notes"])
     return out
 

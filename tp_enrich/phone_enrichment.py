@@ -9,6 +9,7 @@ import json
 import requests
 from typing import Dict, Optional
 from .logging_utils import setup_logger
+from .phase2_enrichment import yelp_phone_lookup_safe
 
 logger = setup_logger(__name__)
 
@@ -409,13 +410,12 @@ def enrich_business_phone_waterfall(biz_name: str, google_hit: Dict, domain: Opt
             google_phone = format_phone(norm)
 
     # Yelp uses city/state/address to reduce wrong matches
-    yelp = yelp_search_phone(
-        term=biz_name,
-        city=google_hit.get("city"),
-        state=google_hit.get("state_region"),
-        address=google_hit.get("address")
+    # PHASE 2 FIX: Use new safe Yelp wrapper that guarantees location OR lat/lon
+    yelp_phone = yelp_phone_lookup_safe(
+        business_name=biz_name,
+        google_payload=google_hit,
+        logger=logger
     )
-    yelp_phone = yelp.get("phone")
 
     site = scrape_phone_from_website(website_url) if website_url else {"phone": None, "notes": "No website"}
     website_phone = site.get("phone")
@@ -436,7 +436,7 @@ def enrich_business_phone_waterfall(biz_name: str, google_hit: Dict, domain: Opt
         "yelp": yelp_phone,
         "website": website_phone,
         "apollo": apollo_phone,
-        "yelp_notes": yelp.get("notes"),
+        "yelp_notes": "phase2_safe_wrapper",
         "website_notes": site.get("notes") if isinstance(site, dict) else None,
         "apollo_notes": ap.get("notes"),
     }, ensure_ascii=False)
