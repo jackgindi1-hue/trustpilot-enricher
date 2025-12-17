@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed - 2025-12-17
+
+#### Phase 2 Hotfix v2 - HUNTER KEY + YP CATEGORY PAGES + DATA EXTRACTION
+
+**Issues Fixed (from 05:36 logs):**
+1. Hunter: "missing key" error even though HUNTER_KEY exists in Railway
+2. YellowPages: Getting category page URLs (useless) instead of business listing URLs
+3. Phase 2: Need DATA extraction (phone/email/website/names) not just URLs
+
+**Solutions:**
+- **Hunter Key Detection**: Centralized `get_hunter_key()` to support both `HUNTER_KEY` (Railway) and `HUNTER_API_KEY` (fallback)
+- **YellowPages URL Validation**: Only accept business listing URLs containing `/mip/` or `/biz/` (reject category pages)
+- **Data Extraction**: Extract actual contact data from BBB and YellowPages HTML (phones, emails, websites, names)
+
+**New CSV Output Fields:**
+- `phase2_bbb_phone`, `phase2_bbb_email`, `phase2_bbb_website`, `phase2_bbb_names`
+- `phase2_yp_phone`, `phase2_yp_email`, `phase2_yp_website`, `phase2_yp_names`
+
+**Files Changed:**
+- `tp_enrich/phase2_enrichment.py` - Added v2 functions with improved validation and data extraction
+- `tp_enrich/pipeline.py` - Updated to use `apply_phase2_data_enrichment()` function
+- `tp_enrich/io_utils.py` - Added new website and names fields to output schema
+
+**Improvements:**
+- BBB profiles now validated to ensure they're actual business profiles (not search/category pages)
+- YellowPages now only accepts business listing URLs (category pages like `/roofing-contractors` are rejected)
+- Extract websites from BBB and YellowPages (filtered to exclude bbb.org, google.com, yellowpages.com)
+- Extract contact names from BBB with improved filtering to avoid junk like "Business Profile"
+
+---
+
 ### Added - 2025-12-17
 
 #### Phase 2 Contact Data Patch - ACTUAL DATA EXTRACTION
