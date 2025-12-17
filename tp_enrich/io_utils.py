@@ -1,33 +1,25 @@
 """
 I/O utilities for reading and writing CSV files
 """
-
 import pandas as pd
 from typing import Dict, List, Optional
 from .logging_utils import setup_logger
-
 logger = setup_logger(__name__)
-
-
 def map_display_name_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     Robustly map display name column to raw_display_name
-
     Handles various column naming conventions:
     - consumer.displayName (Apify Trustpilot scraper)
     - consumer.display_name
     - displayName
     - display_name
-
     Args:
         df: DataFrame with original columns (already normalized to lowercase)
-
     Returns:
         DataFrame with raw_display_name column added
     """
     # Create lowercase mapping (columns are already lowercase from load_input_csv)
     lower_map = {col.lower(): col for col in df.columns}
-
     # Priority list for display name columns (all lowercase since columns are normalized)
     candidate_keys = [
         "consumer.displayname",
@@ -35,18 +27,15 @@ def map_display_name_column(df: pd.DataFrame) -> pd.DataFrame:
         "displayname",
         "display_name",
     ]
-
     # Find first matching column
     display_col = None
     for candidate in candidate_keys:
         if candidate in lower_map:
             display_col = lower_map[candidate]
             break
-
     # Map to raw_display_name
     if display_col:
         df["raw_display_name"] = df[display_col].astype("string").fillna("").str.strip()
-
         # Debug logging
         sample_values = df["raw_display_name"].head(5).tolist()
         logger.info(f"✓ Using display name column '{display_col}'")
@@ -56,29 +45,22 @@ def map_display_name_column(df: pd.DataFrame) -> pd.DataFrame:
         df["raw_display_name"] = pd.NA
         logger.warning(f"✗ No display name column found in: {list(df.columns)}")
         logger.warning(f"  Looked for: {candidate_keys}")
-
     return df
-
-
 def map_review_date_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     Map review date column to review_date
-
     Handles various date column naming conventions:
     - dates.experiencedDate (Apify Trustpilot scraper)
     - dates.experienceddate (normalized)
     - date
     - review_date
-
     Args:
         df: DataFrame with original columns (already normalized to lowercase)
-
     Returns:
         DataFrame with review_date column added
     """
     # Create lowercase mapping (columns are already lowercase from load_input_csv)
     lower_map = {col.lower(): col for col in df.columns}
-
     # Priority list for date columns (all lowercase since columns are normalized)
     candidate_keys = [
         "dates.experienceddate",
@@ -86,14 +68,12 @@ def map_review_date_column(df: pd.DataFrame) -> pd.DataFrame:
         "review_date",
         "date",
     ]
-
     # Find first matching column
     date_col = None
     for candidate in candidate_keys:
         if candidate in lower_map:
             date_col = lower_map[candidate]
             break
-
     # Map to review_date
     if date_col:
         df["review_date"] = df[date_col]
@@ -103,55 +83,39 @@ def map_review_date_column(df: pd.DataFrame) -> pd.DataFrame:
         df["review_date"] = pd.NA
         logger.warning(f"✗ No date column found in: {list(df.columns)}")
         logger.warning(f"  Looked for: {candidate_keys}")
-
     return df
-
-
 def load_input_csv(filepath: str) -> pd.DataFrame:
     """
     Load and normalize input Trustpilot CSV
-
     Args:
         filepath: Path to input CSV
-
     Returns:
         DataFrame with normalized column names and raw_display_name mapped
     """
     logger.info(f"Loading input CSV from: {filepath}")
     df = pd.read_csv(filepath)
-
     # Store original column names for debugging
     original_columns = list(df.columns)
-
     # Normalize column names to lowercase with underscores
     df.columns = df.columns.str.lower().str.replace(' ', '_').str.replace('-', '_')
-
     logger.info(f"Loaded {len(df)} rows")
     logger.info(f"  Original columns: {original_columns}")
     logger.info(f"  Normalized columns: {list(df.columns)}")
-
     # Map display name column to raw_display_name
     df = map_display_name_column(df)
-
     # Map review date column
     df = map_review_date_column(df)
-
     return df
-
-
 def write_output_csv(df, output_path: str, *args, **kwargs):
     """
     Write enriched CSV reliably.
-
     IMPORTANT:
     Some callers pass (df, output_path, logger) or other extra args.
     We accept *args/**kwargs to stay compatible and avoid 500s.
-
     - Never silently drops enrichment columns
     - Ensures expected enrichment columns exist (creates them if missing)
     - Writes expected columns first, then any extra columns that may exist
     """
-
     expected_cols = [
         "consumer.displayname",
         "date",
@@ -191,16 +155,13 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
         "catchall_emails_json",
         "source_platform",
     ]
-
     # Ensure expected columns exist
     for col in expected_cols:
         if col not in df.columns:
             df[col] = None
-
     # Keep expected first, then extras
     extras = [c for c in df.columns.tolist() if c not in expected_cols]
     final_cols = expected_cols + extras
-
     # Sanity log
     try:
         phones = int(df["primary_phone"].notna().sum())
@@ -208,11 +169,8 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
         logger.info(f"Export sanity: rows={len(df)} phones_nonnull={phones} emails_nonnull={emails}")
     except Exception:
         logger.info(f"Export sanity: rows={len(df)} (could not compute phone/email counts)")
-
     logger.info(f"Writing output CSV to: {output_path}")
     logger.info(f"Final columns count: {len(final_cols)}")
-
-    # --- CSV SANITIZE (prevents "rectangle" glyphs / control chars) ---
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = (
@@ -223,14 +181,10 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
             )
     # write with explicit utf-8
     df.to_csv(output_path, index=False, columns=final_cols, encoding="utf-8")
-    # --- END CSV SANITIZE ---
     logger.info(f"Successfully wrote {len(df)} rows to {output_path}")
-
-
 def get_output_schema() -> List[str]:
     """
     Returns the exact output schema as defined in Section M
-
     Returns:
         List of column names in exact order
     """
@@ -266,6 +220,7 @@ def get_output_schema() -> List[str]:
         'oc_company_number',
         'oc_incorporation_date',
         'oc_match_confidence',
+        'oc_status',
         'overall_lead_confidence',
         'enrichment_status',
         'enrichment_notes',
@@ -275,5 +230,9 @@ def get_output_schema() -> List[str]:
         'catchall_emails_json',
         'email_providers_tried',
         'email_provider_errors_json',
-        'email_waterfall_winner'
+        'email_waterfall_winner',
+        'bbb_url',
+        'yellowpages_url',
+        'yelp_url',
+        'phase2_notes'
     ]
