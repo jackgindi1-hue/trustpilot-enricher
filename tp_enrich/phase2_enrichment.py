@@ -240,6 +240,10 @@ def bbb_scrape_contacts(business_name: str, google_payload: Dict[str, Any], logg
     return {"_attempted": True, "notes": "ok" if names else "ok_no_names", "link": link, "names": names}
 
 def yellowpages_link_via_serp(business_name: str, google_payload: Dict[str, Any], logger=None) -> Dict[str, Any]:
+    """
+    YellowPages link discovery via SerpApi ONLY (no HTML fetch to avoid 403/503).
+    Returns the YP link if found, no phone/name extraction.
+    """
     city = google_payload.get("city") or ""
     state = (google_payload.get("state_region") or google_payload.get("state") or "").strip()
 
@@ -249,43 +253,22 @@ def yellowpages_link_via_serp(business_name: str, google_payload: Dict[str, Any]
     if logger:
         logger.info(f"PHASE2 YP: serp attempted={sr.get('_attempted')} notes={sr.get('notes')}")
     if not sr.get("_attempted") or sr.get("notes") != "ok":
-        return {"_attempted": sr.get("_attempted", False), "notes": f"serp_{sr.get('notes')}", "link": None, "phone": None, "names": []}
+        return {"_attempted": sr.get("_attempted", False), "notes": f"serp_{sr.get('notes')}", "link": None}
 
     js = sr.get("json") or {}
     link = _pick_best_link_any(js, "yellowpages.com")
     if logger:
-        logger.info(f"PHASE2 YP: link={link}")
+        logger.info(f"PHASE2 YP: link={link} (no HTML fetch to avoid bot blocks)")
 
     if not link:
-        return {"_attempted": True, "notes": "no_link", "link": None, "phone": None, "names": []}
+        return {"_attempted": True, "notes": "no_link", "link": None}
 
-    # Try to fetch and extract phone
-    status, html = _fetch_html(link, logger=logger)
-    if logger:
-        logger.info(f"PHASE2 YP: fetch status={status} html_len={len(html)}")
-
-    phone = None
-    names: List[str] = []
-    if status == 200 and html:
-        m = re.search(r"tel:\+?1?(\d{10})", html)
-        if m:
-            phone = normalize_us_phone(m.group(1))
-        if not phone:
-            m2 = re.search(r"(\(\d{3}\)\s*\d{3}[-\s]\d{4})", html)
-            if m2:
-                phone = normalize_us_phone(m2.group(1))
-
-        for m in re.finditer(r"Contact[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})", html):
-            cand = _clean_person_candidate(m.group(1))
-            if cand and cand not in names:
-                names.append(cand)
-
+    # IMPORTANT: Do NOT fetch yellowpages.com HTML (causes 403/503 bot blocks)
+    # Just return the link - it's valuable for coverage even without extraction
     return {
         "_attempted": True,
-        "notes": "ok" if (status == 200) else f"fetch_http_{status}",
+        "notes": "ok",
         "link": link,
-        "phone": phone,
-        "names": names,
     }
 
 def opencorporates_link_via_serp(business_name: str, google_payload: Dict[str, Any], logger=None) -> Dict[str, Any]:
@@ -360,11 +343,9 @@ def apply_phase2_fallbacks_v2(
     out["phase2_bbb_names"] = bbb.get("names") or []
     out["phase2_notes"].append(f"bbb:{bbb.get('notes')}")
 
-    # YellowPages
+    # YellowPages (link only, no HTML fetch to avoid bot blocks)
     yp = yellowpages_link_via_serp(business_name, google_payload, logger=logger)
     out["phase2_yp_link"] = yp.get("link")
-    out["phase2_yp_names"] = yp.get("names") or []
-    out["phase2_yp_phone"] = yp.get("phone")
     out["phase2_notes"].append(f"yp:{yp.get('notes')}")
 
     # OpenCorporates
@@ -386,19 +367,78 @@ def apply_phase2_fallbacks_v2(
     out["phase2_notes"] = "|".join(out["phase2_notes"])
     return out
 
+def apply_phase2_coverage(
+    business_name: str,
+    google_payload: Dict[str, Any],
+    current_phone: Optional[str],
+    current_website: Optional[str],
+    logger=None,
+) -> Dict[str, Any]:
+    """
+    Simplified Phase 2 coverage boost (minimal, fast, no HTML fetching).
+    Returns:
+      - phone_final (may be improved)
+      - website_final (may be improved)
+      - bbb_url (if found)
+      - yellowpages_url (if found)
+      - yelp_url (if found)
+      - phase2_notes (string)
+    """
+    out: Dict[str, Any] = {}
+    phone = normalize_us_phone(current_phone) or current_phone
+    website = current_website
+
+    city = google_payload.get("city")
+    state = google_payload.get("state_region") or google_payload.get("state")
+    q_loc = " ".join([p for p in [city, state] if p]).strip()
+    q = business_name if not q_loc else f"{business_name} {q_loc}"
+
+    if logger:
+        phase2_env_debug(logger)
+        logger.info(f"PHASE2 COVERAGE | has_phone={bool(phone)} has_website={bool(website)}")
+
+    # BBB link discovery
+    bbb = _serp_search(f'{q} site:bbb.org', engine="google", logger=logger)
+    if bbb.get("_attempted") and bbb.get("notes") == "ok":
+        link = _pick_best_link_any(bbb.get("json") or {}, "bbb.org")
+        if link:
+            out["bbb_url"] = link
+
+    # YellowPages link discovery (NO HTML fetch)
+    yp = yellowpages_link_via_serp(business_name, google_payload, logger=logger)
+    if yp.get("link"):
+        out["yellowpages_url"] = yp["link"]
+
+    # Yelp link discovery (if needed)
+    if not phone or not website:
+        yelp_res = yelp_fusion_search_business(business_name, google_payload, logger=logger)
+        if yelp_res.get("_attempted") and yelp_res.get("yelp_url"):
+            out["yelp_url"] = yelp_res["yelp_url"]
+            if not phone and yelp_res.get("phone"):
+                phone = yelp_res["phone"]
+
+    out["phone_final"] = normalize_us_phone(phone) or phone
+    out["website_final"] = website
+    out["phase2_notes"] = "ok"
+    return out
+
 # Backward compatibility aliases
 apply_phase2_fallbacks = apply_phase2_fallbacks_v2
 apply_phase2_fallbacks_logged = apply_phase2_fallbacks_v2
 
 # Hunter key helpers for backward compatibility
 def get_hunter_key() -> Optional[str]:
-    return _env_first("HUNTER_API_KEY", "HUNTER_KEY")
+    # CRITICAL: You only have HUNTER_KEY in Railway, so prioritize it!
+    # Still accept HUNTER_API_KEY if ever added later
+    return _env_first("HUNTER_KEY", "HUNTER_API_KEY", "HUNTER_IO_KEY")
 
 def hunter_env_debug(logger=None) -> None:
     k = get_hunter_key()
     if logger:
         logger.info(
-            f"HUNTER ENV CHECK (FIXED): HUNTER_API_KEY present={bool(os.getenv('HUNTER_API_KEY'))} "
-            f"| HUNTER_KEY present={bool(os.getenv('HUNTER_KEY'))} "
-            f"| chosen={_mask(k)}"
+            f"HUNTER ENV CHECK (FIXED v2): HUNTER_KEY present={bool(os.getenv('HUNTER_KEY'))} "
+            f"(len={len(os.getenv('HUNTER_KEY') or '')}) | "
+            f"HUNTER_API_KEY present={bool(os.getenv('HUNTER_API_KEY'))} "
+            f"(len={len(os.getenv('HUNTER_API_KEY') or '')}) | "
+            f"chosen={_mask(k)}"
         )

@@ -24,12 +24,15 @@ try:
     from .phase2_enrichment import hunter_env_debug
     hunter_env_debug(logging.getLogger("uvicorn"))
 except ImportError:
+    # Fallback boot check if phase2_enrichment not available
+    hk = os.getenv('HUNTER_KEY') or os.getenv('HUNTER_API_KEY') or os.getenv('HUNTER_IO_KEY')
     logging.getLogger("uvicorn").info(
         f"BOOT ENV CHECK: "
-        f"HUNTER_API_KEY present={bool(os.getenv('HUNTER_API_KEY'))} "
-        f"len={len(os.getenv('HUNTER_API_KEY') or '')} | "
         f"HUNTER_KEY present={bool(os.getenv('HUNTER_KEY'))} "
-        f"len={len(os.getenv('HUNTER_KEY') or '')}"
+        f"(len={len(os.getenv('HUNTER_KEY') or '')}) | "
+        f"HUNTER_API_KEY present={bool(os.getenv('HUNTER_API_KEY'))} "
+        f"(len={len(os.getenv('HUNTER_API_KEY') or '')}) | "
+        f"chosen={hk[:3] + '***' + hk[-3:] if hk and len(hk) > 6 else ('***' if hk else 'None')}"
     )
 
 # ============================================================
@@ -116,7 +119,8 @@ def _hunter_domain_search(domain: str, logger=None) -> Dict[str, Any]:
         from .phase2_enrichment import get_hunter_key
         key = get_hunter_key()
     except ImportError:
-        key = os.getenv("HUNTER_API_KEY") or os.getenv("HUNTER_KEY")
+        # Fallback: prioritize HUNTER_KEY (what you have in Railway)
+        key = os.getenv("HUNTER_KEY") or os.getenv("HUNTER_API_KEY") or os.getenv("HUNTER_IO_KEY")
 
     # ENHANCED DEBUG LOGGING
     if logger:
@@ -133,7 +137,7 @@ def _hunter_domain_search(domain: str, logger=None) -> Dict[str, Any]:
         return {
             "ok": False,
             "attempted": False,
-            "reason": "missing HUNTER_API_KEY (or HUNTER_KEY)"
+            "reason": "missing HUNTER_KEY (or HUNTER_API_KEY or HUNTER_IO_KEY)"
         }
 
     url = "https://api.hunter.io/v2/domain-search"
@@ -503,7 +507,9 @@ def email_waterfall(domain: Optional[str], company_name: Optional[str] = None, l
 
 # ============================================================
 # ENV VARS YOU SHOULD SET IN RAILWAY (for speed + stability)
-# - If you want "Hunter back on" just restore correct HUNTER_API_KEY.
+#
+# HUNTER_KEY=<your hunter.io key>                    (PRIORITY 1)
+# HUNTER_API_KEY=<alternate name>                    (PRIORITY 2 fallback)
 #
 # SNOV_MAX_POLLS=5
 # SNOV_POLL_SLEEP=1.0
