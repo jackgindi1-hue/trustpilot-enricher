@@ -312,25 +312,31 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     # Add notes for debugging
     row["phase2_notes"] = f"yelp:{p2.get('yelp_notes')} serp:{p2.get('serp_notes')} oc:{p2.get('oc_notes')}"
     logger.info(f"   -> Phase 2 fallbacks complete")
+
     # ============================================================
-    # PHASE 2 DATA ENRICHMENT - CRASHPROOF WRAPPER
-    # Fixes: Hunter key, YP category pages, data extraction
-    # Safety: DOUBLE crash guard - never crashes pipeline
+    # PHASE 2 DATA ENRICHMENT - HOTFIX v2
+    # Fixes: Hunter key detection, YP category pages, data extraction
     # ============================================================
-    from tp_enrich.phase2_enrichment import run_phase2_safely, apply_phase2_data_enrichment_SAFE
-    logger.info(f"   -> Applying Phase 2 data enrichment (CRASHPROOF) for {name}")
-    
-    p2_data = run_phase2_safely(
-        business_name=name,
+    from tp_enrich.phase2_enrichment import apply_phase2_data_enrichment_SAFE
+    logger.info(f"   -> Applying Phase 2 data enrichment (HOTFIX v2 + ANTI-CRASH) for {name}")
+
+    p2_data = apply_phase2_data_enrichment_SAFE(
+        company=name,
         google_payload=google_payload,
-        logger=logger,
-        phase2_func=apply_phase2_data_enrichment_SAFE
+        logger=logger
     )
-    
-    # Store ALL Phase 2 fields (crashproof wrapper guarantees they all exist)
-    row.update(p2_data)
-    
-    logger.info(f"   -> Phase 2 data enrichment (CRASHPROOF) complete")
+
+    # Store extracted contact data (with website fields)
+    row["phase2_bbb_phone"] = p2_data.get("phase2_bbb_phone")
+    row["phase2_bbb_email"] = p2_data.get("phase2_bbb_email")
+    row["phase2_bbb_website"] = p2_data.get("phase2_bbb_website")
+    row["phase2_bbb_names"] = p2_data.get("phase2_bbb_names", [])
+    row["phase2_yp_phone"] = p2_data.get("phase2_yp_phone")
+    row["phase2_yp_email"] = p2_data.get("phase2_yp_email")
+    row["phase2_yp_website"] = p2_data.get("phase2_yp_website")
+    row["phase2_yp_names"] = p2_data.get("phase2_yp_names", [])
+
+    logger.info(f"   -> Phase 2 data enrichment (HOTFIX v2 + ANTI-CRASH) complete")
     # ============================================================
     # END PHASE 2
     # ============================================================
