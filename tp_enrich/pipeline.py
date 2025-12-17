@@ -611,8 +611,8 @@ def run_pipeline(
     # ============================================================
     # Write final CSV
     logger.info("Step 7: Writing output CSV...")
-    output_schema = get_output_schema()
-    write_output_csv(df, output_csv_path, output_schema)
+    output_schema = get_output_schema(df)
+    write_output_csv(output_csv_path, df, output_schema)
     # Calculate statistics
     stats = {
         'total_rows': len(df),
