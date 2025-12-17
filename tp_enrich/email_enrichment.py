@@ -20,13 +20,17 @@ GENERIC_PREFIXES = ("info@", "support@", "sales@", "hello@", "contact@", "admin@
 # ============================================================
 # BOOT-TIME ENV CHECK (logs once on container start)
 # ============================================================
-logging.getLogger("uvicorn").info(
-    f"BOOT ENV CHECK: "
-    f"HUNTER_API_KEY present={bool(os.getenv('HUNTER_API_KEY'))} "
-    f"len={len(os.getenv('HUNTER_API_KEY') or '')} | "
-    f"HUNTER_KEY present={bool(os.getenv('HUNTER_KEY'))} "
-    f"len={len(os.getenv('HUNTER_KEY') or '')}"
-)
+try:
+    from .phase2_enrichment import hunter_env_debug
+    hunter_env_debug(logging.getLogger("uvicorn"))
+except ImportError:
+    logging.getLogger("uvicorn").info(
+        f"BOOT ENV CHECK: "
+        f"HUNTER_API_KEY present={bool(os.getenv('HUNTER_API_KEY'))} "
+        f"len={len(os.getenv('HUNTER_API_KEY') or '')} | "
+        f"HUNTER_KEY present={bool(os.getenv('HUNTER_KEY'))} "
+        f"len={len(os.getenv('HUNTER_KEY') or '')}"
+    )
 
 # ============================================================
 # HELPER: Mask API keys for safe logging
@@ -107,8 +111,12 @@ def _hunter_domain_search(domain: str, logger=None) -> Dict[str, Any]:
         - person: list (person emails)
         - catchall: list (catchall emails)
     """
-    # Accept either env var name, prefer HUNTER_API_KEY
-    key = os.getenv("HUNTER_API_KEY") or os.getenv("HUNTER_KEY")
+    # Use centralized get_hunter_key from phase2
+    try:
+        from .phase2_enrichment import get_hunter_key
+        key = get_hunter_key()
+    except ImportError:
+        key = os.getenv("HUNTER_API_KEY") or os.getenv("HUNTER_KEY")
 
     # ENHANCED DEBUG LOGGING
     if logger:

@@ -1,41 +1,35 @@
 # ============================================================
-# PHASE 2 HOTFIX + SCRAPERS (ANTI-DEBUG-HELL, REAL COVERAGE NOW)
+# PHASE 2 PATCH v2 (ANTI-DEBUG-HELL, REAL COVERAGE)
 #
-# Adds NOW:
-#   - Yelp Fusion FIX 400 (requires location or lat/lon)
-#   - SerpApi Google Maps fallback
-#   - BBB SCRAPE fallback (tries to extract phone + contact/owner-ish names if present)
-#   - YellowPages SCRAPE fallback (phone + possible contact/owner-ish names if present)
-#   - OpenCorporates SCRAPE fallback (no token) AFTER we have state (best effort)
+# Fixes:
+# 1) Yelp Fusion 400 (phone_enrichment) by ALWAYS providing location OR lat/lon.
+# 2) BBB/YP/OC "scrape" returning HTTP 202 in Railway:
+#      - Use SerpApi first to find the correct listing URL (site search)
+#      - Try fetch with browser headers
+#      - If still blocked, extract phone/address/names from SerpApi title/snippet
+# 3) Hunter "missing key" even when HUNTER_KEY exists:
+#      - remove any precheck that looks only for HUNTER_API_KEY
+#      - always use env-first helper: HUNTER_API_KEY OR HUNTER_KEY
 #
-# Goals:
-#   - More phones, more emails only where possible, more contact names
-#   - Minimal new output fields (no useless CSV bloat)
-#   - Very clear logs so you SEE it running
-#   - Hard caps so it won't hang on 10k rows
+# REQUIRED ENV VARS (Railway Variables):
+#   - YELP_API_KEY
+#   - SERP_API_KEY   (we also accept SERPAPI_API_KEY / SERPAPI_KEY)
+#   - HUNTER_KEY (or HUNTER_API_KEY)  <-- either works
 #
-# ENV VARS (Railway Variables):
-#   REQUIRED for Yelp API:
-#     YELP_API_KEY=<your yelp fusion key>
-#
-#   REQUIRED for SerpApi:
-#     SERP_API_KEY=<your serpapi key>
-#     (also accepts SERPAPI_API_KEY or SERPAPI_KEY)
-#
-#   NO KEYS NEEDED for BBB/YP/OpenCorporates scraping in this patch.
+# NO KEYS REQUIRED:
+#   - BBB / YellowPages / OpenCorporates (we do via SerpApi + best-effort fetch)
 # ============================================================
 
 import os
 import re
 import time
-import html
 import requests
 from typing import Any, Dict, Optional, List, Tuple
-from urllib.parse import quote_plus
 
 # -----------------------------
-# shared helpers
+# Shared helpers
 # -----------------------------
+
 def _env_first(*names: str) -> Optional[str]:
     for n in names:
         v = os.getenv(n)
@@ -50,7 +44,6 @@ def _mask(s: Optional[str]) -> str:
     return "***" if len(s) <= 8 else s[:3] + "***" + s[-3:]
 
 _US_PHONE_RE = re.compile(r"\+?1?\s*[\(\-\.]?\s*(\d{3})\s*[\)\-\.]?\s*(\d{3})\s*[\-\.]?\s*(\d{4})")
-
 def normalize_us_phone(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
@@ -58,7 +51,6 @@ def normalize_us_phone(raw: Optional[str]) -> Optional[str]:
     if not m:
         return None
     a, b, c = m.group(1), m.group(2), m.group(3)
-    # NANP sanity
     if a[0] in ("0", "1") or b[0] in ("0", "1"):
         return None
     return f"({a}) {b}-{c}"
@@ -71,41 +63,30 @@ def _build_location_from_google_payload(g: Dict[str, Any]) -> Optional[str]:
     parts = [p for p in [city, state, postal, country] if p]
     return ", ".join(parts) if parts else None
 
-def _safe_get(url: str, *, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None,
-              timeout: int = 15) -> Tuple[int, str]:
-    """
-    Safe HTTP GET returning (status_code, text). Never raises.
-    """
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=timeout)
-        return r.status_code, r.text or ""
-    except Exception as e:
-        return 0, f"EXCEPTION: {repr(e)}"
+def _browser_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    }
 
-def _extract_possible_person_names(text: str, limit: int = 3) -> List[str]:
-    """
-    Heuristic: extract "First Last" patterns, filter obvious junk.
-    Not perfect; best-effort for BBB/YP pages.
-    """
+def _extract_possible_names(text: str) -> List[str]:
+    # extremely conservative: pulls 2-4 word capitalized sequences
     if not text:
         return []
-    t = html.unescape(text)
-    # Typical "John Doe" pattern, capitalized
-    candidates = re.findall(r"\b([A-Z][a-z]{2,20})\s+([A-Z][a-z]{2,20})\b", t)
-    names = []
-    for a, b in candidates:
-        full = f"{a} {b}"
-        # filter common non-names
-        if full.lower() in ("united states", "better business", "business bureau"):
-            continue
-        if full not in names:
-            names.append(full)
-        if len(names) >= limit:
-            break
-    return names
+    candidates = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b", text)
+    # de-dupe while preserving order
+    seen = set()
+    out = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:3]
 
 # ============================================================
-# (A) Yelp Fusion FIX 400 (used in BOTH phone_enrichment + Phase2)
+# (1) Yelp Fusion FIX (USE THIS in tp_enrich/phone_enrichment.py)
 # ============================================================
 
 def yelp_fusion_search_phone_fix400(
@@ -114,6 +95,8 @@ def yelp_fusion_search_phone_fix400(
     logger=None,
 ) -> Dict[str, Any]:
     key = _env_first("YELP_API_KEY", "YELP_FUSION_API_KEY", "YELP_KEY")
+    if logger:
+        logger.info(f"PHASE2 Yelp ENV | present={bool(key)} key={_mask(key)}")
     if not key:
         return {"_attempted": False, "_reason": "missing YELP_API_KEY"}
 
@@ -131,232 +114,162 @@ def yelp_fusion_search_phone_fix400(
     else:
         loc = _build_location_from_google_payload(google_payload)
         if not loc:
-            return {"_attempted": False, "_reason": "no lat/lon and no google location fields"}
+            return {"_attempted": False, "_reason": "no lat/lon and no location from Google"}
         params["location"] = loc
 
     url = "https://api.yelp.com/v3/businesses/search"
     headers = {"Authorization": f"Bearer {key}"}
 
-    sc, body = _safe_get(url, headers=headers, params=params, timeout=15)
-    if sc != 200:
-        if logger:
-            logger.warning(f"PHASE2 Yelp: status={sc} body={body[:160]}")
-        return {"_attempted": True, "_reason": f"HTTP {sc}"}
-
     try:
-        import json
-        js = json.loads(body)
-    except Exception:
-        js = {}
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        if r.status_code != 200:
+            if logger:
+                logger.warning(f"PHASE2 Yelp FIX400 failed: status={r.status_code} body={r.text[:200]}")
+            return {"_attempted": True, "_reason": f"HTTP {r.status_code}"}
 
-    biz = (js.get("businesses") or [None])[0] or {}
-    phone = normalize_us_phone(biz.get("display_phone") or biz.get("phone"))
-    return {"_attempted": True, "phone": phone, "_reason": "ok" if phone else "ok_no_phone"}
+        js = r.json() or {}
+        biz = (js.get("businesses") or [None])[0] or {}
+        phone = normalize_us_phone(biz.get("display_phone") or biz.get("phone"))
+        return {"_attempted": True, "phone": phone, "_reason": "ok" if phone else "ok_no_phone"}
+    except Exception as e:
+        return {"_attempted": True, "_reason": f"exception={repr(e)}"}
 
 # ============================================================
-# (B) SerpApi Google Maps fallback
+# (2) SerpApi helpers (use for BBB/YP/OC discovery + fallback extraction)
 # ============================================================
-
-def phase2_env_debug(logger=None) -> None:
-    yelp = _env_first("YELP_API_KEY", "YELP_FUSION_API_KEY", "YELP_KEY")
-    serp = _env_first("SERP_API_KEY", "SERPAPI_API_KEY", "SERPAPI_KEY")
-    if logger:
-        logger.info(
-            "PHASE2 ENV CHECK | "
-            f"Yelp={bool(yelp)}({_mask(yelp)}) | "
-            f"SerpApi={bool(serp)}({_mask(serp)})"
-        )
 
 def _serp_key() -> Optional[str]:
-    # IMPORTANT: accept multiple to avoid env-var hell
     return _env_first("SERP_API_KEY", "SERPAPI_API_KEY", "SERPAPI_KEY")
 
-def serpapi_maps_lookup(
-    business_name: str,
-    google_payload: Dict[str, Any],
-    logger=None
+def serpapi_google_site_search(
+    query: str,
+    logger=None,
 ) -> Dict[str, Any]:
     key = _serp_key()
     if not key:
-        return {"_attempted": False, "serp_notes": "missing SERP key"}
-
-    q_name = (business_name or "").strip()
-    if not q_name:
-        return {"_attempted": False, "serp_notes": "missing business name"}
-
-    city = google_payload.get("city")
-    state = google_payload.get("state_region") or google_payload.get("state")
-    loc = " ".join([p for p in [city, state] if p]).strip()
-    q = q_name if not loc else f"{q_name} {loc}"
+        return {"_attempted": False, "notes": "missing SERP key"}
 
     url = "https://serpapi.com/search.json"
-    params = {"engine": "google_maps", "q": q, "api_key": key, "type": "search"}
-
-    sc, body = _safe_get(url, params=params, timeout=20)
-    if sc != 200:
-        if logger:
-            logger.warning(f"PHASE2 SerpApi: status={sc} body={body[:160]}")
-        return {"_attempted": True, "serp_notes": f"HTTP {sc}"}
+    params = {"engine": "google", "q": query, "api_key": key, "num": 5}
 
     try:
-        import json
-        js = json.loads(body)
-    except Exception:
-        js = {}
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            if logger:
+                logger.warning(f"SerpApi google failed: status={r.status_code} body={r.text[:200]}")
+            return {"_attempted": True, "notes": f"HTTP {r.status_code}"}
+        js = r.json() or {}
+        organic = js.get("organic_results") or []
+        top = organic[0] if organic else {}
+        return {
+            "_attempted": True,
+            "notes": "ok" if top else "ok_no_results",
+            "link": top.get("link"),
+            "title": top.get("title") or "",
+            "snippet": top.get("snippet") or "",
+        }
+    except Exception as e:
+        return {"_attempted": True, "notes": f"exception={repr(e)}"}
 
-    results = js.get("local_results") or []
-    top = results[0] if results else {}
-    phone = normalize_us_phone(top.get("phone"))
-    website = top.get("website")
-    return {
-        "_attempted": True,
-        "serp_phone": phone,
-        "serp_website": website,
-        "serp_notes": "ok" if top else "ok_no_results",
-    }
-
-# ============================================================
-# (C) BBB SCRAPE (NO KEY)
-# ============================================================
-
-def bbb_scrape(
-    business_name: str,
-    google_payload: Dict[str, Any],
-    logger=None,
-) -> Dict[str, Any]:
-    """
-    Best-effort:
-      - Find BBB profile page via search query (simple HTML scrape)
-      - Extract phone + possible contact names if present in page text
-    Hard-capped for speed.
-    """
-    city = google_payload.get("city") or ""
-    state = (google_payload.get("state_region") or google_payload.get("state") or "")
-    q = f"site:bbb.org {business_name} {city} {state}".strip()
-    search_url = f"https://duckduckgo.com/html/?q={quote_plus(q)}"
-
-    sc, body = _safe_get(search_url, timeout=12)
-    if sc != 200:
+def _best_effort_fetch_html(url: str, logger=None) -> Tuple[int, str]:
+    try:
+        r = requests.get(url, headers=_browser_headers(), timeout=20, allow_redirects=True)
+        return r.status_code, (r.text or "")[:200000]
+    except Exception as e:
         if logger:
-            logger.info(f"PHASE2 BBB: search failed status={sc}")
-        return {"_attempted": True, "bbb_notes": f"search_http_{sc}"}
+            logger.warning(f"Fetch exception for {url}: {repr(e)}")
+        return 0, ""
 
-    # find first bbb.org link
-    m = re.search(r'href="(https?://[^"]*bbb\.org/[^"]+)"', body)
-    if not m:
-        return {"_attempted": True, "bbb_notes": "no_bbb_link"}
-
-    bbb_url = html.unescape(m.group(1))
-    sc2, page = _safe_get(bbb_url, timeout=12)
-    if sc2 != 200:
-        return {"_attempted": True, "bbb_notes": f"profile_http_{sc2}", "bbb_url": bbb_url}
-
-    phone = normalize_us_phone(page)
-    names = _extract_possible_person_names(page, limit=3)
-    return {
-        "_attempted": True,
-        "bbb_url": bbb_url,
-        "bbb_phone": phone,
-        "bbb_names": names,
-        "bbb_notes": "ok" if (phone or names) else "ok_no_fields",
-    }
+def _extract_phone_from_text(text: str) -> Optional[str]:
+    return normalize_us_phone(text)
 
 # ============================================================
-# (D) YELLOWPAGES SCRAPE (NO KEY)
+# (3) BBB + YellowPages + OpenCorporates via SerpApi-first
 # ============================================================
 
-def yellowpages_scrape(
+def phase2_bbb_yp_oc(
     business_name: str,
     google_payload: Dict[str, Any],
     logger=None,
 ) -> Dict[str, Any]:
-    city = google_payload.get("city") or ""
-    state = (google_payload.get("state_region") or google_payload.get("state") or "")
-    q = f"site:yellowpages.com {business_name} {city} {state}".strip()
-    search_url = f"https://duckduckgo.com/html/?q={quote_plus(q)}"
+    city = google_payload.get("city")
+    st = google_payload.get("state_region") or google_payload.get("state")
+    loc = " ".join([p for p in [city, st] if p]).strip()
 
-    sc, body = _safe_get(search_url, timeout=12)
-    if sc != 200:
-        return {"_attempted": True, "yp_notes": f"search_http_{sc}"}
+    out: Dict[str, Any] = {"contact_names": []}
 
-    m = re.search(r'href="(https?://[^"]*yellowpages\.com/[^"]+)"', body)
-    if not m:
-        return {"_attempted": True, "yp_notes": "no_yp_link"}
+    def _site_run(site: str, label: str) -> None:
+        q = f'site:{site} "{business_name}" {loc}'.strip()
+        res = serpapi_google_site_search(q, logger=logger)
+        if logger:
+            logger.info(f"PHASE2 {label}: serp attempted={res.get('_attempted')} notes={res.get('notes')} link={res.get('link')}")
+        if not res.get("_attempted") or not res.get("link"):
+            out[f"{label.lower()}_notes"] = f"serp_{res.get('notes')}"
+            return
 
-    yp_url = html.unescape(m.group(1))
-    sc2, page = _safe_get(yp_url, timeout=12)
-    if sc2 != 200:
-        return {"_attempted": True, "yp_notes": f"profile_http_{sc2}", "yp_url": yp_url}
+        link = res["link"]
+        title = res.get("title","")
+        snip = res.get("snippet","")
+        out[f"{label.lower()}_url"] = link
 
-    phone = normalize_us_phone(page)
-    names = _extract_possible_person_names(page, limit=3)
-    return {
-        "_attempted": True,
-        "yp_url": yp_url,
-        "yp_phone": phone,
-        "yp_names": names,
-        "yp_notes": "ok" if (phone or names) else "ok_no_fields",
-    }
+        # Pull phone from snippet/title when available
+        ph = _extract_phone_from_text(title + " " + snip)
+        if ph:
+            out.setdefault("phones_found", [])
+            out["phones_found"].append({"source": f"{label}_serp", "phone": ph})
 
-# ============================================================
-# (E) OPENCORPORATES SCRAPE (NO TOKEN) — best-effort after state
-# ============================================================
+        # Names from title/snippet (best-effort)
+        for nm in _extract_possible_names(title + " " + snip):
+            if nm not in out["contact_names"]:
+                out["contact_names"].append(nm)
 
-def opencorporates_scrape(
-    business_name: str,
-    state_region: Optional[str],
-    logger=None,
-) -> Dict[str, Any]:
-    """
-    No token: use site search via OpenCorporates pages.
-    We scope by state if possible (us_<state>).
-    """
-    st = (state_region or "").strip().upper()
-    if not st or len(st) != 2:
-        return {"_attempted": False, "oc_notes": "missing_state"}
+        # Try fetch HTML; if blocked with 202/403/503, we still keep serp result
+        status, html = _best_effort_fetch_html(link, logger=logger)
+        if logger:
+            logger.info(f"PHASE2 {label}: fetch status={status} html_len={len(html)}")
+        if status in (202, 403, 503) or status == 0 or not html:
+            out[f"{label.lower()}_notes"] = f"fetch_blocked_http_{status}"
+            return
 
-    # search OpenCorporates web pages
-    q = f"site:opencorporates.com {business_name} us_{st.lower()}".strip()
-    search_url = f"https://duckduckgo.com/html/?q={quote_plus(q)}"
+        # Best-effort: pull phone again from HTML
+        ph2 = _extract_phone_from_text(html)
+        if ph2:
+            out.setdefault("phones_found", [])
+            out["phones_found"].append({"source": f"{label}_html", "phone": ph2})
 
-    sc, body = _safe_get(search_url, timeout=12)
-    if sc != 200:
-        return {"_attempted": True, "oc_notes": f"search_http_{sc}"}
+        # Best-effort: names from HTML
+        for nm in _extract_possible_names(html):
+            if nm not in out["contact_names"]:
+                out["contact_names"].append(nm)
 
-    m = re.search(r'href="(https?://[^"]*opencorporates\.com/companies/[^"]+)"', body)
-    if not m:
-        return {"_attempted": True, "oc_notes": "no_company_link"}
+        out[f"{label.lower()}_notes"] = "ok"
 
-    oc_url = html.unescape(m.group(1))
-    sc2, page = _safe_get(oc_url, timeout=12)
-    if sc2 != 200:
-        return {"_attempted": True, "oc_notes": f"profile_http_{sc2}", "oc_url": oc_url}
+    # Run them (these do NOT require paid BBB/YP/OC tokens)
+    _site_run("bbb.org", "BBB")
+    _site_run("yellowpages.com", "YP")
+    _site_run("opencorporates.com", "OC")
 
-    # try to extract company number / status (heuristics)
-    company_number = None
-    status = None
-    mnum = re.search(r"Company Number</dt>\s*<dd[^>]*>\s*([^<]+)\s*<", page, re.I)
-    if mnum:
-        company_number = html.unescape(mnum.group(1)).strip()
-    mstat = re.search(r"Status</dt>\s*<dd[^>]*>\s*([^<]+)\s*<", page, re.I)
-    if mstat:
-        status = html.unescape(mstat.group(1)).strip()
-
-    names = _extract_possible_person_names(page, limit=3)
-    return {
-        "_attempted": True,
-        "oc_url": oc_url,
-        "oc_company_number": company_number,
-        "oc_status": status,
-        "oc_names": names,  # sometimes officers appear in text
-        "oc_notes": "ok" if (company_number or status or names) else "ok_no_fields",
-    }
+    return out
 
 # ============================================================
-# (F) APPLY PHASE 2 FALLBACKS (NOW INCLUDES SCRAPERS)
+# (4) Hunter key logic fix (DO NOT precheck only HUNTER_API_KEY)
 # ============================================================
 
-def apply_phase2_fallbacks_logged(
+def get_hunter_key() -> Optional[str]:
+    # accept both, so you never get burned again
+    return _env_first("HUNTER_API_KEY", "HUNTER_KEY")
+
+def hunter_env_debug(logger=None) -> None:
+    k = get_hunter_key()
+    if logger:
+        logger.info(
+            f"HUNTER ENV CHECK (FIXED): HUNTER_API_KEY present={bool(os.getenv('HUNTER_API_KEY'))} "
+            f"| HUNTER_KEY present={bool(os.getenv('HUNTER_KEY'))} "
+            f"| chosen={_mask(k)}"
+        )
+
+# Backward compatibility - provide apply_phase2_fallbacks for pipeline integration
+def apply_phase2_fallbacks(
     business_name: str,
     google_payload: Dict[str, Any],
     current_phone: Optional[str],
@@ -364,110 +277,28 @@ def apply_phase2_fallbacks_logged(
     logger=None,
 ) -> Dict[str, Any]:
     """
-    Produces ONLY useful extras:
-      - normalized_phone (if improved)
-      - website_final (if improved)
-      - contact_names (best-effort from BBB/YP/OC)
-      - source notes for debugging
+    Wrapper for backward compatibility with existing pipeline integration.
+    Calls phase2_bbb_yp_oc and formats output to match expected schema.
     """
-    out: Dict[str, Any] = {}
-    phase2_env_debug(logger)
-
-    phone = normalize_us_phone(current_phone) or current_phone
-    website = current_website
-
-    # Always log starting state
-    if logger:
-        logger.info(f"PHASE2 START | has_phone={bool(phone)} has_website={bool(website)}")
-
-    # 1) Yelp API fallback if phone missing
-    if not phone:
-        y = yelp_fusion_search_phone_fix400(business_name, google_payload, logger=logger)
-        if logger:
-            logger.info(f"PHASE2 Yelp attempted={y.get('_attempted')} reason={y.get('_reason')}")
-        if y.get("phone"):
-            phone = y["phone"]
-            out["phone_source"] = "yelp"
-            out["phone_confidence"] = "low"
-
-    # 2) SerpApi fallback if phone or website missing
-    if (not phone) or (not website):
-        s = serpapi_maps_lookup(business_name, google_payload, logger=logger)
-        if logger:
-            logger.info(f"PHASE2 SerpApi attempted={s.get('_attempted')} notes={s.get('serp_notes')}")
-        if not phone and s.get("serp_phone"):
-            phone = s["serp_phone"]
-            out["phone_source"] = "serpapi_maps"
-            out["phone_confidence"] = "low"
-        if not website and s.get("serp_website"):
-            website = s["serp_website"]
-
-    # 3) BBB scrape (always attempt, but fast-capped)
-    b = bbb_scrape(business_name, google_payload, logger=logger)
-    if logger:
-        logger.info(f"PHASE2 BBB attempted={b.get('_attempted')} notes={b.get('bbb_notes')}")
-    # use BBB phone only if still missing
-    if not phone and b.get("bbb_phone"):
-        phone = b["bbb_phone"]
-        out["phone_source"] = "bbb"
+    result = phase2_bbb_yp_oc(business_name, google_payload, logger=logger)
+    
+    # Format output to match expected schema
+    out = {
+        "normalized_phone": current_phone,  # Keep existing phone
+        "website_final": current_website,    # Keep existing website
+        "contact_names": result.get("contact_names", []),
+        "bbb_url": result.get("bbb_url"),
+        "yp_url": result.get("yp_url"),
+        "oc_url": result.get("oc_url"),
+    }
+    
+    # If we found phones and don't have one, use the first found
+    if not current_phone and result.get("phones_found"):
+        first_phone = result["phones_found"][0]
+        out["normalized_phone"] = first_phone["phone"]
+        out["phone_source"] = first_phone["source"]
         out["phone_confidence"] = "low"
-
-    # collect names
-    contact_names: List[str] = []
-    for n in (b.get("bbb_names") or []):
-        if n not in contact_names:
-            contact_names.append(n)
-
-    # 4) YellowPages scrape (always attempt, fast-capped)
-    yp = yellowpages_scrape(business_name, google_payload, logger=logger)
-    if logger:
-        logger.info(f"PHASE2 YP attempted={yp.get('_attempted')} notes={yp.get('yp_notes')}")
-    if not phone and yp.get("yp_phone"):
-        phone = yp["yp_phone"]
-        out["phone_source"] = "yellowpages"
-        out["phone_confidence"] = "low"
-    for n in (yp.get("yp_names") or []):
-        if n not in contact_names:
-            contact_names.append(n)
-
-    # 5) OpenCorporates scrape AFTER state (always attempt if state exists)
-    st = google_payload.get("state_region") or google_payload.get("state")
-    oc = opencorporates_scrape(business_name, st, logger=logger)
-    if logger:
-        logger.info(f"PHASE2 OC attempted={oc.get('_attempted')} notes={oc.get('oc_notes')}")
-    for n in (oc.get("oc_names") or []):
-        if n not in contact_names:
-            contact_names.append(n)
-
-    # output minimal useful fields
-    out["normalized_phone"] = normalize_us_phone(phone) or phone
-    out["website_final"] = website
-
-    if contact_names:
-        out["contact_names"] = contact_names[:5]  # cap
-
-    # optional: include URLs if present (these are useful, not bloat)
-    if b.get("bbb_url"):
-        out["bbb_url"] = b["bbb_url"]
-    if yp.get("yp_url"):
-        out["yp_url"] = yp["yp_url"]
-    if oc.get("oc_url"):
-        out["oc_url"] = oc["oc_url"]
-
-    # (optional) OC company metadata if found
-    if oc.get("oc_company_number"):
-        out["oc_company_number"] = oc["oc_company_number"]
-    if oc.get("oc_status"):
-        out["oc_status"] = oc["oc_status"]
-
-    if logger:
-        logger.info(
-            f"PHASE2 END | phone={bool(out.get('normalized_phone'))} "
-            f"website={bool(out.get('website_final'))} "
-            f"names={len(out.get('contact_names') or [])}"
-        )
-
+    
     return out
 
-# Backward compatibility alias
-apply_phase2_fallbacks = apply_phase2_fallbacks_logged
+apply_phase2_fallbacks_logged = apply_phase2_fallbacks  # Alias for compatibility
