@@ -231,6 +231,8 @@ def get_output_schema() -> List[str]:
         'email_providers_tried',
         'email_provider_errors_json',
         'email_waterfall_winner',
+        'contact_names_json',
+        'oc_url',
         'bbb_url',
         'yellowpages_url',
         'yelp_url',

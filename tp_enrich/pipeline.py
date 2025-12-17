@@ -277,9 +277,9 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
         logger=logger
     )
     # Apply phone fallback if we didn't have one
-    if not row.get("primary_phone") and p2.get("phone_final"):
-        row["primary_phone"] = p2["phone_final"]
-        row["phone"] = p2["phone_final"]
+    if not row.get("primary_phone") and p2.get("normalized_phone"):
+        row["primary_phone"] = p2["normalized_phone"]
+        row["phone"] = p2["normalized_phone"]
         row["phone_source"] = p2.get("phone_source", "phase2_fallback")
         row["phone_confidence"] = p2.get("phone_confidence", "low")
         logger.info(f"   -> Phase 2 phone fallback: {p2['phone_final']} from {p2.get('phone_source')}")
@@ -287,9 +287,17 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     if not row.get("website") and p2.get("website_final"):
         row["website"] = p2["website_final"]
         logger.info(f"   -> Phase 2 website fallback: {p2['website_final']}")
+        # NEW: Store contact names extracted from BBB/YP/OC scrapers
+    contact_names = p2.get("contact_names", [])
+    if contact_names:
+        row["contact_names_json"] = str(contact_names)
+        logger.info(f"   -> Phase 2 extracted {len(contact_names)} contact names: {contact_names}")
+    else:
+        row["contact_names_json"] = "[]"
+    
     # Add discovery URLs (optional but useful)
     row["bbb_url"] = p2.get("bbb_url")
-    row["yellowpages_url"] = p2.get("yellowpages_url")
+    row["yellowpages_url"] = p2.get("yp_url")
     row["yelp_url"] = p2.get("yelp_url")
     # Add OpenCorporates validation (optional)
     row["oc_company_number"] = p2.get("oc_company_number")
