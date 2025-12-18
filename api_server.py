@@ -335,27 +335,60 @@ def job_download(job_id: str):
     """
     Download enriched CSV for completed job (PHASE 4)
 
+    CRITICAL: Only returns CSV when job.status == "done"
+    Returns 409 (Conflict) JSON if job is still running/queued/error
+
     Args:
         job_id: Job ID from /jobs POST
 
     Returns:
-        CSV file download
+        CSV file download OR JSON error
     """
-    meta = read_meta(job_id)
-    if meta.get("status") != "done":
+    meta = read_meta(job_id) or {}
+    status = (meta.get("status") or "").lower().strip()
+
+    # ✅ HARD GUARD: Do not return CSV until job is actually done
+    if status != "done":
+        logger.warning(f"Download attempt for job {job_id} with status={status} (not done)")
         return JSONResponse(
-            {"error": "not_ready", "status": meta.get("status")},
-            status_code=409
+            {
+                "error": "not_ready",
+                "status": status or "unknown",
+                "note": "Job not finished. Poll GET /jobs/{id} until status=='done' then download.",
+                "job_id": job_id,
+                "current_progress": meta.get("progress", 0),
+                "stage": meta.get("stage", "unknown")
+            },
+            status_code=409,
+            headers={
+                "Content-Type": "application/json",  # Explicit: this is NOT a CSV
+                "X-Job-Status": status or "unknown"
+            }
         )
 
     _, _, out_path = job_paths(job_id)
     if not os.path.exists(out_path):
-        return JSONResponse({"error": "missing_output"}, status_code=404)
+        logger.error(f"Job {job_id} marked done but output file missing: {out_path}")
+        return JSONResponse(
+            {
+                "error": "missing_output",
+                "job_id": job_id,
+                "note": "Job completed but output file not found. Contact support."
+            },
+            status_code=404,
+            headers={"Content-Type": "application/json"}
+        )
 
+    # ✅ Return actual CSV file
+    logger.info(f"Serving CSV download for job {job_id}: {out_path}")
     return FileResponse(
         path=out_path,
         media_type="text/csv",
-        filename=f"enriched-{job_id}.csv"
+        filename=f"enriched-{job_id}.csv",
+        headers={
+            "Content-Type": "text/csv",  # Explicit CSV
+            "X-Job-Status": "done"
+        }
     )
 
 
