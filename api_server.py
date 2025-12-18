@@ -315,8 +315,9 @@ def job_stream(job_id: str):
             if tail != last:
                 chunk = tail[len(last):] if tail.startswith(last) else tail
                 last = tail
-                # SSE format
-                yield f"data: {chunk.replace(chr(10), '\\n')}\n\n"
+                # SSE format (precompute escaped string to avoid f-string backslash error)
+                safe = chunk.replace("\n", "\\n")
+                yield f"data: {safe}\n\n"
 
             if meta.get("status") in ("done", "error", "missing"):
                 break
