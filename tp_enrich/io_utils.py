@@ -148,8 +148,13 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
         "oc_match_confidence",
         "overall_lead_confidence",
         "enrichment_status",
-        "enrichment_notes",
+        "debug_notes",  # PHASE 4 CLEANUP: renamed from enrichment_notes
         "all_phones_json",
+        # PHASE 4 CLEANUP: Split phone columns
+        "phone_google",
+        "phone_yelp",
+        "phone_website",
+        "phone_apollo",
         "generic_emails_json",
         "person_emails_json",
         "catchall_emails_json",
@@ -171,6 +176,35 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
     # Keep expected first, then extras
     extras = [c for c in df.columns.tolist() if c not in expected_cols]
     final_cols = expected_cols + extras
+    # ============================================================
+    # PHASE 4 CLEANUP: Split all_phones_json into real columns
+    # ============================================================
+    import json
+
+    def _safe_json(x):
+        try:
+            if not x:
+                return {}
+            return json.loads(x) if isinstance(x, str) else (x or {})
+        except Exception:
+            return {}
+
+    if "all_phones_json" in df.columns:
+        phones = df["all_phones_json"].apply(_safe_json)
+        df["phone_google"] = phones.apply(lambda x: x.get("google") or "")
+        df["phone_yelp"] = phones.apply(lambda x: x.get("yelp") or "")
+        df["phone_website"] = phones.apply(lambda x: x.get("website") or "")
+        df["phone_apollo"] = phones.apply(lambda x: x.get("apollo") or "")
+        logger.info("Split all_phones_json into: phone_google, phone_yelp, phone_website, phone_apollo")
+
+    # ============================================================
+    # PHASE 4 CLEANUP: Rename enrichment_notes -> debug_notes
+    # ============================================================
+    if "enrichment_notes" in df.columns:
+        df["debug_notes"] = df["enrichment_notes"]
+        df = df.drop(columns=["enrichment_notes"])
+        logger.info("Renamed enrichment_notes -> debug_notes")
+
     # Sanity log
     try:
         phones = int(df["primary_phone"].notna().sum())
@@ -180,6 +214,10 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
         logger.info(f"Export sanity: rows={len(df)} (could not compute phone/email counts)")
     logger.info(f"Writing output CSV to: {output_path}")
     logger.info(f"Final columns count: {len(final_cols)}")
+
+    # ============================================================
+    # PHASE 4 CLEANUP: Replace "none" with empty strings
+    # ============================================================
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = (
@@ -187,9 +225,12 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
                 .astype(str)
                 .str.replace(r"[\u0000-\u001F\u007F]", "", regex=True)  # control chars
                 .str.replace("\u00A0", " ", regex=False)                # nbsp
+                .replace("none", "")  # PHASE 4 CLEANUP: Remove literal "none"
+                .replace("None", "")
             )
-    # write with explicit utf-8
-    df.to_csv(output_path, index=False, columns=final_cols, encoding="utf-8")
+
+    # PHASE 4 CLEANUP: Write with na_rep="" to avoid "none" in CSV
+    df.to_csv(output_path, index=False, columns=final_cols, encoding="utf-8", na_rep="")
     logger.info(f"Successfully wrote {len(df)} rows to {output_path}")
 def get_output_schema(df=None):
     """

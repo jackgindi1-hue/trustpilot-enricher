@@ -7,6 +7,32 @@ from urllib.parse import urlparse, urljoin
 
 from tp_enrich.phase0_gating import pick_first_email
 
+# ============================================================
+# PHASE 4 CLEANUP: Block placeholder emails
+# ============================================================
+_PLACEHOLDER_EMAILS = {
+    "user@domain.com",
+    "test@test.com",
+    "example@example.com",
+    "name@domain.com",
+    "email@domain.com",
+    "info@domain.com",
+    "admin@domain.com",
+}
+
+def is_placeholder_email(email: str) -> bool:
+    """Check if email is a placeholder/template email"""
+    e = (email or "").strip().lower()
+    if not e or "@" not in e:
+        return True
+    if e in _PLACEHOLDER_EMAILS:
+        return True
+    if e.endswith("@example.com") or e.endswith("@domain.com"):
+        return True
+    if e.startswith("user@") or e.startswith("email@") or e.startswith("name@"):
+        return True
+    return False
+
 def _safe_get(url: str, timeout: int = 12) -> Tuple[int, str]:
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xhtml+xml"}
     r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
@@ -47,8 +73,13 @@ def micro_scan_for_email(website: Optional[str], logger=None) -> Optional[str]:
         if st == 200 and html:
             e = pick_first_email(html)
             if e:
-                if logger: logger.info(f"WEBSITE_EMAIL_SCAN: found email on homepage: {e}")
-                return e
+                # PHASE 4 CLEANUP: Block placeholder emails
+                if is_placeholder_email(e):
+                    if logger: logger.warning(f"WEBSITE_EMAIL_SCAN: ignoring placeholder email: {e}")
+                    e = None
+                else:
+                    if logger: logger.info(f"WEBSITE_EMAIL_SCAN: found email on homepage: {e}")
+                    return e
 
             # find one likely contact link (only one extra fetch to stay fast)
             lowered = html.lower()
@@ -77,8 +108,12 @@ def micro_scan_for_email(website: Optional[str], logger=None) -> Optional[str]:
                 if st2 == 200 and html2:
                     e2 = pick_first_email(html2)
                     if e2:
-                        if logger: logger.info(f"WEBSITE_EMAIL_SCAN: found email on secondary page: {e2}")
-                        return e2
+                        # PHASE 4 CLEANUP: Block placeholder emails
+                        if is_placeholder_email(e2):
+                            if logger: logger.warning(f"WEBSITE_EMAIL_SCAN: ignoring placeholder email: {e2}")
+                        else:
+                            if logger: logger.info(f"WEBSITE_EMAIL_SCAN: found email on secondary page: {e2}")
+                            return e2
     except Exception as e:
         if logger:
             logger.warning(f"WEBSITE_EMAIL_SCAN: exception={repr(e)}")

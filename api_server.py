@@ -67,6 +67,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "Content-Type"],  # PHASE 4 CLEANUP: Fix download CORS
 )
 
 
@@ -395,7 +396,12 @@ def job_download(job_id: str):
         path=out_csv_path,
         media_type="text/csv",
         filename=f"enriched-{job_id}.csv",
-        headers={"Content-Type": "text/csv", "X-Job-Status": "done"}
+        headers={
+            "Content-Type": "text/csv",
+            "X-Job-Status": "done",
+            "Cache-Control": "no-store",  # PHASE 4 CLEANUP: Prevent caching
+            "X-Content-Type-Options": "nosniff",  # PHASE 4 CLEANUP: Security header
+        }
     )
 
 
