@@ -505,6 +505,12 @@ def enrich_domain_emails(domain: Optional[str], company_name: Optional[str] = No
 def email_waterfall(domain: Optional[str], company_name: Optional[str] = None, logger: Any = None, **kwargs) -> Dict[str, Any]:
     return run_email_waterfall(domain=domain, company_name=company_name, logger=logger, **kwargs)
 
+# PHASE 4: Apollo public wrapper (prevents ImportError in phase2_final.py)
+def apollo_domain_search(domain: Optional[str], logger: Any = None) -> Dict[str, Any]:
+    """Public wrapper for Apollo domain search - used by phase2_final.py"""
+    res = _apollo_domain_email(domain=domain, logger=logger)
+    return {"attempted": res.get("attempted", False), "notes": res.get("reason", "ok"), "emails": (res.get("generic") or []) + (res.get("person") or [])}
+
 # ============================================================
 # ENV VARS YOU SHOULD SET IN RAILWAY (for speed + stability)
 #

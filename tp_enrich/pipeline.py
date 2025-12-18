@@ -22,7 +22,14 @@ from .phone_enrichment import enrich_business_phone_waterfall
 from .merge_results import merge_enrichment_results
 from .phase2_final import email_waterfall_enrich, phase2_enrich
 
+# PHASE 4: Phase 0 gating + website email scan + rate limiting
+from .phase0_gating import should_run_phase2, should_run_opencorporates, domain_from_url, is_high_enough_for_skip
+from .website_email_scan import micro_scan_for_email
+from .entity_match import normalize_company_key
+from .retry_ratelimit import SimpleRateLimiter, with_retry
+
 logger = setup_logger(__name__)
+_rate = SimpleRateLimiter(min_interval_s=0.2)
 
 def _safe_str(x):
     """Safely convert value to string, handling None and NaN."""
@@ -221,6 +228,14 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
             row["domain"] = host.lower()
         except Exception:
             row["domain"] = None
+
+    # PHASE 4: Phase 0 domain canonicalization (enforce early)
+    if not row.get("domain") and website:
+        d = domain_from_url(website)
+        if d:
+            row["domain"] = d
+            logger.info(f"   -> Phase 0: Canonical domain={d} from website={website}")
+
     domain = row.get("domain")
     phone_layer = enrich_business_phone_waterfall(
         biz_name=name,
@@ -252,14 +267,30 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     row["primary_email_confidence"] = primary_email_confidence
     row["email_type"] = email_type
     row["email_providers_attempted"] = email_providers_attempted
+
+    # PHASE 4: EMAIL-FIRST FALLBACK (website micro-scan if email still missing)
+    if not row.get("primary_email") and website:
+        try:
+            _rate.wait("website_email_scan")
+            logger.info(f"   -> Phase 4: Email missing, trying website micro-scan for {name}")
+            e2 = micro_scan_for_email(website, logger=logger)
+            if e2:
+                row["primary_email"] = e2
+                row["primary_email_source"] = "website_scan"
+                row["email_type"] = "generic"
+                row["primary_email_confidence"] = "low"
+                logger.info(f"   -> Phase 4: Website scan found email={e2}")
+        except Exception as _e:
+            logger.warning(f"   -> Phase 4: Website scan failed: {repr(_e)}")
+
     # ============================================================
     # END WIRING EDIT 2
     # ============================================================
     # ============================================================
-    # PHASE 2: Apply fallback enrichment for phone/website coverage
+    # PHASE 2: Apply fallback enrichment for phone/website coverage (WITH GATING)
     # ============================================================
     from tp_enrich.phase2_enrichment import apply_phase2_fallbacks_v2
-    logger.info(f"   -> Applying Phase 2 fallbacks for {name}")
+
     # Build google_payload from local enrichment data
     google_payload = {
         "lat": local.get("lat") if local else None,
@@ -269,59 +300,86 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
         "state_region": row.get("state_region"),
         "state": row.get("state_region"),
         "postal_code": row.get("postal_code"),
+        "website": row.get("website"),
     }
-    p2 = apply_phase2_fallbacks_v2(
-        business_name=name,
-        google_payload=google_payload,
-        current_phone=row.get("primary_phone"),
-        current_website=row.get("website"),
-        logger=logger
-    )
-    # Apply phone fallback if we didn't have one
-    if not row.get("primary_phone") and p2.get("normalized_phone"):
-        row["primary_phone"] = p2["normalized_phone"]
-        row["phone"] = p2["normalized_phone"]
-        row["phone_source"] = p2.get("phone_source", "phase2_fallback")
-        row["phone_confidence"] = p2.get("phone_confidence", "low")
-        logger.info(f"   -> Phase 2 phone fallback: {p2['phone_final']} from {p2.get('phone_source')}")
-    # Apply website fallback if we didn't have one
-    if not row.get("website") and p2.get("website_final"):
-        row["website"] = p2["website_final"]
-        logger.info(f"   -> Phase 2 website fallback: {p2['website_final']}")
-        # NEW: Store contact names extracted from BBB/YP/OC scrapers
-    contact_names = p2.get("contact_names", [])
-    if contact_names:
-        row["phase2_bbb_names_json"] = str(contact_names)
-        logger.info(f"   -> Phase 2 extracted {len(contact_names)} contact names: {contact_names}")
+
+    # PHASE 4: GATING LOGIC (Phase 2 = discovery/fallback only)
+    # Build a temporary base_out dict to check if we should run Phase 2
+    base_out_check = {
+        "primary_phone": row.get("primary_phone"),
+        "primary_phone_display": row.get("phone"),
+        "company_domain": row.get("domain"),
+        "domain": row.get("domain"),
+        "primary_email": row.get("primary_email"),
+        "business_website": row.get("website"),
+    }
+
+    if should_run_phase2(base_out_check, google_payload):
+        logger.info(f"   -> PHASE 2 RUN | missing/weak anchors (fallback/discovery mode) for {name}")
+
+        p2 = apply_phase2_fallbacks_v2(
+            business_name=name,
+            google_payload=google_payload,
+            current_phone=row.get("primary_phone"),
+            current_website=row.get("website"),
+            logger=logger
+        )
+        # Apply phone fallback if we didn't have one
+        if not row.get("primary_phone") and p2.get("normalized_phone"):
+            row["primary_phone"] = p2["normalized_phone"]
+            row["phone"] = p2["normalized_phone"]
+            row["phone_source"] = p2.get("phone_source", "phase2_fallback")
+            row["phone_confidence"] = p2.get("phone_confidence", "low")
+            logger.info(f"   -> Phase 2 phone fallback: {p2['phone_final']} from {p2.get('phone_source')}")
+        # Apply website fallback if we didn't have one
+        if not row.get("website") and p2.get("website_final"):
+            row["website"] = p2["website_final"]
+            logger.info(f"   -> Phase 2 website fallback: {p2['website_final']}")
+
+        # Store contact names extracted from BBB/YP/OC scrapers
+        contact_names = p2.get("contact_names", [])
+        if contact_names:
+            row["phase2_bbb_names_json"] = str(contact_names)
+            logger.info(f"   -> Phase 2 extracted {len(contact_names)} contact names: {contact_names}")
+        else:
+            row["phase2_bbb_names_json"] = "[]"
+
+        # Add discovery URLs (optional but useful)
+        row["phase2_bbb_link"] = p2.get("bbb_url")
+        row["phase2_yp_link"] = p2.get("yp_url")
+        row["yelp_url"] = p2.get("yelp_url")
+        # Add OpenCorporates validation (optional)
+        row["oc_company_number"] = p2.get("oc_company_number")
+        row["oc_status"] = p2.get("oc_status")
+        # Add notes for debugging
+        row["phase2_notes"] = f"yelp:{p2.get('yelp_notes')} serp:{p2.get('serp_notes')} oc:{p2.get('oc_notes')}"
+        logger.info(f"   -> Phase 2 fallbacks complete")
+
+        # ============================================================
+        # WIRING EDIT 3 — PHASE 2 ENRICH (DATA NOT URLS)
+        # ============================================================
+        try:
+            logger.info(f"   -> Applying Phase 2 data enrichment (FINAL PATCH) for {name}")
+            p2_data = phase2_enrich(company=name, google_payload=google_payload, logger=logger)
+
+            # Merge Phase 2 data into row
+            row.update(p2_data)
+
+            logger.info(f"   -> Phase 2 data enrichment complete: bbb_phone={bool(p2_data.get('phase2_bbb_phone'))} yp_phone={bool(p2_data.get('phase2_yp_phone'))} notes={p2_data.get('phase2_notes')}")
+        except Exception as e:
+            logger.exception(f"Phase 2 data enrichment failed (non-fatal): {repr(e)}")
+            # Set safe defaults so CSV doesn't break
+            row["phase2_notes"] = f"exception_{repr(e)}"
     else:
+        logger.info(f"   -> PHASE 2 SKIP | Phase 0 satisfied (phone+domain+email present) for {name}")
+        # Set empty defaults so CSV doesn't break
         row["phase2_bbb_names_json"] = "[]"
-
-    # Add discovery URLs (optional but useful)
-    row["phase2_bbb_link"] = p2.get("bbb_url")
-    row["phase2_yp_link"] = p2.get("yp_url")
-    row["yelp_url"] = p2.get("yelp_url")
-    # Add OpenCorporates validation (optional)
-    row["oc_company_number"] = p2.get("oc_company_number")
-    row["oc_status"] = p2.get("oc_status")
-    # Add notes for debugging
-    row["phase2_notes"] = f"yelp:{p2.get('yelp_notes')} serp:{p2.get('serp_notes')} oc:{p2.get('oc_notes')}"
-    logger.info(f"   -> Phase 2 fallbacks complete")
-
-    # ============================================================
-    # WIRING EDIT 3 — PHASE 2 ENRICH (DATA NOT URLS)
-    # ============================================================
-    try:
-        logger.info(f"   -> Applying Phase 2 data enrichment (FINAL PATCH) for {name}")
-        p2_data = phase2_enrich(company=name, google_payload=google_payload, logger=logger)
-
-        # Merge Phase 2 data into row
-        row.update(p2_data)
-
-        logger.info(f"   -> Phase 2 data enrichment complete: bbb_phone={bool(p2_data.get('phase2_bbb_phone'))} yp_phone={bool(p2_data.get('phase2_yp_phone'))} notes={p2_data.get('phase2_notes')}")
-    except Exception as e:
-        logger.exception(f"Phase 2 data enrichment failed (non-fatal): {repr(e)}")
-        # Set safe defaults so CSV doesn't break
-        row["phase2_notes"] = f"exception_{repr(e)}"
+        row["phase2_bbb_link"] = None
+        row["phase2_yp_link"] = None
+        row["yelp_url"] = None
+        row["oc_company_number"] = None
+        row["oc_status"] = None
+        row["phase2_notes"] = "skipped_phase0_satisfied"
     # ============================================================
     # END WIRING EDIT 3
     # ============================================================

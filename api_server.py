@@ -4,17 +4,23 @@ Provides HTTP endpoint for CSV upload and enrichment
 """
 
 import os
+import shutil
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 from tp_enrich.pipeline import run_pipeline
 from tp_enrich.logging_utils import setup_logger
+# PHASE 4: Job management imports
+from tp_enrich.jobs import new_job_id, job_paths, read_meta, read_log_tail, write_meta
+from tp_enrich.progress import set_job_status, set_job_progress, make_job_logger
 
 # Load environment variables
 load_dotenv()
@@ -117,20 +123,20 @@ async def enrich_csv(
             if not output_path.exists():
                 raise HTTPException(status_code=500, detail="Enrichment failed to produce output file")
 
-            # Read enriched CSV into memory BEFORE temp directory cleanup
-            logger.info(f"Reading enriched CSV from: {output_path}")
-            with open(output_path, 'rb') as f:
-                csv_bytes = f.read()
+            logger.info(f"Enrichment complete, output file size: {output_path.stat().st_size} bytes")
 
-            logger.info(f"Returning enriched CSV ({len(csv_bytes)} bytes)")
+            # Copy to a persistent temp location (FileResponse requires file to exist during send)
+            persistent_temp = Path(tempfile.gettempdir()) / f"enriched_{os.getpid()}.csv"
+            import shutil
+            shutil.copy2(output_path, persistent_temp)
 
-            # Return enriched CSV as streaming response from memory
-            return StreamingResponse(
-                iter([csv_bytes]),
+            logger.info(f"Returning enriched CSV: {persistent_temp}")
+
+            # Return enriched CSV as FileResponse
+            return FileResponse(
+                path=str(persistent_temp),
                 media_type='text/csv',
-                headers={
-                    'Content-Disposition': 'attachment; filename="enriched.csv"'
-                }
+                filename='enriched.csv'
             )
 
         except Exception as e:
@@ -138,15 +144,175 @@ async def enrich_csv(
             raise HTTPException(status_code=500, detail=f"Enrichment failed: {str(e)}")
 
 
+# ============================================================
+# PHASE 4: ASYNC JOB ENDPOINTS
+# ============================================================
+
+def _run_job_thread(job_id: str, csv_bytes: bytes, config: dict):
+    """Background thread for async job processing"""
+    meta_path, log_path, out_path = job_paths(job_id)
+    log = make_job_logger(job_id)
+
+    try:
+        set_job_status(job_id, "running", {"stage": "start"})
+        log(f"JOB {job_id} START")
+
+        # Write input CSV to temp file
+        in_path = out_path.replace(".enriched.csv", ".input.csv")
+        with open(in_path, "wb") as f:
+            f.write(csv_bytes)
+
+        # Progress: starting
+        set_job_progress(job_id, 0, 1, stage="enrich")
+        log(f"Running enrichment pipeline...")
+
+        # Run pipeline
+        cache_path = out_path.replace(".enriched.csv", ".cache.json")
+        stats = run_pipeline(
+            input_csv_path=in_path,
+            output_csv_path=out_path,
+            cache_file=cache_path,
+            config=config or {}
+        )
+
+        # Progress: complete
+        set_job_progress(job_id, 1, 1, stage="done")
+        set_job_status(job_id, "done", {"output": out_path, "stats": stats})
+        log(f"JOB {job_id} DONE | output={out_path} | stats={stats}")
+
+    except Exception as e:
+        set_job_status(job_id, "error", {"error": repr(e)})
+        log(f"JOB {job_id} ERROR: {repr(e)}")
+        logger.exception(f"Job {job_id} failed")
+
+
+@app.post("/jobs")
+async def create_job(
+    file: UploadFile = File(..., description="Trustpilot CSV file to enrich"),
+    lender_name_override: Optional[str] = Form(None, description="Optional: Override source_lender_name for all rows")
+):
+    """
+    Create async enrichment job (PHASE 4)
+
+    Args:
+        file: CSV file upload
+        lender_name_override: Optional override for lender/source name
+
+    Returns:
+        Job ID and status
+    """
+    # Validate file type
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="File must be a CSV file")
+
+    job_id = new_job_id()
+    csv_bytes = await file.read()
+
+    config = {}
+    if lender_name_override:
+        config['lender_name_override'] = lender_name_override
+
+    set_job_status(job_id, "queued", {"stage": "queued", "filename": file.filename})
+
+    # Start background thread
+    t = threading.Thread(target=_run_job_thread, args=(job_id, csv_bytes, config), daemon=True)
+    t.start()
+
+    logger.info(f"Created job {job_id} for file {file.filename}")
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    """
+    Get job status (PHASE 4)
+
+    Args:
+        job_id: Job ID from /jobs POST
+
+    Returns:
+        Job metadata and status
+    """
+    return read_meta(job_id)
+
+
+@app.get("/jobs/{job_id}/stream")
+def job_stream(job_id: str):
+    """
+    Stream job logs via SSE (PHASE 4)
+
+    Args:
+        job_id: Job ID from /jobs POST
+
+    Returns:
+        Server-Sent Events stream of logs
+    """
+    def gen():
+        last = ""
+        while True:
+            meta = read_meta(job_id)
+            tail = read_log_tail(job_id)
+
+            # Only emit new tail chunks
+            if tail != last:
+                chunk = tail[len(last):] if tail.startswith(last) else tail
+                last = tail
+                # SSE format
+                yield f"data: {chunk.replace(chr(10), '\\n')}\n\n"
+
+            if meta.get("status") in ("done", "error", "missing"):
+                break
+
+            time.sleep(0.5)
+
+        # Final status push
+        yield f"data: __STATUS__:{meta.get('status')}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/jobs/{job_id}/download")
+def job_download(job_id: str):
+    """
+    Download enriched CSV for completed job (PHASE 4)
+
+    Args:
+        job_id: Job ID from /jobs POST
+
+    Returns:
+        CSV file download
+    """
+    meta = read_meta(job_id)
+    if meta.get("status") != "done":
+        return JSONResponse(
+            {"error": "not_ready", "status": meta.get("status")},
+            status_code=409
+        )
+
+    _, _, out_path = job_paths(job_id)
+    if not os.path.exists(out_path):
+        return JSONResponse({"error": "missing_output"}, status_code=404)
+
+    return FileResponse(
+        path=out_path,
+        media_type="text/csv",
+        filename=f"enriched-{job_id}.csv"
+    )
+
+
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
         "service": "Trustpilot Enrichment API",
-        "version": "1.0.0",
+        "version": "1.0.0 (Phase 4)",
         "endpoints": {
             "health": "/health",
-            "enrich": "/enrich (POST)"
+            "enrich": "/enrich (POST) - sync enrichment",
+            "jobs": "/jobs (POST) - async job creation",
+            "job_status": "/jobs/{job_id} (GET) - job status",
+            "job_stream": "/jobs/{job_id}/stream (GET) - SSE log stream",
+            "job_download": "/jobs/{job_id}/download (GET) - download result"
         },
         "docs": "/docs"
     }
