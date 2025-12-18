@@ -55,34 +55,106 @@ function App() {
       // Prepare form data
       const formData = new FormData()
       formData.append('file', file)
+      formData.append('concurrency', '8')
 
       if (lenderNameOverride.trim()) {
         formData.append('lender_name_override', lenderNameOverride.trim())
       }
 
-      // Start the fetch, then immediately set status to processing
-      const responsePromise = fetch(`${config.API_BASE_URL}/enrich`, {
+      // ============================================================
+      // PHASE 4 CORRECT FLOW: POST /jobs -> poll -> download
+      // ============================================================
+
+      // 1) CREATE JOB (returns JSON only)
+      setStatus('creating_job')
+      const createRes = await fetch(`${config.API_BASE_URL}/jobs`, {
         method: 'POST',
         body: formData
       })
 
-      setStatus('processing')
-
-      const response = await responsePromise
-
-      if (!response.ok) {
-        const errorText = await response.text()
-        throw new Error(`Server error (${response.status}): ${errorText}`)
+      if (!createRes.ok) {
+        const errorText = await createRes.text()
+        throw new Error(`Job creation failed (${createRes.status}): ${errorText}`)
       }
 
-      // Get the enriched CSV as blob
-      const blob = await response.blob()
+      // Parse JSON response
+      const createData = await createRes.json()
+      const jobId = createData.job_id
+
+      if (!jobId) {
+        throw new Error('Missing job_id from server response')
+      }
+
+      console.log(`✅ Job created: ${jobId}`)
+      setStatus('running')
+
+      // 2) POLL STATUS UNTIL DONE
+      let pollCount = 0
+      const maxPolls = 600 // 10 minutes
+
+      while (pollCount < maxPolls) {
+        await new Promise(r => setTimeout(r, 1000))
+        pollCount++
+
+        const statusRes = await fetch(`${config.API_BASE_URL}/jobs/${jobId}`)
+        const meta = await statusRes.json()
+
+        const jobStatus = (meta.status || '').toLowerCase()
+        const progress = meta.progress || 0
+
+        console.log(`Poll ${pollCount}: status=${jobStatus}, progress=${Math.round(progress * 100)}%`)
+
+        // Update UI with progress
+        if (progress > 0) {
+          setStatus(`running (${Math.round(progress * 100)}%)`)
+        }
+
+        // Check if done
+        if (jobStatus === 'done') {
+          console.log('✅ Job completed!')
+          setStatus('downloading')
+          break
+        }
+
+        if (jobStatus === 'error') {
+          throw new Error(meta.error || 'Job failed on server')
+        }
+      }
+
+      if (pollCount >= maxPolls) {
+        throw new Error('Job timeout: exceeded 10 minutes')
+      }
+
+      // 3) DOWNLOAD CSV (ONLY AFTER status == "done")
+      const downloadRes = await fetch(`${config.API_BASE_URL}/jobs/${jobId}/download`)
+
+      if (!downloadRes.ok) {
+        const errorText = await downloadRes.text()
+        throw new Error(`Download failed (${downloadRes.status}): ${errorText}`)
+      }
+
+      // Validate content-type (must be CSV, not JSON)
+      const contentType = downloadRes.headers.get('content-type') || ''
+      if (contentType.includes('application/json')) {
+        const jsonText = await downloadRes.text()
+        throw new Error(`Server returned JSON instead of CSV: ${jsonText.slice(0, 200)}`)
+      }
+
+      // Download as blob
+      const blob = await downloadRes.blob()
+
+      // Double-check: refuse JSON-looking content
+      const buffer = await blob.arrayBuffer()
+      const header = new TextDecoder('utf-8').decode(buffer.slice(0, 64)).trim()
+      if (header.startsWith('{') || header.startsWith('[')) {
+        throw new Error(`Refusing to download JSON-looking content: ${header}`)
+      }
 
       // Create download link
-      const url = window.URL.createObjectURL(blob)
+      const url = window.URL.createObjectURL(new Blob([buffer], { type: 'text/csv' }))
       const a = document.createElement('a')
       a.href = url
-      a.download = 'enriched.csv'
+      a.download = `enriched-${jobId}.csv`
       document.body.appendChild(a)
       a.click()
 
@@ -90,6 +162,7 @@ function App() {
       window.URL.revokeObjectURL(url)
       document.body.removeChild(a)
 
+      console.log('✅ CSV downloaded successfully!')
       setStatus('done')
       setIsProcessing(false)
 
@@ -105,7 +178,7 @@ function App() {
       }, 3000)
 
     } catch (err) {
-      console.error('Enrichment error:', err)
+      console.error('❌ Enrichment error:', err)
       setError(err.message || 'Enrichment failed. Please try again.')
       setStatus('error')
       setIsProcessing(false)
@@ -186,17 +259,27 @@ function App() {
                   <span className="status-icon spinner">⟳</span>
                   <span>Uploading CSV...</span>
                 </>
-              ) : status === 'processing' ? (
+              ) : status === 'creating_job' ? (
+                <>
+                  <span className="status-icon spinner">⟳</span>
+                  <span>Creating enrichment job...</span>
+                </>
+              ) : status.startsWith('running') ? (
                 <>
                   <span className="status-icon spinner">⟳</span>
                   <span>
-                    Processing... {rowCount !== null && `(${rowCount} rows)`}. This may take a while.
+                    Running... {status.includes('%') ? status.replace('running', '').trim() : ''} {rowCount !== null && `(${rowCount} rows)`}
                   </span>
+                </>
+              ) : status === 'downloading' ? (
+                <>
+                  <span className="status-icon spinner">⟳</span>
+                  <span>Downloading enriched CSV...</span>
                 </>
               ) : status === 'done' ? (
                 <>
                   <span className="status-icon">✓</span>
-                  <span>Done. Processed {rowCount !== null ? `${rowCount} rows.` : 'successfully.'}</span>
+                  <span>Done! CSV downloaded successfully.</span>
                 </>
               ) : (
                 <>
@@ -213,10 +296,13 @@ function App() {
           <ol>
             <li>Upload your Trustpilot review CSV file</li>
             <li>Optionally specify a lender name override</li>
-            <li>Click "Run Enrichment" to process</li>
-            <li>Wait while we enrich your data with business contacts</li>
-            <li>Download the enriched CSV automatically</li>
+            <li>Click "Run Enrichment" to create an async job</li>
+            <li>Watch live progress as we enrich your data</li>
+            <li>CSV downloads automatically when complete</li>
           </ol>
+          <p className="help-text">
+            ℹ️ Using async job system for reliability and progress tracking
+          </p>
 
           <h3>Data Sources</h3>
           <ul>
