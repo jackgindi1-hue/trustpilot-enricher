@@ -288,7 +288,7 @@ def serpapi_search(engine: str, q: str, logger=None) -> Dict[str, Any]:
     url = "https://serpapi.com/search.json"
     params = {"engine": engine, "q": q, "api_key": key}
     try:
-        r = requests.get(url, params=params, timeout=25)
+        r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
             if logger:
                 logger.warning(f"SerpApi failed engine={engine}: status={r.status_code} body={r.text[:200]}")

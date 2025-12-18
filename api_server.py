@@ -277,7 +277,11 @@ async def create_job(
     t.start()
 
     logger.info(f"Created job {job_id} for file {file.filename} (rows={rows}, concurrency={config['concurrency']})")
-    return {"job_id": job_id, "status": "queued", "rows": rows}
+    return JSONResponse(
+        {"job_id": job_id, "status": "queued", "mode": "async", "rows": rows},
+        status_code=200,
+        headers={"Content-Type": "application/json"}
+    )
 
 
 @app.get("/jobs/{job_id}")
