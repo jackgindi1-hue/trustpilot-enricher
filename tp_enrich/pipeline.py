@@ -632,8 +632,21 @@ def run_pipeline(
     # Enrich each unique business
     logger.info("Step 5: Enriching businesses...")
     enrichment_results = {}
+
+    # Get progress callback if provided
+    progress_callback = config.get('progress_callback') if config else None
+    total_businesses = len(unique_businesses)
+
     for idx, (normalized_key, business_info) in enumerate(unique_businesses.items(), 1):
-        logger.info(f"  [{idx}/{len(unique_businesses)}] Processing: {business_info['company_search_name']}")
+        logger.info(f"  [{idx}/{total_businesses}] Processing: {business_info['company_search_name']}")
+
+        # Report progress
+        if progress_callback:
+            try:
+                progress_callback(idx, total_businesses)
+            except Exception as e:
+                logger.warning(f"Progress callback failed: {e}")
+
         try:
             result = enrich_business(business_info, cache, run_id=RUN_ID)
             enrichment_results[normalized_key] = result

@@ -217,21 +217,37 @@ def _run_job_thread(job_id: str, csv_bytes: bytes, config: dict):
         with open(in_path, "wb") as f:
             f.write(csv_bytes)
 
-        # Progress: starting
-        set_job_progress(job_id, 0, 1, stage="enrich")
-        log(f"Running enrichment pipeline...")
+        # Count rows to track progress
+        import csv as csv_module
+        with open(in_path, 'r', encoding='utf-8') as f:
+            total_rows = max(0, len(list(csv_module.reader(f))) - 1)  # minus header
 
-        # Run pipeline
+        log(f"Processing {total_rows} rows...")
+
+        # Progress: starting
+        set_job_progress(job_id, 0, total_rows, stage="enrich")
+
+        # Progress callback for pipeline
+        def progress_callback(current, total):
+            set_job_progress(job_id, current, total, stage="enrich")
+            if current % 5 == 0 or current == total:  # Log every 5 rows
+                log(f"Progress: {current}/{total} rows ({int(current/total*100) if total > 0 else 0}%)")
+
+        # Run pipeline with progress tracking
         cache_path = out_path.replace(".enriched.csv", ".cache.json")
+        config_with_progress = dict(config or {})
+        config_with_progress['progress_callback'] = progress_callback
+        config_with_progress['job_id'] = job_id
+
         stats = run_pipeline(
             input_csv_path=in_path,
             output_csv_path=out_path,
             cache_file=cache_path,
-            config=config or {}
+            config=config_with_progress
         )
 
         # Progress: complete
-        set_job_progress(job_id, 1, 1, stage="done")
+        set_job_progress(job_id, total_rows, total_rows, stage="done")
         set_job_status(job_id, "done", {"output": out_path, "stats": stats})
         log(f"JOB {job_id} DONE | output={out_path} | stats={stats}")
 
