@@ -20,7 +20,7 @@ from . import local_enrichment
 from .email_enrichment import enrich_emails_for_domain
 from .phone_enrichment import enrich_business_phone_waterfall
 from .merge_results import merge_enrichment_results
-from .phase2_final import true_email_waterfall, phase2_enrich
+from .phase2_final import email_waterfall_enrich, phase2_enrich
 
 logger = setup_logger(__name__)
 
@@ -236,13 +236,13 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     # ============================================================
     # WIRING EDIT 2 — EMAIL WATERFALL (STOP ON WINNER)
     # ============================================================
-    logger.info(f"   -> Email enrichment (STOP-ON-WINNER) for {name} domain={domain}")
-    wf = true_email_waterfall(domain=domain, company=name, logger=logger)
+    logger.info(f"   -> Email enrichment (CONTINUE-ON-EMPTY - MAX COVERAGE) for {name} domain={domain}")
+    wf = email_waterfall_enrich(company=name, domain=domain, person_name=None, logger=logger)
     primary_email = wf.get("primary_email")
     primary_email_source = wf.get("email_source")
     primary_email_confidence = wf.get("email_confidence")
     email_type = wf.get("email_type")
-    email_providers_attempted = ",".join(wf.get("tried") or [])
+    email_providers_attempted = wf.get("email_tried") or ""
 
     logger.info(f"   -> Email waterfall complete: email={primary_email} source={primary_email_source} confidence={primary_email_confidence} tried={email_providers_attempted}")
 

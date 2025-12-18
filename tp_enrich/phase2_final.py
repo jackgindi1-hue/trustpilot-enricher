@@ -1,14 +1,14 @@
 """
-PHASE 2 FINAL PATCH - Drop-in Module
+PHASE 2 LOCK PATCH - Drop-in Module (ANTI-BRICK + MAX COVERAGE)
 
 Purpose:
-- Stop-on-winner email waterfall (no wasted providers)
-- Phase 2 pulls actual DATA from BBB/YP/OC (not just URLs)
-- Anti-crash with explicit logs
-- Safe fallbacks everywhere
+- Email waterfall: stop ONLY on winner; if Hunter=empty -> continue (Snov/Apollo/FullEnrich) for MAX coverage
+- Phase 2 pulls actual DATA from BBB/YP/OC (phone/email/website/company_number/status)
+- YP = NO HTML FETCH (uses Serp snippets only to avoid bot blocks)
+- Safe schema: append-only columns (no overwriting/syntax mess)
 
 Usage:
-- Import functions in pipeline.py
+- Import functions in pipeline.py and io_utils.py
 - Use 3 wiring edits to integrate
 """
 
@@ -178,55 +178,99 @@ def score_email_confidence(source: str, email_type: str) -> str:
         return "medium"
     return "low"
 
-def true_email_waterfall(
-    domain: Optional[str],
-    company: str,
-    logger=None,
-) -> Dict[str, Any]:
+def email_waterfall_enrich(company: str, domain: Optional[str], person_name: Optional[str] = None, logger=None) -> Dict[str, Any]:
     """
-    STOP-ON-WINNER logic:
+    LOCK PATCH: Stop ONLY on winner; if Hunter returns nothing -> continue for MAX coverage
     - Try Hunter first
-    - If Hunter returns ANY email -> stop. (No Snov/Apollo/FullEnrich)
-    - If none -> then continue (you can re-enable providers later)
+    - If Hunter returns ANY email -> stop and return it
+    - If Hunter returns NOTHING -> continue: Snov -> Apollo -> FullEnrich (if person_name)
     """
     tried: List[str] = []
-    if not domain:
-        return {"primary_email": None, "email_source": None, "email_confidence": None, "email_type": None, "tried": []}
 
-    # 1) HUNTER
-    tried.append("hunter")
-    h = hunter_domain_search(domain, company, logger=logger)
-    if h.get("attempted") and (h.get("generic") or h.get("person")):
-        # prefer generic for business contact
-        if h.get("generic"):
-            email = h["generic"][0]
-            return {
-                "primary_email": email,
-                "email_source": "hunter",
-                "email_type": "generic",
-                "email_confidence": score_email_confidence("hunter", "generic"),
-                "tried": tried,
-            }
-        email = h["person"][0]
+    def _done(email: Optional[str], source: Optional[str], email_type: Optional[str]) -> Dict[str, Any]:
         return {
             "primary_email": email,
-            "email_source": "hunter",
-            "email_type": "person",
-            "email_confidence": score_email_confidence("hunter", "person"),
-            "tried": tried,
+            "email_source": source,
+            "email_type": email_type,
+            "email_confidence": (score_email_confidence(source, email_type) if email else None),
+            "email_tried": ",".join(tried),
         }
 
-    # If Hunter had no email, stop here for now to keep Phase 2 stable.
-    # (You can add Snov/Apollo later behind a feature flag without risking Phase 2.)
+    if not domain:
+        if logger:
+            logger.info("EMAIL WATERFALL: skipped (missing domain)")
+        return _done(None, None, None)
+
+    # ---- HUNTER (uses HUNTER_KEY or HUNTER_API_KEY)
+    tried.append("hunter")
+    hunter_res = hunter_domain_search(company=company, domain=domain, logger=logger)
+    hunter_generic = (hunter_res.get("generic") or [])
+    hunter_person = (hunter_res.get("person") or [])
+
+    if hunter_generic:
+        if logger:
+            logger.info("EMAIL WATERFALL: Hunter found generic email -> STOPPING")
+        return _done(hunter_generic[0], "hunter", "generic")
+    if hunter_person:
+        if logger:
+            logger.info("EMAIL WATERFALL: Hunter found person email -> STOPPING")
+        return _done(hunter_person[0], "hunter", "person")
+
     if logger:
-        logger.info("EMAIL WATERFALL: Hunter produced no emails; skipping other providers for speed/stability.")
-    return {
-        "primary_email": None,
-        "email_source": None,
-        "email_type": None,
-        "email_confidence": None,
-        "tried": tried,
-    }
+        logger.info("EMAIL WATERFALL: Hunter returned 0 emails -> continuing to Snov/Apollo/FullEnrich for MAX coverage")
+
+    # ---- SNOV (import from email_enrichment if exists)
+    tried.append("snov")
+    try:
+        from .email_enrichment import snov_domain_search
+        snov_res = snov_domain_search(domain=domain, logger=logger)
+        snov_emails = (snov_res.get("emails") or [])
+        if snov_emails:
+            if logger:
+                logger.info("EMAIL WATERFALL: Snov found email -> STOPPING")
+            return _done(snov_emails[0], "snov", "generic")
+    except Exception as e:
+        if logger:
+            logger.warning(f"EMAIL WATERFALL: Snov failed: {repr(e)}")
+
+    # ---- APOLLO (import from email_enrichment if exists)
+    tried.append("apollo")
+    try:
+        from .email_enrichment import apollo_domain_search
+        apollo_res = apollo_domain_search(domain=domain, logger=logger)
+        apollo_emails = (apollo_res.get("emails") or [])
+        if apollo_emails:
+            if logger:
+                logger.info("EMAIL WATERFALL: Apollo found email -> STOPPING")
+            return _done(apollo_emails[0], "apollo", "generic")
+    except Exception as e:
+        if logger:
+            logger.warning(f"EMAIL WATERFALL: Apollo failed: {repr(e)}")
+
+    # ---- FULLENRICH (only if person_name + domain)
+    if person_name and domain:
+        tried.append("fullenrich")
+        try:
+            from .email_enrichment import fullenrich_person_enrich
+            fe_res = fullenrich_person_enrich(person_name=person_name, domain=domain, logger=logger)
+            fe_email = clean_email(fe_res.get("email"))
+            if fe_email:
+                if logger:
+                    logger.info("EMAIL WATERFALL: FullEnrich found email -> STOPPING")
+                return _done(fe_email, "fullenrich", "person")
+        except Exception as e:
+            if logger:
+                logger.warning(f"EMAIL WATERFALL: FullEnrich failed: {repr(e)}")
+    else:
+        if logger:
+            logger.info("EMAIL WATERFALL: FullEnrich skipped (needs person_name + domain)")
+
+    if logger:
+        logger.info(f"EMAIL WATERFALL: No email found after trying: {','.join(tried)}")
+    return _done(None, None, None)
+
+# Backward compatibility alias
+true_email_waterfall = email_waterfall_enrich
 
 # -----------------------------
 # SERPAPI GOOGLE SEARCH (for BBB/YP/OC URL discovery)
@@ -279,56 +323,57 @@ def _is_yellowpages_profile_url(url: str) -> bool:
     return False
 
 def find_bbb_url(company: str, city: Optional[str], state: Optional[str], logger=None) -> Dict[str, Any]:
-    q1 = f'site:bbb.org/us "{company}"' + (f' "{city} {state}"' if (city and state) else "")
-    s1 = serpapi_google_search(q1, logger=logger)
-    js1 = s1.get("json") or {}
-    organic1 = js1.get("organic_results") or []
-    candidates1 = [r.get("link") for r in organic1 if _is_bbb_profile_url((r.get("link") or "").strip())]
-    url = (candidates1[0] if candidates1 else None)
-
-    if not url:
-        q2 = f'site:bbb.org/us "{company}" profile' + (f' "{city} {state}"' if (city and state) else "")
-        s2 = serpapi_google_search(q2, logger=logger)
-        js2 = s2.get("json") or {}
-        organic2 = js2.get("organic_results") or []
-        candidates2 = [r.get("link") for r in organic2 if _is_bbb_profile_url((r.get("link") or "").strip())]
-        url = (candidates2[0] if candidates2 else None)
-        notes = f"{s1.get('notes')} -> retry({s2.get('notes')})"
-    else:
-        notes = s1.get("notes")
-
-    if logger:
-        logger.info(f"PHASE2 BBB URL PICK | found={bool(url)} url={url}")
-
-    return {"attempted": bool(s1.get("attempted")), "notes": notes, "url": url}
-
-def find_yp_url(company: str, city: Optional[str], state: Optional[str], logger=None) -> Dict[str, Any]:
-    q = f'site:yellowpages.com "{company}"' + (f' "{city} {state}"' if (city and state) else "")
+    q = f'site:bbb.org/us "{company}"' + (f' "{city} {state}"' if (city and state) else "")
     s = serpapi_google_search(q, logger=logger)
     js = s.get("json") or {}
     organic = js.get("organic_results") or []
-    candidates = [r.get("link") for r in organic if _is_yellowpages_profile_url((r.get("link") or "").strip())]
-    url = (candidates[0] if candidates else None)
+    candidates = [r.get("link") for r in organic if _is_bbb_profile_url((r.get("link") or "").strip())]
+    url = candidates[0] if candidates else None
     if logger:
-        logger.info(f"PHASE2 YP URL PICK | found={bool(url)} url={url} (rejected category pages)")
-    return {"attempted": bool(s.get("attempted")), "notes": s.get("notes"), "url": url}
+        logger.info(f"PHASE2 BBB URL PICK | found={bool(url)} url={url}")
+    return {"attempted": bool(s.get("attempted")), "notes": s.get("notes"), "url": url, "organic": organic}
 
-def find_oc_url(company: str, city: Optional[str], state: Optional[str], logger=None) -> Dict[str, Any]:
+def find_yp_url(company: str, city: Optional[str], state: Optional[str], logger=None) -> Dict[str, Any]:
+    q1 = f'site:yellowpages.com "{company}"' + (f' "{city} {state}"' if (city and state) else "")
+    s1 = serpapi_google_search(q1, logger=logger)
+    js1 = s1.get("json") or {}
+    organic1 = js1.get("organic_results") or []
+    candidates1 = [r.get("link") for r in organic1 if _is_yellowpages_profile_url((r.get("link") or "").strip())]
+    url = candidates1[0] if candidates1 else None
+
+    organic = organic1
+    notes = s1.get("notes")
+
+    if not url:
+        q2 = f'site:yellowpages.com (mip OR biz) "{company}"' + (f' "{city} {state}"' if (city and state) else "")
+        s2 = serpapi_google_search(q2, logger=logger)
+        js2 = s2.get("json") or {}
+        organic2 = js2.get("organic_results") or []
+        candidates2 = [r.get("link") for r in organic2 if _is_yellowpages_profile_url((r.get("link") or "").strip())]
+        url = candidates2[0] if candidates2 else None
+        organic = organic2
+        notes = f"{notes}->retry({s2.get('notes')})"
+
+    if logger:
+        logger.info(f"PHASE2 YP URL PICK | found={bool(url)} url={url}")
+    return {"attempted": True, "notes": notes, "url": url, "organic": organic}
+
+def find_oc_url(company: str, state: Optional[str], logger=None) -> Dict[str, Any]:
     # OC is optional; use it only to discover a likely company page.
-    q = f'site:opencorporates.com "{company}"' + (f' "{state}"' if state else "")
+    q = f'site:opencorporates.com/companies "{company}"' + (f' "{state}"' if state else "")
     s = serpapi_google_search(q, logger=logger)
     js = s.get("json") or {}
     organic = js.get("organic_results") or []
     # accept direct OC company pages only
-    candidates = []
+    url = None
     for r in organic:
         link = (r.get("link") or "").strip()
         if "opencorporates.com/companies/" in link:
-            candidates.append(link)
-    url = candidates[0] if candidates else None
+            url = link
+            break
     if logger:
         logger.info(f"PHASE2 OC URL PICK | found={bool(url)} url={url}")
-    return {"attempted": bool(s.get("attempted")), "notes": s.get("notes"), "url": url}
+    return {"attempted": bool(s.get("attempted")), "notes": s.get("notes"), "url": url, "organic": organic}
 
 # -----------------------------
 # LIGHT HTML EXTRACTION (BBB / YP / OC)
@@ -346,106 +391,143 @@ def _fetch_html(url: str, timeout: int = 20) -> Tuple[int, str]:
     r = requests.get(url, headers=headers, timeout=timeout)
     return r.status_code, (r.text or "")
 
-def _extract_contact_from_html(html: str) -> Dict[str, Any]:
-    emails = [clean_email(e) for e in _EMAIL_RE.findall(html or "")]
+def _extract_from_text(text: str) -> Dict[str, Any]:
+    """Extract contact data from any text (HTML, Serp snippets, etc.)"""
+    emails = [clean_email(e) for e in _EMAIL_RE.findall(text or "")]
     emails = [e for e in emails if e]
-    phones = [normalize_us_phone(p) for p in _PHONE_RE.findall(html or "")]
+    email = emails[0] if emails else None
+
+    phones = []
+    for m in _PHONE_RE.finditer(text or ""):
+        phones.append(normalize_us_phone(m.group(0)))
     phones = [p for p in phones if p]
+    phone = phones[0] if phones else None
 
-    # naive website extraction: look for "http" + not bbb/yp/oc domain
-    sites = re.findall(r"https?://[^\s\"'<>]+", html or "", flags=re.I)
-    sites = [s for s in sites if s and all(bad not in s.lower() for bad in ["bbb.org", "yellowpages.com", "opencorporates.com", "google.com"])]
-    website = sites[0] if sites else None
+    urls = re.findall(r"https?://[^\s\"'<>]+", text or "", flags=re.I)
+    urls = [u for u in urls if u and all(bad not in u.lower() for bad in ["bbb.org", "yellowpages.com", "opencorporates.com", "google.com"])]
+    website = urls[0] if urls else None
 
-    # names: keep very conservative (avoid trash words)
-    # pull likely capitalized phrases (this is intentionally minimal)
-    raw_names = re.findall(r"\b[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3}\b", html or "")
-    bad = {"Business", "Profile", "Accredited", "Since", "Reviews", "Better", "Bureau", "Contractors", "Road", "Street", "Avenue"}
-    names = []
-    for n in raw_names[:300]:
-        if len(n) < 4:
+    return {"phone": phone, "email": email, "website": website}
+
+def _extract_from_serp_organic(organic_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract contact data from Serp organic results (titles + snippets + highlighted words)"""
+    blob = ""
+    for r in (organic_results or [])[:8]:
+        blob += " " + (r.get("title") or "")
+        blob += " " + (r.get("snippet") or "")
+        blob += " " + (r.get("link") or "")
+        blob += " " + " ".join((r.get("snippet_highlighted_words") or [])[:8])
+    return _extract_from_text(blob)
+
+def _extract_bbb_from_html(html: str) -> Dict[str, Any]:
+    """Extract BBB contact data from HTML (better extraction with JSON-LD support)"""
+    out = {"phone": None, "email": None, "website": None}
+
+    # Try tel: links
+    tel = re.search(r'href=["\']tel:([^"\']+)["\']', html or "", re.I)
+    if tel:
+        out["phone"] = normalize_us_phone(tel.group(1))
+
+    # Try JSON-LD structured data
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html or "", re.I | re.S):
+        raw = (m.group(1) or "").strip()
+        if not raw:
             continue
-        if any(w in bad for w in n.split()):
+        try:
+            js = json.loads(raw)
+        except Exception:
             continue
-        if n not in names:
-            names.append(n)
-        if len(names) >= 8:
-            break
+        candidates = js if isinstance(js, list) else [js]
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            tel2 = item.get("telephone") or item.get("phone")
+            url2 = item.get("url") or item.get("sameAs")
+            email2 = item.get("email")
+            if not out["phone"] and tel2:
+                out["phone"] = normalize_us_phone(tel2)
+            if not out["email"] and email2:
+                out["email"] = clean_email(email2)
+            if not out["website"] and url2:
+                if isinstance(url2, list):
+                    for u in url2:
+                        if isinstance(u, str) and "bbb.org" not in u.lower():
+                            out["website"] = u
+                            break
+                elif isinstance(url2, str) and "bbb.org" not in url2.lower():
+                    out["website"] = url2
 
-    return {
-        "phone": phones[0] if phones else None,
-        "email": emails[0] if emails else None,
-        "website": website,
-        "names": names,
-    }
+    # Fallback to text extraction
+    fb = _extract_from_text(html or "")
+    out["phone"] = out["phone"] or fb.get("phone")
+    out["email"] = out["email"] or fb.get("email")
+    out["website"] = out["website"] or fb.get("website")
+    return out
 
 # -----------------------------
 # PHASE 2 ENRICH (DATA, NOT URLS)
 # -----------------------------
 
-def phase2_enrich(
-    company: str,
-    google_payload: Dict[str, Any],
-    logger=None,
-) -> Dict[str, Any]:
+def phase2_enrich(company: str, google_payload: Dict[str, Any], logger=None) -> Dict[str, Any]:
     """
-    Produces actual enrichment fields:
-    - phase2_bbb_phone/email/website/names_json
-    - phase2_yp_phone/email/website/names_json
-    - phase2_oc_company_number/status (best effort)
+    LOCK PATCH: Produces actual enrichment fields with Serp snippet extraction for YP
+    - phase2_bbb_phone/email/website (from Serp snippets + HTML)
+    - phase2_yp_phone/email/website (from Serp snippets ONLY - no HTML fetch to avoid bot blocks)
+    - phase2_oc_company_number/status (from HTML if URL found)
     - phase2_notes
     """
     city = google_payload.get("city")
     state = google_payload.get("state_region") or google_payload.get("state")
 
-    out: Dict[str, Any] = {"phase2_notes": []}
+    out: Dict[str, Any] = {
+        "phase2_bbb_phone": None, "phase2_bbb_email": None, "phase2_bbb_website": None,
+        "phase2_yp_phone": None,  "phase2_yp_email": None,  "phase2_yp_website": None,
+        "phase2_oc_company_number": None, "phase2_oc_status": None,
+        "phase2_notes": ""
+    }
+    notes = []
 
-    # BBB
+    # BBB: Serp snippet -> then fetch BBB HTML (usually allowed)
     bbb = find_bbb_url(company, city, state, logger=logger)
+    if bbb.get("organic"):
+        sdat = _extract_from_serp_organic(bbb["organic"])
+        out["phase2_bbb_phone"] = out["phase2_bbb_phone"] or sdat.get("phone")
+        out["phase2_bbb_email"] = out["phase2_bbb_email"] or sdat.get("email")
+        out["phase2_bbb_website"] = out["phase2_bbb_website"] or sdat.get("website")
+
     if bbb.get("url"):
-        if logger:
-            logger.info(f"PHASE2 BBB: link={bbb['url']}")
         st, html = _fetch_html(bbb["url"])
         if logger:
             logger.info(f"PHASE2 BBB: fetch status={st} html_len={len(html)}")
         if st == 200 and html:
-            c = _extract_contact_from_html(html)
-            out["phase2_bbb_phone"] = c.get("phone")
-            out["phase2_bbb_email"] = c.get("email")
-            out["phase2_bbb_website"] = c.get("website")
-            out["phase2_bbb_names_json"] = json.dumps(c.get("names") or [])
+            hdat = _extract_bbb_from_html(html)
+            out["phase2_bbb_phone"] = out["phase2_bbb_phone"] or hdat.get("phone")
+            out["phase2_bbb_email"] = out["phase2_bbb_email"] or hdat.get("email")
+            out["phase2_bbb_website"] = out["phase2_bbb_website"] or hdat.get("website")
         else:
-            out["phase2_notes"].append(f"bbb_fetch_http_{st}")
+            notes.append(f"bbb_fetch_http_{st}")
     else:
-        out["phase2_notes"].append(f"bbb_no_url_{bbb.get('notes')}")
+        notes.append(f"bbb_no_url_{bbb.get('notes')}")
 
-    # YP (NOTE: YP blocks often; we only fetch if we have a likely profile URL)
+    # YP: NEVER fetch HTML (blocks). Serp snippet only.
     yp = find_yp_url(company, city, state, logger=logger)
-    if yp.get("url"):
+    if yp.get("organic"):
         if logger:
-            logger.info(f"PHASE2 YP: link={yp['url']}")
-        st, html = _fetch_html(yp["url"])
-        if logger:
-            logger.info(f"PHASE2 YP: fetch status={st} html_len={len(html)}")
-        if st == 200 and html:
-            c = _extract_contact_from_html(html)
-            out["phase2_yp_phone"] = c.get("phone")
-            out["phase2_yp_email"] = c.get("email")
-            out["phase2_yp_website"] = c.get("website")
-            out["phase2_yp_names_json"] = json.dumps(c.get("names") or [])
-        else:
-            out["phase2_notes"].append(f"yp_fetch_http_{st}")
-    else:
-        out["phase2_notes"].append(f"yp_no_url_{yp.get('notes')}")
+            logger.info(f"PHASE2 YP: extracting from Serp snippets (NO HTML FETCH to avoid bot blocks)")
+        sdat = _extract_from_serp_organic(yp["organic"])
+        out["phase2_yp_phone"] = out["phase2_yp_phone"] or sdat.get("phone")
+        out["phase2_yp_email"] = out["phase2_yp_email"] or sdat.get("email")
+        out["phase2_yp_website"] = out["phase2_yp_website"] or sdat.get("website")
+    if not yp.get("url"):
+        notes.append(f"yp_no_url_{yp.get('notes')}")
 
-    # OpenCorporates (best-effort: use SerpApi to discover, then parse minimal identifiers)
-    oc = find_oc_url(company, city, state, logger=logger)
+    # OC: optional (fetch often allowed); extract company number/status
+    oc = find_oc_url(company, state, logger=logger)
     if oc.get("url"):
         st, html = _fetch_html(oc["url"])
         if logger:
             logger.info(f"PHASE2 OC: fetch status={st} html_len={len(html)}")
         if st == 200 and html:
-            # very light OC extraction
             m_num = re.search(r"Company Number</dt>\s*<dd[^>]*>\s*([^<]+)\s*<", html, re.I)
             m_stat = re.search(r"Status</dt>\s*<dd[^>]*>\s*([^<]+)\s*<", html, re.I)
             if m_num:
@@ -453,9 +535,9 @@ def phase2_enrich(
             if m_stat:
                 out["phase2_oc_status"] = (m_stat.group(1) or "").strip()
         else:
-            out["phase2_notes"].append(f"oc_fetch_http_{st}")
+            notes.append(f"oc_fetch_http_{st}")
     else:
-        out["phase2_notes"].append(f"oc_no_url_{oc.get('notes')}")
+        notes.append(f"oc_no_url_{oc.get('notes')}")
 
-    out["phase2_notes"] = ";".join([n for n in out["phase2_notes"] if n])[:500]
+    out["phase2_notes"] = ";".join([n for n in notes if n])[:500]
     return out
