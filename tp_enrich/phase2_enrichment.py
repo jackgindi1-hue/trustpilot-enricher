@@ -405,10 +405,40 @@ apply_phase2_fallbacks_logged = apply_phase2_fallbacks
 # ============================================================
 
 def _is_bbb_profile_url(url: str) -> bool:
-    """Only accept BBB business profile URLs, not search/category pages"""
-    if not url:
+    """PATCH 1: Accept BBB /details and other profile variants"""
+    u = (url or "").lower().strip()
+    if "bbb.org/us/" not in u:
         return False
-    u = url.lower().strip()
+
+    # Exclude obvious non-business/profile sitemap/xml and category pages
+    if any(bad in u for bad in [
+        "/sitemap", ".xml", "/category/", "/categories/", "/accreditation", "/reviews", "/complaints",
+        "bbb.org/sitemap", "bbb.org/file-a-complaint", "bbb.org/all/"
+    ]):
+        return False
+
+    # Accept known business profile variants BBB returns from Google/Serp
+    # Examples seen in logs:
+    #  - .../profile/.../xxx/details
+    #  - .../profile/.../xxx
+    #  - sometimes /details without /profile
+    if "/profile/" in u:
+        return True
+    if u.endswith("/details") or "/details" in u:
+        return True
+
+    # Accept "business profile" patterns: bbb.org/us/<state>/<city>/profile/<category>/<name>-<id>
+    # If it has /us/ and looks like a deep path (5+ segments), it's likely a profile page.
+    try:
+        path = u.split("bbb.org", 1)[1]
+        segs = [s for s in path.split("/") if s]
+        if len(segs) >= 6 and segs[0] == "us":
+            return True
+    except Exception:
+        pass
+
+    return False
+
     return ("bbb.org/us/" in u) and ("/profile/" in u)
 
 def find_bbb_profile_url_v2(company: str, city: Optional[str], state: Optional[str], logger=None) -> Dict[str, Any]:
@@ -639,7 +669,17 @@ def find_bbb_profile_url(company: str, city: Optional[str], state: Optional[str]
 
     js = s.get("json") or {}
     organic = js.get("organic_results") or []
-    link = _first_matching_link(organic, "bbb.org/us/")
+    # PATCH 2: Use strict validator + fallback to ANY bbb.org/us/ link
+    candidates = [r.get("link") for r in organic if _is_bbb_profile_url((r.get("link") or "").strip())]
+    if not candidates:
+        # FALLBACK: if we found SOME bbb.org/us/ link that didn't pass strict filter, use first one
+        # This is SAFER than discarding all results (avoids losing valid profiles)
+        fb_candidates = [r.get("link") for r in organic if "bbb.org/us/" in (r.get("link") or "").lower()]
+        if fb_candidates and logger:
+            logger.warning(f"PHASE2 BBB FALLBACK: strict filter found 0, using fallback bbb.org/us/ link")
+        candidates = fb_candidates
+    
+    link = candidates[0] if candidates else None
     return {"attempted": True, "notes": s.get("notes"), "url": link, "serp": s}
 
 def find_yp_url(company: str, city: Optional[str], state: Optional[str], logger=None) -> Dict[str, Any]:
