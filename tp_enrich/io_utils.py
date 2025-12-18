@@ -177,25 +177,46 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
     extras = [c for c in df.columns.tolist() if c not in expected_cols]
     final_cols = expected_cols + extras
     # ============================================================
-    # PHASE 4 CLEANUP: Split all_phones_json into real columns
+    # PHASE 4 CLEANUP: Split all_phones_json into real columns (SAFE NaN handling)
     # ============================================================
     import json
 
-    def _safe_json(x):
+    def _safe_json_dict(x):
+        """Always return a dict, never NaN/float"""
+        if x is None:
+            return {}
+        # pandas NaN comes through as float
         try:
-            if not x:
+            if isinstance(x, float) and pd.isna(x):
                 return {}
-            return json.loads(x) if isinstance(x, str) else (x or {})
+        except Exception:
+            pass
+
+        if isinstance(x, dict):
+            return x
+
+        s = str(x).strip()
+        if not s or s.lower() in ("none", "null", "nan"):
+            return {}
+
+        try:
+            v = json.loads(s)
+            return v if isinstance(v, dict) else {}
         except Exception:
             return {}
 
-    if "all_phones_json" in df.columns:
-        phones = df["all_phones_json"].apply(_safe_json)
-        df["phone_google"] = phones.apply(lambda x: x.get("google") or "")
-        df["phone_yelp"] = phones.apply(lambda x: x.get("yelp") or "")
-        df["phone_website"] = phones.apply(lambda x: x.get("website") or "")
-        df["phone_apollo"] = phones.apply(lambda x: x.get("apollo") or "")
-        logger.info("Split all_phones_json into: phone_google, phone_yelp, phone_website, phone_apollo")
+    # Ensure column exists
+    if "all_phones_json" not in df.columns:
+        df["all_phones_json"] = ""
+
+    phones = df["all_phones_json"].apply(_safe_json_dict)
+
+    df["phone_google"] = phones.apply(lambda d: d.get("google", "") or "")
+    df["phone_yelp"] = phones.apply(lambda d: d.get("yelp", "") or "")
+    df["phone_website"] = phones.apply(lambda d: d.get("website", "") or "")
+    df["phone_apollo"] = phones.apply(lambda d: d.get("apollo", "") or "")
+
+    logger.info("Split all_phones_json into: phone_google, phone_yelp, phone_website, phone_apollo")
 
     # ============================================================
     # PHASE 4 CLEANUP: Rename enrichment_notes -> debug_notes
