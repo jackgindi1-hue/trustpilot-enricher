@@ -339,7 +339,7 @@ def job_download(job_id: str):
     """
     Download enriched CSV for completed job (PHASE 4)
 
-    CRITICAL: Only returns CSV when job.status == "done"
+    CRITICAL: NEVER returns CSV unless status == "done"
     Returns 409 (Conflict) JSON if job is still running/queued/error
 
     Args:
@@ -348,51 +348,38 @@ def job_download(job_id: str):
     Returns:
         CSV file download OR JSON error
     """
+    # Read job metadata
     meta = read_meta(job_id) or {}
     status = (meta.get("status") or "").lower().strip()
 
-    # ✅ HARD GUARD: Do not return CSV until job is actually done
+    # ✅ HARD GUARD: NEVER return CSV unless status == "done"
     if status != "done":
         logger.warning(f"Download attempt for job {job_id} with status={status} (not done)")
         return JSONResponse(
-            {
-                "error": "not_ready",
-                "status": status or "unknown",
-                "note": "Job not finished. Poll GET /jobs/{id} until status=='done' then download.",
-                "job_id": job_id,
-                "current_progress": meta.get("progress", 0),
-                "stage": meta.get("stage", "unknown")
-            },
+            {"error": "not_ready", "job_id": job_id, "status": status or "unknown"},
             status_code=409,
-            headers={
-                "Content-Type": "application/json",  # Explicit: this is NOT a CSV
-                "X-Job-Status": status or "unknown"
-            }
+            headers={"Content-Type": "application/json"}
         )
 
-    _, _, out_path = job_paths(job_id)
-    if not os.path.exists(out_path):
-        logger.error(f"Job {job_id} marked done but output file missing: {out_path}")
+    # Get output CSV path
+    _, _, out_csv_path = job_paths(job_id)
+
+    # Check file exists
+    if not out_csv_path or not os.path.exists(out_csv_path):
+        logger.error(f"Job {job_id} marked done but output file missing: {out_csv_path}")
         return JSONResponse(
-            {
-                "error": "missing_output",
-                "job_id": job_id,
-                "note": "Job completed but output file not found. Contact support."
-            },
+            {"error": "missing_output", "job_id": job_id, "status": status},
             status_code=404,
             headers={"Content-Type": "application/json"}
         )
 
-    # ✅ Return actual CSV file
-    logger.info(f"Serving CSV download for job {job_id}: {out_path}")
+    # ✅ Return actual CSV file (only reaches here if status == "done")
+    logger.info(f"Serving CSV download for job {job_id}: {out_csv_path}")
     return FileResponse(
-        path=out_path,
+        path=out_csv_path,
         media_type="text/csv",
         filename=f"enriched-{job_id}.csv",
-        headers={
-            "Content-Type": "text/csv",  # Explicit CSV
-            "X-Job-Status": "done"
-        }
+        headers={"Content-Type": "text/csv", "X-Job-Status": "done"}
     )
 
 
