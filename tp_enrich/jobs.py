@@ -1,8 +1,12 @@
 """
 Job tracking system for async enrichment
 """
+from __future__ import annotations
+
 import os, json, uuid, time
-from typing import Dict, Any, Optional
+import threading
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, List
 
 _JOBS_DIR = os.getenv("JOBS_DIR", "/tmp/tp_jobs")
 
