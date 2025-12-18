@@ -20,6 +20,7 @@ from . import local_enrichment
 from .email_enrichment import enrich_emails_for_domain
 from .phone_enrichment import enrich_business_phone_waterfall
 from .merge_results import merge_enrichment_results
+from .phase2_final import true_email_waterfall, phase2_enrich
 
 logger = setup_logger(__name__)
 
@@ -233,33 +234,26 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     row["phone_confidence"] = phone_layer.get("primary_phone_confidence")
     row["all_phones_json"] = phone_layer.get("all_phones_json")
     # ============================================================
-    # EMAIL WATERFALL (Hunter → Snov → Apollo → FullEnrich)
+    # WIRING EDIT 2 — EMAIL WATERFALL (STOP ON WINNER)
     # ============================================================
-    from tp_enrich.email_enrichment import run_email_waterfall
-    logger.info(f"   -> Email enrichment (Hunter → Snov → Apollo → FullEnrich) for {name} domain={domain}")
-    email_result = run_email_waterfall(domain, logger=logger, company_name=name)
-    # Always log one line proving what happened (super useful for debugging credits)
-    # Use self-proving fields from run_email_waterfall (these CANNOT be blank)
-    logger.info(f"   -> Email providers attempted: {email_result.get('email_waterfall_tried')}")
-    logger.info(f"   -> Email waterfall tracking: tried={email_result.get('email_waterfall_tried')} winner={email_result.get('email_waterfall_winner')}")
-    primary_email = email_result.get("primary_email")
-    primary_email_source = email_result.get("primary_email_source")
-    primary_email_confidence = email_result.get("primary_email_confidence")
-    logger.info(f"   -> Email enrichment complete: primary_email={primary_email} source={primary_email_source} confidence={primary_email_confidence}")
-    # Make sure you store these into row so they get returned
+    logger.info(f"   -> Email enrichment (STOP-ON-WINNER) for {name} domain={domain}")
+    wf = true_email_waterfall(domain=domain, company=name, logger=logger)
+    primary_email = wf.get("primary_email")
+    primary_email_source = wf.get("email_source")
+    primary_email_confidence = wf.get("email_confidence")
+    email_type = wf.get("email_type")
+    email_providers_attempted = ",".join(wf.get("tried") or [])
+
+    logger.info(f"   -> Email waterfall complete: email={primary_email} source={primary_email_source} confidence={primary_email_confidence} tried={email_providers_attempted}")
+
+    # Store into row
     row["primary_email"] = primary_email
     row["primary_email_source"] = primary_email_source
     row["primary_email_confidence"] = primary_email_confidence
-    # SELF-PROVING WATERFALL TRACKING: These fields come directly from run_email_waterfall
-    row["email_waterfall_tried"] = email_result.get("email_waterfall_tried", "")
-    row["email_waterfall_winner"] = email_result.get("email_waterfall_winner")
-    row["provider_status_json"] = email_result.get("provider_status_json", "{}")
-    # CRITICAL: Ensure primary_email_source is correctly mapped
-    # CSV writer expects: primary_email_source (NOT email_source)
-    if row.get("email_source") and not row.get("primary_email_source"):
-        row["primary_email_source"] = row["email_source"]
+    row["email_type"] = email_type
+    row["email_providers_attempted"] = email_providers_attempted
     # ============================================================
-    # END EMAIL WATERFALL
+    # END WIRING EDIT 2
     # ============================================================
     # ============================================================
     # PHASE 2: Apply fallback enrichment for phone/website coverage
@@ -314,31 +308,22 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
     logger.info(f"   -> Phase 2 fallbacks complete")
 
     # ============================================================
-    # PHASE 2 DATA ENRICHMENT - HOTFIX v2
-    # Fixes: Hunter key detection, YP category pages, data extraction
+    # WIRING EDIT 3 — PHASE 2 ENRICH (DATA NOT URLS)
     # ============================================================
-    from tp_enrich.phase2_enrichment import apply_phase2_data_enrichment_SAFE
-    logger.info(f"   -> Applying Phase 2 data enrichment (HOTFIX v2 + ANTI-CRASH) for {name}")
+    try:
+        logger.info(f"   -> Applying Phase 2 data enrichment (FINAL PATCH) for {name}")
+        p2_data = phase2_enrich(company=name, google_payload=google_payload, logger=logger)
 
-    p2_data = apply_phase2_data_enrichment_SAFE(
-        company=name,
-        google_payload=google_payload,
-        logger=logger
-    )
+        # Merge Phase 2 data into row
+        row.update(p2_data)
 
-    # Store extracted contact data (with website fields)
-    row["phase2_bbb_phone"] = p2_data.get("phase2_bbb_phone")
-    row["phase2_bbb_email"] = p2_data.get("phase2_bbb_email")
-    row["phase2_bbb_website"] = p2_data.get("phase2_bbb_website")
-    row["phase2_bbb_names"] = p2_data.get("phase2_bbb_names", [])
-    row["phase2_yp_phone"] = p2_data.get("phase2_yp_phone")
-    row["phase2_yp_email"] = p2_data.get("phase2_yp_email")
-    row["phase2_yp_website"] = p2_data.get("phase2_yp_website")
-    row["phase2_yp_names"] = p2_data.get("phase2_yp_names", [])
-
-    logger.info(f"   -> Phase 2 data enrichment (HOTFIX v2 + ANTI-CRASH) complete")
+        logger.info(f"   -> Phase 2 data enrichment complete: bbb_phone={bool(p2_data.get('phase2_bbb_phone'))} yp_phone={bool(p2_data.get('phase2_yp_phone'))} notes={p2_data.get('phase2_notes')}")
+    except Exception as e:
+        logger.exception(f"Phase 2 data enrichment failed (non-fatal): {repr(e)}")
+        # Set safe defaults so CSV doesn't break
+        row["phase2_notes"] = f"exception_{repr(e)}"
     # ============================================================
-    # END PHASE 2
+    # END WIRING EDIT 3
     # ============================================================
     row["confidence"] = _compute_confidence(row)
     return row
@@ -443,9 +428,9 @@ def run_pipeline(
     # ============================================================
     # PATCH 1 — HOTFIX v3: Ensure raw_display_name populated + safer classification
     # ============================================================
-    def _pick_first_existing_col(df_inner, candidates):
+    def _pick_first_existing_col(df, candidates):
         for c in candidates:
-            if c in df_inner.columns:
+            if c in df.columns:
                 return c
         return None
 
@@ -480,12 +465,12 @@ def run_pipeline(
 
     # --- classification hardening: business by default ---
     # Only classify as person when it's very likely a human name; otherwise business.
-    import re as re_classify
+    import re
 
-    _PERSON_RE = re_classify.compile(r"^[A-Za-z]+(?:\s+[A-Za-z]+){0,2}$")  # "John" / "John Smith" / "John A Smith"
-    _BUSINESS_HINTS = re_classify.compile(
+    _PERSON_RE = re.compile(r"^[A-Za-z]+(?:\s+[A-Za-z]+){0,2}$")  # "John" / "John Smith" / "John A Smith"
+    _BUSINESS_HINTS = re.compile(
         r"\b(llc|inc|ltd|corp|co\.?|company|pllc|pc|lp|llp|construction|roof|roofing|plumbing|electric|hvac|transport|trucking|logistics|restaurant|cafe|bakery|fitness|gym|auto|detailing|repair|sewer|drain|florist|shop|store|market|bar|grill|salon|spa)\b",
-        re_classify.I,
+        re.I,
     )
 
     def classify_name_sane(s: str) -> str:
@@ -497,11 +482,11 @@ def run_pipeline(
             return "person"
         return "business"
 
-    # Classify each row with new safer logic
+    # Classify each row
     logger.info("Step 2: Classifying display names (HOTFIX v3)...")
     df["name_classification"] = df["raw_display_name"].apply(classify_name_sane)
     classification_counts = df['name_classification'].value_counts()
-    logger.info(f"  Classification results: {dict(classification_counts)}")
+    logger.info(f"  Classification results (HOTFIX v3): {dict(classification_counts)}")
 
     # If somehow everything is still "other" from older code paths, force business
     if (df["name_classification"] == "other").all():
@@ -510,7 +495,6 @@ def run_pipeline(
     # ============================================================
     # END PATCH 1 — HOTFIX v3
     # ============================================================
-
     # ============================================================
     # POST-CLASSIFICATION OVERRIDES (business pattern boosts)
     # ============================================================
@@ -677,8 +661,8 @@ def run_pipeline(
     # ============================================================
     # Write final CSV
     logger.info("Step 7: Writing output CSV...")
-    output_schema = get_output_schema(df)
-    write_output_csv(output_csv_path, df, output_schema)
+    output_schema = get_output_schema()
+    write_output_csv(df, output_csv_path, output_schema)
     # Calculate statistics
     stats = {
         'total_rows': len(df),
