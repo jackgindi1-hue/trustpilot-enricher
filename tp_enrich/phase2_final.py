@@ -219,24 +219,31 @@ def email_waterfall_enrich(company: str, domain: Optional[str], person_name: Opt
     if logger:
         logger.info("EMAIL WATERFALL: Hunter returned 0 emails -> continuing to Snov/Apollo/FullEnrich for MAX coverage")
 
-    # ---- SNOV (import from email_enrichment if exists)
+    # ---- SNOV (skip fast if not wired - Diff1)
     tried.append("snov")
     try:
         from .email_enrichment import snov_domain_search
+        if not callable(snov_domain_search):
+            raise ImportError("snov_domain_search not callable")
         snov_res = snov_domain_search(domain=domain, logger=logger)
         snov_emails = (snov_res.get("emails") or [])
         if snov_emails:
             if logger:
                 logger.info("EMAIL WATERFALL: Snov found email -> STOPPING")
             return _done(snov_emails[0], "snov", "generic")
+    except (ImportError, AttributeError) as e:
+        if logger:
+            logger.warning(f"EMAIL WATERFALL: Snov not wired -> skipping")
     except Exception as e:
         if logger:
             logger.warning(f"EMAIL WATERFALL: Snov failed: {repr(e)}")
 
-    # ---- APOLLO (import from email_enrichment if exists)
+    # ---- APOLLO (skip fast if not wired - Diff1)
     tried.append("apollo")
     try:
         from .email_enrichment import apollo_domain_search
+        if not callable(apollo_domain_search):
+            raise ImportError("apollo_domain_search not callable")
         apollo_res = apollo_domain_search(domain=domain, logger=logger)
         apollo_emails = (apollo_res.get("emails") or [])
         if apollo_emails:
@@ -277,21 +284,72 @@ true_email_waterfall = email_waterfall_enrich
 # -----------------------------
 
 def serpapi_google_search(query: str, logger=None) -> Dict[str, Any]:
+    """DiffA: Pooled + cached + limited SerpApi calls"""
     key = _env_first("SERP_API_KEY", "SERPAPI_API_KEY", "SERPAPI_KEY")
     if not key:
         return {"attempted": False, "notes": "missing_serp_key", "json": None}
 
-    url = "https://serpapi.com/search.json"
-    params = {"engine": "google", "q": query, "api_key": key}
+    qn = (query or "").strip()
+
+    # Try cache first
     try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
+        from tp_enrich.fast_cache import cache_get_ttl, cache_set_ttl
+        ck = "serp:" + qn.lower()
+        hit = cache_get_ttl(ck, ttl_s=86400)
+        if hit:
+            return {"attempted": True, "notes": "ok_cache", "json": hit}
+    except ImportError:
+        pass  # cache not available, continue without it
+
+    # Use pooled session + semaphore if available
+    try:
+        from tp_enrich.http_pool import get_session
+        from tp_enrich.provider_limits import sem
+        from tp_enrich.net_guard import request_with_retry
+
+        s = get_session()
+        limiter = sem("serpapi")
+
+        def _do():
+            if limiter:
+                with limiter:
+                    return s.get("https://serpapi.com/search.json",
+                                 params={"engine": "google", "q": qn, "api_key": key},
+                                 timeout=20)
+            return s.get("https://serpapi.com/search.json",
+                         params={"engine": "google", "q": qn, "api_key": key},
+                         timeout=20)
+
+        r = request_with_retry(_do, logger=logger, tries=4, base_sleep=0.4, max_sleep=4.0)
+        if not r or r.status_code != 200:
             if logger:
-                logger.warning(f"SerpApi google failed: status={r.status_code} body={r.text[:200]}")
-            return {"attempted": True, "notes": f"http_{r.status_code}", "json": None}
-        return {"attempted": True, "notes": "ok", "json": (r.json() or {})}
-    except Exception as e:
-        return {"attempted": True, "notes": f"exception_{repr(e)}", "json": None}
+                logger.warning(f"SerpApi google failed: status={getattr(r,'status_code',None)}")
+            return {"attempted": True, "notes": f"http_{getattr(r,'status_code',None)}", "json": None}
+
+        js = (r.json() or {})
+
+        # Cache result
+        try:
+            from tp_enrich.fast_cache import cache_set_ttl
+            cache_set_ttl(ck, js)
+        except ImportError:
+            pass
+
+        return {"attempted": True, "notes": "ok", "json": js}
+
+    except ImportError:
+        # Fallback to basic requests if Phase 3 modules not available
+        url = "https://serpapi.com/search.json"
+        params = {"engine": "google", "q": qn, "api_key": key}
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code != 200:
+                if logger:
+                    logger.warning(f"SerpApi google failed: status={r.status_code} body={r.text[:200]}")
+                return {"attempted": True, "notes": f"http_{r.status_code}", "json": None}
+            return {"attempted": True, "notes": "ok", "json": (r.json() or {})}
+        except Exception as e:
+            return {"attempted": True, "notes": f"exception_{repr(e)}", "json": None}
 
 # -----------------------------
 # URL PICKERS (BBB / YP / OC)
@@ -541,3 +599,43 @@ def phase2_enrich(company: str, google_payload: Dict[str, Any], logger=None) -> 
 
     out["phase2_notes"] = ";".join([n for n in notes if n])[:500]
     return out
+
+# ============================================================
+# Phase 3: Sanitizer for Excel control chars (DiffD support)
+# ============================================================
+import re as _re_sanitize
+import json as _json_sanitize
+_CTRL = _re_sanitize.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+def safe_json_cell(v):
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            v = v.decode("utf-8", errors="ignore")
+        except Exception:
+            v = str(v)
+    if isinstance(v, (dict, list)):
+        s = _json_sanitize.dumps(v, ensure_ascii=False)
+    else:
+        s = str(v)
+    s = _CTRL.sub("", s)
+    return s
+
+# ============================================================
+# Phase 3: DiffA - extract names from Serp organic
+# ============================================================
+def _extract_names_from_serp_organic(organic_results):
+    names = []
+    for r in (organic_results or [])[:8]:
+        t = (r.get("title") or "").strip()
+        if t:
+            names.append(t[:120])
+    out = []
+    seen = set()
+    for n in names:
+        k = n.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(n)
+    return out[:5]
