@@ -4,6 +4,8 @@ Provides HTTP endpoint for CSV upload and enrichment
 """
 
 import os
+import io
+import csv
 import shutil
 import tempfile
 import threading
@@ -26,6 +28,19 @@ from tp_enrich.progress import set_job_status, set_job_progress, make_job_logger
 load_dotenv()
 
 logger = setup_logger(__name__)
+
+# ============================================================
+# FIX: Auto-upgrade large jobs to async mode (prevents timeouts)
+# ============================================================
+MAX_SYNC_ROWS = int(os.getenv("MAX_SYNC_ROWS", "25"))  # keep /enrich for small jobs only
+
+def _count_rows(csv_bytes: bytes) -> int:
+    """Count CSV rows (minus header) to determine if job should be async"""
+    try:
+        s = csv_bytes.decode("utf-8", errors="ignore")
+        return max(0, len(list(csv.reader(io.StringIO(s)))) - 1)  # minus header
+    except Exception:
+        return 999999  # treat as large on parse error
 
 # Create FastAPI app
 app = FastAPI(
@@ -85,6 +100,47 @@ async def enrich_csv(
 
     logger.info(f"Received enrichment request for file: {file.filename}")
 
+    # Read CSV bytes first
+    csv_bytes = await file.read()
+
+    # ============================================================
+    # AUTO-UPGRADE LARGE JOBS TO ASYNC MODE (prevents timeouts)
+    # ============================================================
+    rows = _count_rows(csv_bytes)
+    logger.info(f"CSV has {rows} rows (MAX_SYNC_ROWS={MAX_SYNC_ROWS})")
+
+    if rows > MAX_SYNC_ROWS:
+        # Create async job instead of holding the request open
+        job_id = new_job_id()
+        config = {}
+        if lender_name_override:
+            config['lender_name_override'] = lender_name_override
+
+        set_job_status(job_id, "queued", {
+            "stage": "queued",
+            "note": f"auto_upgraded_sync_limit_{MAX_SYNC_ROWS}",
+            "rows": rows,
+            "filename": file.filename
+        })
+
+        t = threading.Thread(
+            target=_run_job_thread,
+            args=(job_id, csv_bytes, config),
+            daemon=True
+        )
+        t.start()
+
+        logger.info(f"Auto-upgraded to async job {job_id} (rows={rows} > {MAX_SYNC_ROWS})")
+        return JSONResponse(
+            {"job_id": job_id, "status": "queued", "mode": "async", "rows": rows},
+            status_code=202
+        )
+
+    # ============================================================
+    # SYNC MODE (small jobs only)
+    # ============================================================
+    logger.info(f"Running sync enrichment (rows={rows} <= {MAX_SYNC_ROWS})")
+
     # Create temp directory for processing
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir_path = Path(temp_dir)
@@ -97,8 +153,7 @@ async def enrich_csv(
         try:
             # Write uploaded file to disk
             with open(input_path, 'wb') as f:
-                contents = await file.read()
-                f.write(contents)
+                f.write(csv_bytes)
 
             logger.info(f"Saved input file: {input_path}")
 
@@ -189,7 +244,8 @@ def _run_job_thread(job_id: str, csv_bytes: bytes, config: dict):
 @app.post("/jobs")
 async def create_job(
     file: UploadFile = File(..., description="Trustpilot CSV file to enrich"),
-    lender_name_override: Optional[str] = Form(None, description="Optional: Override source_lender_name for all rows")
+    lender_name_override: Optional[str] = Form(None, description="Optional: Override source_lender_name for all rows"),
+    concurrency: Optional[int] = Form(8, description="Concurrency level (default: 8)")
 ):
     """
     Create async enrichment job (PHASE 4)
@@ -207,19 +263,21 @@ async def create_job(
 
     job_id = new_job_id()
     csv_bytes = await file.read()
+    rows = _count_rows(csv_bytes)
 
     config = {}
     if lender_name_override:
         config['lender_name_override'] = lender_name_override
+    config['concurrency'] = int(concurrency or 8)
 
-    set_job_status(job_id, "queued", {"stage": "queued", "filename": file.filename})
+    set_job_status(job_id, "queued", {"stage": "queued", "filename": file.filename, "rows": rows})
 
     # Start background thread
     t = threading.Thread(target=_run_job_thread, args=(job_id, csv_bytes, config), daemon=True)
     t.start()
 
-    logger.info(f"Created job {job_id} for file {file.filename}")
-    return {"job_id": job_id, "status": "queued"}
+    logger.info(f"Created job {job_id} for file {file.filename} (rows={rows}, concurrency={config['concurrency']})")
+    return {"job_id": job_id, "status": "queued", "rows": rows}
 
 
 @app.get("/jobs/{job_id}")
