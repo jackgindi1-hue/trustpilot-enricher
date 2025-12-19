@@ -1,1 +1,1 @@
-$(cat /tmp/pipeline_new.py)
+$(cat /tmp/pipeline.py)
