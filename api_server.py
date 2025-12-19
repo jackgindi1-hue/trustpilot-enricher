@@ -49,25 +49,15 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Configure CORS - Allow frontend origin
-allowed_origins = [
-    'https://same-ds94u6p1ays-latest.netlify.app',
-    'http://localhost:3000',
-    'http://localhost:5173',
-]
-
-# Add custom origin from env var if set
-frontend_origin = os.getenv('FRONTEND_ORIGIN')
-if frontend_origin and frontend_origin not in allowed_origins:
-    allowed_origins.append(frontend_origin)
-
+# Configure CORS - Allow all origins for polling resilience
+# PHASE 4 HOTFIX: Use ["*"] to prevent "failed to fetch" during transient 502/503/cold-start
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],  # Allow all origins (can restrict to specific domains later if needed)
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition", "Content-Type"],  # PHASE 4 CLEANUP: Fix download CORS
+    expose_headers=["Content-Disposition", "Content-Type"],
 )
 
 

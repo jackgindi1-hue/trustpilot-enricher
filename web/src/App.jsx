@@ -88,16 +88,33 @@ function App() {
       console.log(`✅ Job created: ${jobId}`)
       setStatus('running')
 
-      // 2) POLL STATUS UNTIL DONE
+      // 2) POLL STATUS UNTIL DONE (resilient polling with transient failure tolerance)
       let pollCount = 0
+      let pollFails = 0
       const maxPolls = 600 // 10 minutes
 
       while (pollCount < maxPolls) {
         await new Promise(r => setTimeout(r, 1000))
         pollCount++
 
-        const statusRes = await fetch(`${config.API_BASE_URL}/jobs/${jobId}`)
-        const meta = await statusRes.json()
+        let meta = {}
+        try {
+          const statusRes = await fetch(`${config.API_BASE_URL}/jobs/${jobId}`, { cache: 'no-store' })
+          if (!statusRes.ok) {
+            const txt = await statusRes.text().catch(() => '')
+            throw new Error(`poll_http_${statusRes.status}:${txt.slice(0, 120)}`)
+          }
+          meta = await statusRes.json().catch(() => ({}))
+          pollFails = 0 // reset on successful poll
+        } catch (e) {
+          pollFails += 1
+          console.log(`Poll glitch (${pollFails}/12): ${String(e).slice(0, 160)}`)
+          setStatus(`running (retrying poll ${pollFails}/12...)`)
+          // tolerate up to 12 consecutive failures (~18-30 seconds)
+          if (pollFails >= 12) throw e
+          await new Promise(r => setTimeout(r, 1500))
+          continue
+        }
 
         const jobStatus = (meta.status || '').toLowerCase()
         const progress = meta.progress || 0
