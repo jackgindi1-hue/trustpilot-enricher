@@ -226,6 +226,18 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
         df = df.drop(columns=["enrichment_notes"])
         logger.info("Renamed enrichment_notes -> debug_notes")
 
+    # ============================================================
+    # PHASE 4 RELIABILITY HOTFIX: Ensure debug_notes exists
+    # ============================================================
+    if "debug_notes" not in df.columns:
+        # Backfill from enrichment_notes if still present, otherwise create empty
+        if "enrichment_notes" in df.columns:
+            df["debug_notes"] = df["enrichment_notes"].astype("string")
+            logger.info("Backfilled debug_notes from enrichment_notes")
+        else:
+            df["debug_notes"] = ""
+            logger.info("Created empty debug_notes column")
+
     # Sanity log
     try:
         phones = int(df["primary_phone"].notna().sum())
@@ -250,8 +262,25 @@ def write_output_csv(df, output_path: str, *args, **kwargs):
                 .replace("None", "")
             )
 
+    # ============================================================
+    # PHASE 4 RELIABILITY HOTFIX: Safe column export (prevents KeyError)
+    # ============================================================
+    # 1) Replace enrichment_notes with debug_notes in column list if present
+    if isinstance(final_cols, (list, tuple)):
+        final_cols = [("debug_notes" if c == "enrichment_notes" else c) for c in final_cols]
+
+    # 2) Only export columns that actually exist (prevents KeyError on schema mismatch)
+    final_cols_existing = [c for c in final_cols if c in df.columns]
+    missing_cols = [c for c in final_cols if c not in df.columns]
+
+    # 3) Log missing columns (helps debug schema issues)
+    if missing_cols:
+        logger.warning(f"Export: dropping {len(missing_cols)} missing columns: {missing_cols[:10]}")  # limit to first 10
+
+    logger.info(f"Export: writing {len(final_cols_existing)}/{len(final_cols)} columns")
+
     # PHASE 4 CLEANUP: Write with na_rep="" to avoid "none" in CSV
-    df.to_csv(output_path, index=False, columns=final_cols, encoding="utf-8", na_rep="")
+    df.to_csv(output_path, index=False, columns=final_cols_existing, encoding="utf-8", na_rep="")
     logger.info(f"Successfully wrote {len(df)} rows to {output_path}")
 def get_output_schema(df=None):
     """
