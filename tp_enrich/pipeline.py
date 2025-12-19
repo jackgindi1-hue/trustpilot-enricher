@@ -29,6 +29,15 @@ from .entity_match import normalize_company_key
 from .retry_ratelimit import SimpleRateLimiter, with_retry
 
 logger = setup_logger(__name__)
+
+# ============================================================
+# PHASE 4 SAFE PATCH: Phase2/OpenCorporates export columns
+# ============================================================
+PHASE2_OC_EXPORT_COLS = [
+    "phase2_bbb_phone", "phase2_bbb_email", "phase2_bbb_website", "phase2_bbb_names",
+    "phase2_yp_phone", "phase2_yp_email", "phase2_yp_website", "phase2_yp_names",
+    "oc_company_name", "oc_jurisdiction", "oc_company_number", "oc_incorporation_date", "oc_match_confidence",
+]
 _rate = SimpleRateLimiter(min_interval_s=0.2)
 
 def _safe_str(x):
@@ -151,6 +160,17 @@ def merge_enrichment_back_to_rows(df: pd.DataFrame, enriched_businesses: list) -
         "enrichment_status",
         "enrichment_notes",
     ]
+
+    # ============================================================
+    # PHASE 4 SAFE PATCH: Add Phase2/OpenCorporates columns to merge
+    # ============================================================
+    for col in PHASE2_OC_EXPORT_COLS:
+        if col not in wanted:
+            wanted.append(col)
+
+    logger.info(f"Added Phase2/OC columns to merge: {PHASE2_OC_EXPORT_COLS}")
+    # ============================================================
+
     present = [c for c in wanted if c in biz_df.columns]
     logger.info("  Merging %d enrichment columns: %s", len(present), present)
     # Prepare minimal merge frame
@@ -445,6 +465,25 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache, run_id: str = N
         "source_platform": "trustpilot",
         # RUN_ID for tracing this enrichment run
         "run_id": run_id or "",
+        # ============================================================
+        # PHASE 4 SAFE PATCH: Phase2/OpenCorporates data mapping
+        # ============================================================
+        # BBB data (support both phase2_* and legacy bbb_* keys)
+        "phase2_bbb_phone": enriched_data.get("phase2_bbb_phone") or enriched_data.get("bbb_phone") or "",
+        "phase2_bbb_email": enriched_data.get("phase2_bbb_email") or enriched_data.get("bbb_email") or "",
+        "phase2_bbb_website": enriched_data.get("phase2_bbb_website") or enriched_data.get("bbb_website") or "",
+        "phase2_bbb_names": enriched_data.get("phase2_bbb_names") or enriched_data.get("bbb_names") or enriched_data.get("phase2_bbb_names_json") or "",
+        # YellowPages data
+        "phase2_yp_phone": enriched_data.get("phase2_yp_phone") or enriched_data.get("yp_phone") or "",
+        "phase2_yp_email": enriched_data.get("phase2_yp_email") or enriched_data.get("yp_email") or "",
+        "phase2_yp_website": enriched_data.get("phase2_yp_website") or enriched_data.get("yp_website") or "",
+        "phase2_yp_names": enriched_data.get("phase2_yp_names") or enriched_data.get("yp_names") or enriched_data.get("phase2_yp_names_json") or "",
+        # OpenCorporates data
+        "oc_company_name": enriched_data.get("oc_company_name") or "",
+        "oc_jurisdiction": enriched_data.get("oc_jurisdiction") or "",
+        "oc_company_number": enriched_data.get("oc_company_number") or "",
+        "oc_incorporation_date": enriched_data.get("oc_incorporation_date") or "",
+        "oc_match_confidence": enriched_data.get("oc_match_confidence") or "",
     }
     # Save to cache
     cache.set(normalized_key, enriched_row)
