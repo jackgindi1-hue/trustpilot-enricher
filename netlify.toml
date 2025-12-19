@@ -1,0 +1,14 @@
+[build]
+  base = "web"
+  command = "bun install && bun run build"
+  publish = "web/dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# Force fresh build (no cache)
+[[plugins]]
+  package = "netlify-plugin-cache-control"
+  
+  [plugins.inputs]
+    include = ["/_app/*", "/_next/*"]
