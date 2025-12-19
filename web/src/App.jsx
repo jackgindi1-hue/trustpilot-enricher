@@ -2,7 +2,8 @@ import { useState } from 'react'
 import config from './config'
 import './App.css'
 
-// Force rebuild - Phase 4 UI updates
+// PHASE 4 DEPLOY - Version 1766174734
+// BUILD TIMESTAMP: 2025-12-19 20:05 UTC
 
 function App() {
   const [file, setFile] = useState(null)
