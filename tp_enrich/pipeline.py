@@ -485,6 +485,123 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache, run_id: str = N
         "oc_incorporation_date": enriched_data.get("oc_incorporation_date") or "",
         "oc_match_confidence": enriched_data.get("oc_match_confidence") or "",
     }
+
+    # ============================================================
+    # PHASE 4 PATCH: Phase2 Output Sanitizer (BBB/YP/OC)
+    # Prevent Phase2 from polluting CSV with garbage values
+    # ============================================================
+    import re
+    from urllib.parse import urlparse
+
+    BAD_EMAIL_DOMAINS = {"bbb.org", "mybbb.org"}
+    BAD_WEBSITE_DOMAINS = {
+        "cdn.mouseflow.com", "mouseflow.com", "googletagmanager.com",
+        "google-analytics.com", "doubleclick.net", "bbb.org",
+        "www.bbb.org", "mybbb.org", "www.mybbb.org",
+    }
+
+    def _domain_of(url: str) -> str:
+        try:
+            u = (url or "").strip()
+            if not u:
+                return ""
+            if not re.match(r"^https?://", u, re.I):
+                u = "http://" + u
+            return (urlparse(u).netloc or "").lower().strip()
+        except Exception:
+            return ""
+
+    def _is_bad_email(email: str) -> bool:
+        e = (email or "").strip().lower()
+        if not e or "@" not in e:
+            return False
+        dom = e.split("@")[-1]
+        return dom in BAD_EMAIL_DOMAINS
+
+    def _is_bad_website(url: str) -> bool:
+        d = _domain_of(url)
+        if not d:
+            return False
+        if d in BAD_WEBSITE_DOMAINS:
+            return True
+        # block obvious tracker/script "websites"
+        if any(x in d for x in ["mouseflow", "googletagmanager", "google-analytics", "doubleclick"]):
+            return True
+        return False
+
+    def _looks_like_bbb_profile_phone(phone: str) -> bool:
+        """
+        BBB profile IDs look like 0443-91843895. Some parsers turn 4439184389 into a phone.
+        We reject suspicious "phone" if it matches pattern derived from BBB profile IDs.
+        """
+        p = re.sub(r"\D+", "", (phone or ""))
+        return len(p) == 10 and p.startswith(("443", "0443"))
+
+    def _append_debug(base_out: dict, msg: str):
+        key = "debug_notes" if "debug_notes" in base_out else ("enrichment_notes" if "enrichment_notes" in base_out else "debug_notes")
+        cur = (base_out.get(key) or "").strip()
+        if not cur:
+            base_out[key] = msg
+        else:
+            if msg not in cur:
+                base_out[key] = cur + " | " + msg
+
+    # Sanitize BBB fields
+    bbb_email = enriched_row.get("phase2_bbb_email") or ""
+    bbb_site = enriched_row.get("phase2_bbb_website") or ""
+    bbb_phone = enriched_row.get("phase2_bbb_phone") or ""
+    bbb_names = enriched_row.get("phase2_bbb_names")
+
+    changed = False
+
+    # Blank BBB email if it's BBB-owned
+    if _is_bad_email(bbb_email):
+        enriched_row["phase2_bbb_email"] = ""
+        _append_debug(enriched_row, "phase2_bbb_email_sanitized(bbb_domain)")
+        changed = True
+
+    # Blank BBB website if it's a tracker or BBB domain
+    if _is_bad_website(bbb_site):
+        enriched_row["phase2_bbb_website"] = ""
+        _append_debug(enriched_row, "phase2_bbb_website_sanitized(tracker_or_bbb)")
+        changed = True
+
+    # Blank BBB names if it's just [] or empty list string
+    if bbb_names in (None, "", "[]", [], {}, "none", "None"):
+        enriched_row["phase2_bbb_names"] = ""
+        if bbb_names == "[]":
+            _append_debug(enriched_row, "phase2_bbb_names_empty")
+            changed = True
+
+    # If BBB email/website were junk AND phone looks like a profile-id phone, blank it too
+    if (not enriched_row.get("phase2_bbb_email") and not enriched_row.get("phase2_bbb_website")) and _looks_like_bbb_profile_phone(bbb_phone):
+        enriched_row["phase2_bbb_phone"] = ""
+        _append_debug(enriched_row, "phase2_bbb_phone_sanitized(profile_id_artifact)")
+        changed = True
+
+    # Sanitize YP fields (light touch)
+    yp_site = enriched_row.get("phase2_yp_website") or ""
+    if _is_bad_website(yp_site):
+        enriched_row["phase2_yp_website"] = ""
+        _append_debug(enriched_row, "phase2_yp_website_sanitized(tracker)")
+        changed = True
+
+    # Prevent literal 'none' strings
+    for k in [
+        "phase2_bbb_phone", "phase2_bbb_email", "phase2_bbb_website", "phase2_bbb_names",
+        "phase2_yp_phone", "phase2_yp_email", "phase2_yp_website", "phase2_yp_names",
+        "oc_company_name", "oc_jurisdiction", "oc_company_number", "oc_incorporation_date", "oc_match_confidence",
+    ]:
+        v = enriched_row.get(k)
+        if isinstance(v, str) and v.strip().lower() in ("none", "null", "nan"):
+            enriched_row[k] = ""
+
+    if changed:
+        logger.info(f"  -> PHASE2 SANITIZER: cleaned BBB/YP outputs for {company_name}")
+    # ============================================================
+    # END PHASE 4 PATCH: Phase2 Output Sanitizer
+    # ============================================================
+
     # Save to cache
     cache.set(normalized_key, enriched_row)
     logger.info(f"  -> Completed enrichment for {company_name} (confidence: {enriched_row.get('overall_lead_confidence')})")
