@@ -2,6 +2,8 @@ import { useState } from 'react'
 import config from './config'
 import './App.css'
 
+// Force rebuild - Phase 4 UI updates
+
 function App() {
   const [file, setFile] = useState(null)
   const [lenderNameOverride, setLenderNameOverride] = useState('')
