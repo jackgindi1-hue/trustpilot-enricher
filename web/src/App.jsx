@@ -387,6 +387,9 @@ function App() {
         <p>
           Powered by multi-source business data enrichment
         </p>
+        <div style={{ opacity: 0.6, fontSize: 12, marginTop: 12, borderTop: '1px solid rgba(255,255,255,0.2)', paddingTop: 8 }}>
+          🔧 UI Build: <strong>BUILD-2025-12-19-20:10-UTC</strong> | Frontend is LIVE if you see this timestamp
+        </div>
       </footer>
     </div>
   )
