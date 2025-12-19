@@ -40,6 +40,11 @@ PHASE2_OC_EXPORT_COLS = [
 ]
 _rate = SimpleRateLimiter(min_interval_s=0.2)
 
+# ============================================================
+# PHASE 4: Checkpoint configuration for partial CSV exports
+# ============================================================
+CHECKPOINT_EVERY = 250  # Write partial CSV every N businesses (250 = ~10-15 min chunks)
+
 def _safe_str(x):
     """Safely convert value to string, handling None and NaN."""
     if x is None:
@@ -187,6 +192,24 @@ def merge_enrichment_back_to_rows(df: pd.DataFrame, enriched_businesses: list) -
     out = out.drop(columns=["_join_key"], errors="ignore")
     logger.info("  Finished merging enrichment results into %d rows", len(out))
     return out
+
+def _write_checkpoint_csv(df: pd.DataFrame, partial_path: str, logger):
+    """
+    Write partial CSV checkpoint for recovery on error.
+    PHASE 4: Enables "Download partial results" button in UI.
+
+    Args:
+        df: DataFrame with merged enrichment results
+        partial_path: Path to write partial CSV (e.g., job_123.partial.csv)
+        logger: Logger instance
+    """
+    try:
+        from .io_utils import write_output_csv, get_output_schema
+        output_schema = get_output_schema(df)
+        write_output_csv(df, partial_path, output_schema)
+        logger.info(f"✓ CHECKPOINT: Wrote partial CSV → {partial_path}")
+    except Exception as e:
+        logger.warning(f"✗ CHECKPOINT: Failed to write partial CSV: {e}")
 
 def _compute_confidence(row: Dict[str, Any]) -> str:
     """Compute overall confidence based on phone and email presence."""
@@ -814,8 +837,36 @@ def run_pipeline(
                 'overall_lead_confidence': 'failed',
                 'run_id': RUN_ID
             }
+
+        # ============================================================
+        # PHASE 4: Write checkpoint every N businesses (partial CSV)
+        # ============================================================
+        if idx % CHECKPOINT_EVERY == 0:
+            partial_path = output_csv_path.replace(".enriched.csv", ".partial.csv")
+            logger.info(f"  CHECKPOINT: {idx}/{total_businesses} businesses completed, writing partial CSV...")
+            try:
+                # Merge current enrichment results into df for checkpoint
+                df_checkpoint = merge_enrichment_back_to_rows(df.copy(), list(enrichment_results.values()))
+                _write_checkpoint_csv(df_checkpoint, partial_path, logger)
+            except Exception as e:
+                logger.warning(f"  CHECKPOINT: Failed to write partial CSV: {e}")
+        # ============================================================
+
     # Save cache
     cache.save_cache()
+
+    # ============================================================
+    # PHASE 4: Write final checkpoint (ensures partial CSV exists even for small jobs)
+    # ============================================================
+    if enrichment_results:
+        partial_path = output_csv_path.replace(".enriched.csv", ".partial.csv")
+        logger.info(f"  CHECKPOINT (FINAL): Writing final partial CSV with {len(enrichment_results)} businesses...")
+        try:
+            df_final_checkpoint = merge_enrichment_back_to_rows(df.copy(), list(enrichment_results.values()))
+            _write_checkpoint_csv(df_final_checkpoint, partial_path, logger)
+        except Exception as e:
+            logger.warning(f"  CHECKPOINT (FINAL): Failed to write final partial CSV: {e}")
+    # ============================================================
     # Calculate enrichment statistics
     logger.info("="*60)
     logger.info("ENRICHMENT SUMMARY")

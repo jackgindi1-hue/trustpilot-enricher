@@ -9,6 +9,8 @@ function App() {
   const [isProcessing, setIsProcessing] = useState(false)
   const [error, setError] = useState(null)
   const [rowCount, setRowCount] = useState(null)
+  const [currentJobId, setCurrentJobId] = useState(null)
+  const [showPartialDownload, setShowPartialDownload] = useState(false)
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0]
@@ -49,6 +51,8 @@ function App() {
 
     setIsProcessing(true)
     setError(null)
+    setShowPartialDownload(false)
+    setCurrentJobId(null)
     setStatus('uploading')
 
     try {
@@ -86,6 +90,7 @@ function App() {
       }
 
       console.log(`✅ Job created: ${jobId}`)
+      setCurrentJobId(jobId) // Save jobId for partial download
       setStatus('running')
 
       // 2) POLL STATUS UNTIL DONE (resilient polling with transient failure tolerance)
@@ -199,6 +204,11 @@ function App() {
       setError(err.message || 'Enrichment failed. Please try again.')
       setStatus('error')
       setIsProcessing(false)
+
+      // Show partial download button if we have a jobId
+      if (currentJobId) {
+        setShowPartialDownload(true)
+      }
     }
   }
 
@@ -305,37 +315,65 @@ function App() {
                 </>
               )}
             </div>
+
+            {showPartialDownload && currentJobId && (
+              <div className="partial-download-section" style={{ marginTop: '1rem' }}>
+                <button
+                  onClick={() => window.open(`${config.API_BASE_URL}/jobs/${currentJobId}/download?partial=1`, '_blank')}
+                  className="partial-download-button"
+                  style={{
+                    padding: '0.75rem 1.5rem',
+                    backgroundColor: '#f59e0b',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '0.375rem',
+                    cursor: 'pointer',
+                    fontSize: '1rem',
+                    fontWeight: '500'
+                  }}
+                >
+                  📥 Download partial results
+                </button>
+                <p className="help-text" style={{ marginTop: '0.5rem', fontSize: '0.875rem', color: '#6b7280' }}>
+                  Some businesses may have been enriched before the error occurred.
+                </p>
+              </div>
+            )}
           </div>
         </div>
 
         <div className="info-section">
           <h3>How it works</h3>
           <ol>
-            <li>Upload your Trustpilot review CSV file</li>
-            <li>Optionally specify a lender name override</li>
-            <li>Click "Run Enrichment" to create an async job</li>
-            <li>Watch live progress as we enrich your data</li>
-            <li>CSV downloads automatically when complete</li>
+            <li>Upload your Trustpilot review CSV</li>
+            <li>Click <strong>Run Enrichment</strong></li>
+            <li>We create an async job and show live progress</li>
+            <li>When the job finishes, your enriched CSV downloads automatically</li>
+            <li>If there's a temporary network glitch, the UI will keep retrying polling</li>
           </ol>
           <p className="help-text">
-            ℹ️ Using async job system for reliability and progress tracking
+            ℹ️ Runs as a background job for reliability (supports large files and live progress).
           </p>
 
-          <h3>Data Sources</h3>
+          <h3>Data sources (what we try)</h3>
           <ul>
-            <li>🗺️ Google Maps - Phone numbers, addresses</li>
-            <li>⭐ Yelp - Business verification</li>
-            <li>📧 Hunter.io & Snov.io - Email discovery</li>
-            <li>🏢 Apollo & FullEnrich - Company data</li>
-            <li>⚖️ OpenCorporates - Legal verification</li>
+            <li><strong>🗺️ Google Places</strong>: phone, address, website (best source when matched)</li>
+            <li><strong>⭐ Yelp</strong>: backup phone + business verification when Google misses</li>
+            <li><strong>📧 Hunter</strong> + website scan: email discovery (generic + sometimes person emails)</li>
+            <li><strong>🔎 Phase 2 discovery</strong> (select cases): BBB / YellowPages / OpenCorporates lookups
+              <br /><small style={{ color: '#6b7280', fontSize: '0.875rem' }}>→ Only kept when values look valid (we filter out obvious junk like BBB's own emails / tracking domains)</small></li>
           </ul>
 
-          <h3>Output Format</h3>
-          <p>
-            The enriched CSV includes 36 columns with classification results,
-            primary contact info, all discovered contacts, confidence scores,
-            and enrichment metadata.
-          </p>
+          <h3>Output</h3>
+          <p>Your CSV keeps your original columns and adds enrichment fields:</p>
+          <ul>
+            <li><strong>Primary phone + source + confidence</strong></li>
+            <li><strong>Primary email + type + source</strong></li>
+            <li><strong>Address fields</strong> (when available)</li>
+            <li><strong>All discovered phones/emails</strong> (JSON columns)</li>
+            <li><strong>overall_lead_confidence</strong></li>
+            <li><strong>debug_notes</strong> (only populated when something failed, was missing, or was sanitized)</li>
+          </ul>
         </div>
       </main>
 
