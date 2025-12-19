@@ -106,182 +106,91 @@ def load_input_csv(filepath: str) -> pd.DataFrame:
     # Map review date column
     df = map_review_date_column(df)
     return df
-def write_output_csv(df, output_path: str, *args, **kwargs):
+# ============================================================
+# PHASE 4 BLOCKING FIX — CSV EXPORT SCHEMA SAFETY
+#
+# GOAL:
+# - CSV must ALWAYS download if pipeline finishes
+# - NEVER crash at 100% due to missing/renamed columns
+# - Support enrichment_notes -> debug_notes transition
+#
+# FILE: tp_enrich/io_utils.py
+# FUNCTION: write_output_csv(...)
+# ============================================================
+
+def write_output_csv(df, output_path: str, final_cols=None, *args, **kwargs):
     """
-    Write enriched CSV reliably.
-    IMPORTANT:
-    Some callers pass (df, output_path, logger) or other extra args.
-    We accept *args/**kwargs to stay compatible and avoid 500s.
-    - Never silently drops enrichment columns
-    - Ensures expected enrichment columns exist (creates them if missing)
-    - Writes expected columns first, then any extra columns that may exist
+    Safe CSV writer.
+    - Never throws KeyError for missing columns
+    - Handles enrichment_notes -> debug_notes rename
+    - Accepts extra args for backward compatibility
     """
-    expected_cols = [
-        "consumer.displayname",
-        "date",
-        "raw_display_name",
-        "review_date",
-        "row_id",
-        "run_id",
-        "name_classification",
-        "company_search_name",
-        "company_normalized_key",
-        "company_domain",
-        "domain_confidence",
-        "primary_phone",
-        "primary_phone_display",
-        "primary_phone_source",
-        "primary_phone_confidence",
-        "primary_email",
-        "primary_email_type",
-        "primary_email_source",
-        "primary_email_confidence",
-        "business_address",
-        "business_city",
-        "business_state_region",
-        "business_postal_code",
-        "business_country",
-        "oc_company_name",
-        "oc_jurisdiction",
-        "oc_company_number",
-        "oc_incorporation_date",
-        "oc_match_confidence",
-        "overall_lead_confidence",
-        "enrichment_status",
-        "debug_notes",  # PHASE 4 CLEANUP: renamed from enrichment_notes
-        "all_phones_json",
-        # PHASE 4 CLEANUP: Split phone columns
-        "phone_google",
-        "phone_yelp",
-        "phone_website",
-        "phone_apollo",
-        "generic_emails_json",
-        "person_emails_json",
-        "catchall_emails_json",
-        # Phase 2 Contact Data Fields (HOTFIX v2)
-        "phase2_bbb_phone",
-        "phase2_bbb_email",
-        "phase2_bbb_website",
-        "phase2_bbb_names",
-        "phase2_yp_phone",
-        "phase2_yp_email",
-        "phase2_yp_website",
-        "phase2_yp_names",
-        "source_platform",
-    ]
-    # Ensure expected columns exist
-    for col in expected_cols:
-        if col not in df.columns:
-            df[col] = None
-    # Keep expected first, then extras
-    extras = [c for c in df.columns.tolist() if c not in expected_cols]
-    final_cols = expected_cols + extras
-    # ============================================================
-    # PHASE 4 CLEANUP: Split all_phones_json into real columns (SAFE NaN handling)
-    # ============================================================
-    import json
+    import pandas as pd
 
-    def _safe_json_dict(x):
-        """Always return a dict, never NaN/float"""
-        if x is None:
-            return {}
-        # pandas NaN comes through as float
-        try:
-            if isinstance(x, float) and pd.isna(x):
-                return {}
-        except Exception:
-            pass
-
-        if isinstance(x, dict):
-            return x
-
-        s = str(x).strip()
-        if not s or s.lower() in ("none", "null", "nan"):
-            return {}
-
-        try:
-            v = json.loads(s)
-            return v if isinstance(v, dict) else {}
-        except Exception:
-            return {}
-
-    # Ensure column exists
-    if "all_phones_json" not in df.columns:
-        df["all_phones_json"] = ""
-
-    phones = df["all_phones_json"].apply(_safe_json_dict)
-
-    df["phone_google"] = phones.apply(lambda d: d.get("google", "") or "")
-    df["phone_yelp"] = phones.apply(lambda d: d.get("yelp", "") or "")
-    df["phone_website"] = phones.apply(lambda d: d.get("website", "") or "")
-    df["phone_apollo"] = phones.apply(lambda d: d.get("apollo", "") or "")
-
-    logger.info("Split all_phones_json into: phone_google, phone_yelp, phone_website, phone_apollo")
-
-    # ============================================================
-    # PHASE 4 CLEANUP: Rename enrichment_notes -> debug_notes
-    # ============================================================
-    if "enrichment_notes" in df.columns:
-        df["debug_notes"] = df["enrichment_notes"]
-        df = df.drop(columns=["enrichment_notes"])
-        logger.info("Renamed enrichment_notes -> debug_notes")
-
-    # ============================================================
-    # PHASE 4 RELIABILITY HOTFIX: Ensure debug_notes exists
-    # ============================================================
-    if "debug_notes" not in df.columns:
-        # Backfill from enrichment_notes if still present, otherwise create empty
-        if "enrichment_notes" in df.columns:
-            df["debug_notes"] = df["enrichment_notes"].astype("string")
-            logger.info("Backfilled debug_notes from enrichment_notes")
-        else:
-            df["debug_notes"] = ""
-            logger.info("Created empty debug_notes column")
-
-    # Sanity log
+    # Sanity log first
     try:
-        phones = int(df["primary_phone"].notna().sum())
-        emails = int(df["primary_email"].notna().sum())
+        phones = int(df["primary_phone"].notna().sum()) if "primary_phone" in df.columns else 0
+        emails = int(df["primary_email"].notna().sum()) if "primary_email" in df.columns else 0
         logger.info(f"Export sanity: rows={len(df)} phones_nonnull={phones} emails_nonnull={emails}")
     except Exception:
         logger.info(f"Export sanity: rows={len(df)} (could not compute phone/email counts)")
-    logger.info(f"Writing output CSV to: {output_path}")
-    logger.info(f"Final columns count: {len(final_cols)}")
 
-    # ============================================================
-    # PHASE 4 CLEANUP: Replace "none" with empty strings
-    # ============================================================
-    for c in df.columns:
-        if df[c].dtype == object:
-            df[c] = (
-                df[c]
-                .astype(str)
-                .str.replace(r"[\u0000-\u001F\u007F]", "", regex=True)  # control chars
-                .str.replace("\u00A0", " ", regex=False)                # nbsp
-                .replace("none", "")  # PHASE 4 CLEANUP: Remove literal "none"
-                .replace("None", "")
-            )
+    # ------------------------------------------------------------
+    # 1) Ensure debug_notes exists (canonical)
+    # ------------------------------------------------------------
+    if "debug_notes" not in df.columns:
+        if "enrichment_notes" in df.columns:
+            df["debug_notes"] = df["enrichment_notes"].astype("string")
+            logger.info("Export: backfilled debug_notes from enrichment_notes")
+        else:
+            df["debug_notes"] = ""
+            logger.info("Export: created empty debug_notes column")
 
-    # ============================================================
-    # PHASE 4 RELIABILITY HOTFIX: Safe column export (prevents KeyError)
-    # ============================================================
-    # 1) Replace enrichment_notes with debug_notes in column list if present
+    # ------------------------------------------------------------
+    # 2) Normalize schema column list
+    #    - Swap enrichment_notes -> debug_notes
+    #    - Drop any columns that do not exist
+    # ------------------------------------------------------------
+    if final_cols is None:
+        # Use all columns if not specified
+        final_cols = list(df.columns)
+
     if isinstance(final_cols, (list, tuple)):
-        final_cols = [("debug_notes" if c == "enrichment_notes" else c) for c in final_cols]
+        normalized_cols = []
+        for c in final_cols:
+            if c == "enrichment_notes":
+                c = "debug_notes"
+            if c in df.columns:
+                normalized_cols.append(c)
 
-    # 2) Only export columns that actually exist (prevents KeyError on schema mismatch)
-    final_cols_existing = [c for c in final_cols if c in df.columns]
-    missing_cols = [c for c in final_cols if c not in df.columns]
+        dropped = [c for c in final_cols if c not in normalized_cols and c != "enrichment_notes"]
+        if dropped:
+            logger.warning(f"Export: dropping missing columns: {dropped[:10]}")
 
-    # 3) Log missing columns (helps debug schema issues)
-    if missing_cols:
-        logger.warning(f"Export: dropping {len(missing_cols)} missing columns: {missing_cols[:10]}")  # limit to first 10
+        final_cols = normalized_cols
 
-    logger.info(f"Export: writing {len(final_cols_existing)}/{len(final_cols)} columns")
+    # ------------------------------------------------------------
+    # 3) HARD GUARD — never crash on empty schema
+    # ------------------------------------------------------------
+    if not final_cols:
+        logger.error("Export: final_cols empty — falling back to all columns")
+        final_cols = list(df.columns)
 
-    # PHASE 4 CLEANUP: Write with na_rep="" to avoid "none" in CSV
-    df.to_csv(output_path, index=False, columns=final_cols_existing, encoding="utf-8", na_rep="")
-    logger.info(f"Successfully wrote {len(df)} rows to {output_path}")
+    logger.info(f"Writing output CSV to: {output_path}")
+    logger.info(f"Export: writing {len(final_cols)} columns")
+
+    # ------------------------------------------------------------
+    # 4) Write CSV safely
+    # ------------------------------------------------------------
+    df.to_csv(
+        output_path,
+        index=False,
+        columns=final_cols,
+        encoding="utf-8",
+        na_rep="",
+    )
+
+    logger.info(f"Successfully wrote CSV: {output_path} (cols={len(final_cols)})")
 def get_output_schema(df=None):
     """
     PATCH 2 — HOTFIX v3: Returns the output column order (schema).
