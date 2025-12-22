@@ -380,7 +380,8 @@ function App() {
                 <>
                   <span className="status-icon spinner">⟳</span>
                   <span>Uploading CSV...</span>
-                </>\n              ) : status === 'creating_job' ? (
+                </>
+              ) : status === 'creating_job' ? (
                 <>
                   <span className="status-icon spinner">⟳</span>
                   <span>Creating enrichment job...</span>
@@ -551,7 +552,7 @@ function App() {
           Powered by multi-source business data enrichment
         </p>
         <div style={{ opacity: 0.6, fontSize: 12, marginTop: 12, borderTop: '1px solid rgba(255,255,255,0.2)', paddingTop: 8 }}>
-          🔧 UI Build: <strong>PHASE-4.5.1-LIVE-2025-12-22-22:45-UTC</strong> | Pagination Fix + Partial Download + Resilient Polling ✅
+          🔧 UI Build: <strong>🔴 LIVE-NOW-2025-12-22-23:30-UTC 🔴</strong> | Phase 4.5.1: Pagination Fix + Partial Download WORKING ✅
         </div>
       </footer>
     </div>
