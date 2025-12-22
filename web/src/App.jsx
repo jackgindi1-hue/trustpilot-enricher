@@ -402,7 +402,7 @@ function App() {
           Powered by multi-source business data enrichment
         </p>
         <div style={{ opacity: 0.6, fontSize: 12, marginTop: 12, borderTop: '1px solid rgba(255,255,255,0.2)', paddingTop: 8 }}>
-          🔧 UI Build: <strong>PHASE-4.5-2025-12-22-21:30-UTC</strong> | Entity Matching + Resilient Polling + Checkpoints
+          🔧 UI Build: <strong>PHASE-4.5-LIVE-2025-12-22-21:29-UTC</strong> | Entity Matching + Resilient Polling + Checkpoints ✅
         </div>
       </footer>
     </div>
