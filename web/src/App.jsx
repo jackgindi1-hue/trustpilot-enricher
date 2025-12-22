@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import config from './config'
 import './App.css'
 
@@ -8,6 +8,70 @@ import './App.css'
 // PHASE 4.5: Pagination constants
 const PAGE_SIZE = 100
 const CHECKPOINT_EVERY = 250
+
+/* ============================================================
+   PHASE 4.5 FRONTEND UI PATCH (REACT)
+   GOALS:
+   1) Pagination UI for preview rows
+   2) Partial download button during run
+   3) Refresh mid-run resumes polling (job_id persisted)
+   4) Never reset to "Ready" if a job is still running
+   ============================================================ */
+
+/* ---- helpers (keep near top of component file) ---- */
+const API_BASE =
+  (window && window.__API_BASE_URL__) ||
+  (typeof import.meta !== "undefined" &&
+    import.meta.env &&
+    import.meta.env.VITE_API_BASE_URL) ||
+  (typeof process !== "undefined" &&
+    process.env &&
+    (process.env.REACT_APP_API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL)) ||
+  config.API_BASE_URL || "";
+
+function apiUrl(path) {
+  if (!API_BASE) return path;
+  return `${API_BASE.replace(/\/+$/, "")}/${String(path).replace(/^\/+/, "")}`;
+}
+
+function looksLikeJsonText(s) {
+  const t = String(s || "").trim();
+  return t.startsWith("{") || t.startsWith("[");
+}
+
+async function downloadArrayBufferAsCsv(buf, filename) {
+  const blob = new Blob([buf], { type: "text/csv" });
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+}
+
+async function safeDownloadCsv(url, filename) {
+  const res = await fetch(url);
+  const ct = (res.headers.get("content-type") || "").toLowerCase();
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Download failed: ${res.status} ${txt.slice(0, 200)}`);
+  }
+
+  // refuse JSON downloads
+  if (ct.includes("application/json")) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Refusing JSON as CSV: ${txt.slice(0, 200)}`);
+  }
+
+  const buf = await res.arrayBuffer();
+  const head = new TextDecoder("utf-8").decode(buf.slice(0, 64)).trim();
+  if (looksLikeJsonText(head)) throw new Error(`Refusing JSON-looking content: ${head}`);
+
+  await downloadArrayBufferAsCsv(buf, filename);
+}
 
 function App() {
   const [file, setFile] = useState(null)
@@ -20,6 +84,7 @@ function App() {
   const [showPartialDownload, setShowPartialDownload] = useState(false)
   const [page, setPage] = useState(1)
   const [progress, setProgress] = useState(0)
+  const [rowsPreview, setRowsPreview] = useState([])
 
   // PHASE 4.5: Helper functions
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n))
@@ -39,6 +104,175 @@ function App() {
     }
     throw lastErr || new Error("network_error")
   }
+
+  // Pagination logic
+  const totalRows = rowsPreview.length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / PAGE_SIZE));
+  const pageSafe = Math.min(Math.max(1, page), totalPages);
+  const startIdx = (pageSafe - 1) * PAGE_SIZE;
+  const endIdx = Math.min(startIdx + PAGE_SIZE, totalRows);
+  const pageRows = rowsPreview.slice(startIdx, endIdx);
+
+  /* ---- Polling helper ---- */
+  const pollUntilDone = async (jobId, options = {}) => {
+    while (true) {
+      let meta = {};
+      try {
+        const st = await fetch(apiUrl(`/jobs/${jobId}`));
+        meta = await st.json().catch(() => ({}));
+      } catch (_) {
+        // keep retrying on transient fetch errors
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+
+      const s = String(meta.status || "").toLowerCase();
+      const p = typeof meta.progress === "number" ? meta.progress : null;
+      if (p !== null) setProgress(p);
+
+      // Update status display
+      if (p !== null && p > 0) {
+        setStatus(`running (${Math.round(p * 100)}%)`);
+      }
+
+      if (s === "done") break;
+      if (s === "error") throw new Error(meta.error || "Job failed");
+
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  };
+
+  /* ---- RUN button handler ---- */
+  const handleRunEnrichment = async (e) => {
+    if (e) e.preventDefault();
+
+    if (!file) {
+      setError("No file selected");
+      return;
+    }
+
+    setError(null);
+    setProgress(0);
+    setStatus("queued");
+    setIsProcessing(true);
+    setShowPartialDownload(false);
+
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("concurrency", "8");
+
+      if (lenderNameOverride.trim()) {
+        fd.append('lender_name_override', lenderNameOverride.trim());
+      }
+
+      // 1) Create job (JSON only)
+      const res = await fetch(apiUrl("/jobs"), { method: "POST", body: fd });
+      const raw = await res.text().catch(() => "");
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+
+      if (!res.ok) throw new Error(`Job create failed: ${res.status} ${raw.slice(0, 200)}`);
+
+      if (!ct.includes("application/json") && !looksLikeJsonText(raw)) {
+        throw new Error(
+          `Expected JSON from POST /jobs; got content-type=${ct} body=${raw.slice(0, 200)}`
+        );
+      }
+
+      const js = JSON.parse(raw);
+      const id = js.job_id;
+      if (!id) throw new Error("Missing job_id from /jobs");
+
+      setCurrentJobId(id);
+      localStorage.setItem("tp_active_job_id", id);
+
+      setStatus("running");
+
+      // 2) Poll until done (network-glitch tolerant)
+      await pollUntilDone(id);
+
+      // 3) Download final CSV (only after done)
+      setStatus('downloading');
+      await safeDownloadCsv(apiUrl(`/jobs/${id}/download`), `enriched-${id}.csv`);
+
+      setStatus("done");
+      localStorage.removeItem("tp_active_job_id");
+      setIsProcessing(false);
+
+      // Reset form after success
+      setTimeout(() => {
+        setFile(null);
+        setLenderNameOverride('');
+        setRowCount(null);
+        setStatus('idle');
+        setCurrentJobId(null);
+        // Reset file input
+        const fileInput = document.getElementById('csvFile');
+        if (fileInput) fileInput.value = '';
+      }, 3000);
+
+    } catch (err) {
+      console.error('❌ Enrichment error:', err);
+      setError(err.message || 'Enrichment failed. Please try again.');
+      setStatus('error');
+      setIsProcessing(false);
+
+      // Show partial download button if we have a jobId
+      if (currentJobId) {
+        setShowPartialDownload(true);
+      }
+    }
+  };
+
+  // ---- Partial download handler (works while job runs) ----
+  const handleDownloadPartial = async () => {
+    if (!currentJobId) {
+      setError("No active job_id");
+      return;
+    }
+    try {
+      await safeDownloadCsv(apiUrl(`/jobs/${currentJobId}/download?partial=1`), `partial-${currentJobId}.csv`);
+    } catch (err) {
+      setError(err.message || 'Partial download failed');
+    }
+  };
+
+  // ---- localStorage resume effect ----
+  useEffect(() => {
+    const saved = localStorage.getItem("tp_active_job_id");
+    if (!saved) return;
+
+    setCurrentJobId(saved);
+    setStatus("running");
+    setIsProcessing(true);
+    setError(null);
+    (async () => {
+      try {
+        await pollUntilDone(saved, { resume: true });
+        setStatus('downloading');
+        await safeDownloadCsv(apiUrl(`/jobs/${saved}/download`), `enriched-${saved}.csv`);
+        setStatus("done");
+        localStorage.removeItem("tp_active_job_id");
+        setIsProcessing(false);
+
+        // Reset after success
+        setTimeout(() => {
+          setFile(null);
+          setLenderNameOverride('');
+          setRowCount(null);
+          setStatus('idle');
+          setCurrentJobId(null);
+          const fileInput = document.getElementById('csvFile');
+          if (fileInput) fileInput.value = '';
+        }, 3000);
+      } catch (e) {
+        setStatus("error");
+        setError(String(e?.message || e));
+        setIsProcessing(false);
+        setShowPartialDownload(true);
+      }
+    })();
+  }, []);
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0]
@@ -68,166 +302,6 @@ function App() {
     }
   }
 
-  const handleSubmit = async (e) => {
-    e.preventDefault()
-
-    // Validation
-    if (!file) {
-      setError('Please select a CSV file first')
-      return
-    }
-
-    setIsProcessing(true)
-    setError(null)
-    setShowPartialDownload(false)
-    setCurrentJobId(null)
-    setStatus('uploading')
-
-    try {
-      // Prepare form data
-      const formData = new FormData()
-      formData.append('file', file)
-      formData.append('concurrency', '8')
-
-      if (lenderNameOverride.trim()) {
-        formData.append('lender_name_override', lenderNameOverride.trim())
-      }
-
-      // ============================================================
-      // PHASE 4 CORRECT FLOW: POST /jobs -> poll -> download
-      // ============================================================
-
-      // 1) CREATE JOB (returns JSON only)
-      setStatus('creating_job')
-      const createRes = await fetch(`${config.API_BASE_URL}/jobs`, {
-        method: 'POST',
-        body: formData
-      })
-
-      if (!createRes.ok) {
-        const errorText = await createRes.text()
-        throw new Error(`Job creation failed (${createRes.status}): ${errorText}`)
-      }
-
-      // Parse JSON response
-      const createData = await createRes.json()
-      const jobId = createData.job_id
-
-      if (!jobId) {
-        throw new Error('Missing job_id from server response')
-      }
-
-      console.log(`✅ Job created: ${jobId}`)
-      setCurrentJobId(jobId) // Save jobId for partial download
-      setStatus('running')
-
-      // 2) POLL STATUS UNTIL DONE (PHASE 4.5: stronger retry with safeFetchJson)
-      let pollCount = 0
-      const maxPolls = 600 // 10 minutes
-
-      while (pollCount < maxPolls) {
-        await new Promise(r => setTimeout(r, 1000))
-        pollCount++
-
-        const st = await safeFetchJson(`${config.API_BASE_URL}/jobs/${jobId}`, 6)
-        const meta = st.json || {}
-
-        setStatus(meta.status || "")
-        if (typeof meta.progress === "number") {
-          setProgress(meta.progress)
-        }
-
-        const jobStatus = (meta.status || '').toLowerCase()
-        const progress = meta.progress || 0
-
-        console.log(`Poll ${pollCount}: status=${jobStatus}, progress=${Math.round(progress * 100)}%`)
-
-        // Update UI with progress
-        if (progress > 0) {
-          setStatus(`running (${Math.round(progress * 100)}%)`)
-        }
-
-        // Check if done
-        if (jobStatus === 'done') {
-          console.log('✅ Job completed!')
-          setStatus('downloading')
-          break
-        }
-
-        if (jobStatus === 'error') {
-          throw new Error(meta.error || 'Job failed on server')
-        }
-      }
-
-      if (pollCount >= maxPolls) {
-        throw new Error('Job timeout: exceeded 10 minutes')
-      }
-
-      // 3) DOWNLOAD CSV (ONLY AFTER status == "done")
-      const downloadRes = await fetch(`${config.API_BASE_URL}/jobs/${jobId}/download`)
-
-      if (!downloadRes.ok) {
-        const errorText = await downloadRes.text()
-        throw new Error(`Download failed (${downloadRes.status}): ${errorText}`)
-      }
-
-      // Validate content-type (must be CSV, not JSON)
-      const contentType = downloadRes.headers.get('content-type') || ''
-      if (contentType.includes('application/json')) {
-        const jsonText = await downloadRes.text()
-        throw new Error(`Server returned JSON instead of CSV: ${jsonText.slice(0, 200)}`)
-      }
-
-      // Download as blob
-      const blob = await downloadRes.blob()
-
-      // Double-check: refuse JSON-looking content
-      const buffer = await blob.arrayBuffer()
-      const header = new TextDecoder('utf-8').decode(buffer.slice(0, 64)).trim()
-      if (header.startsWith('{') || header.startsWith('[')) {
-        throw new Error(`Refusing to download JSON-looking content: ${header}`)
-      }
-
-      // Create download link
-      const url = window.URL.createObjectURL(new Blob([buffer], { type: 'text/csv' }))
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `enriched-${jobId}.csv`
-      document.body.appendChild(a)
-      a.click()
-
-      // Cleanup
-      window.URL.revokeObjectURL(url)
-      document.body.removeChild(a)
-
-      console.log('✅ CSV downloaded successfully!')
-      setStatus('done')
-      setIsProcessing(false)
-
-      // Reset form after success
-      setTimeout(() => {
-        setFile(null)
-        setLenderNameOverride('')
-        setRowCount(null)
-        setStatus('idle')
-        // Reset file input
-        const fileInput = document.getElementById('csvFile')
-        if (fileInput) fileInput.value = ''
-      }, 3000)
-
-    } catch (err) {
-      console.error('❌ Enrichment error:', err)
-      setError(err.message || 'Enrichment failed. Please try again.')
-      setStatus('error')
-      setIsProcessing(false)
-
-      // Show partial download button if we have a jobId
-      if (currentJobId) {
-        setShowPartialDownload(true)
-      }
-    }
-  }
-
   return (
     <div className="app">
       <header className="app-header">
@@ -237,7 +311,7 @@ function App() {
 
       <main className="app-main">
         <div className="card">
-          <form onSubmit={handleSubmit}>
+          <form onSubmit={handleRunEnrichment}>
             <div className="form-group">
               <label htmlFor="csvFile">
                 Select Trustpilot CSV File *
@@ -332,10 +406,10 @@ function App() {
               )}
             </div>
 
-            {showPartialDownload && currentJobId && (
+            {((status === 'running' && currentJobId) || (showPartialDownload && currentJobId)) && (
               <div className="partial-download-section" style={{ marginTop: '1rem' }}>
                 <button
-                  onClick={() => window.open(`${config.API_BASE_URL}/jobs/${currentJobId}/download?partial=1`, '_blank')}
+                  onClick={handleDownloadPartial}
                   className="partial-download-button"
                   style={{
                     padding: '0.75rem 1.5rem',
@@ -356,6 +430,77 @@ function App() {
               </div>
             )}
           </div>
+
+          {rowsPreview.length > 0 && (
+            <div className="preview-section" style={{ marginTop: '1.5rem' }}>
+              <h3>Preview ({totalRows} rows)</h3>
+              <div style={{ overflowX: 'auto', marginTop: '1rem' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid #e5e7eb' }}>
+                      {pageRows.length > 0 && Object.keys(pageRows[0]).map((key) => (
+                        <th key={key} style={{ padding: '0.5rem', textAlign: 'left', fontWeight: '600' }}>
+                          {key}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageRows.map((row, idx) => (
+                      <tr key={idx} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                        {Object.values(row).map((val, colIdx) => (
+                          <td key={colIdx} style={{ padding: '0.5rem' }}>
+                            {String(val || '')}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {totalRows > PAGE_SIZE && (
+                <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginTop: 12, justifyContent: 'center' }}>
+                  <div style={{ fontSize: '0.875rem' }}>
+                    Showing {totalRows === 0 ? 0 : startIdx + 1}-{endIdx} of {totalRows}
+                  </div>
+                  <button
+                    disabled={pageSafe <= 1}
+                    onClick={() => setPage(pageSafe - 1)}
+                    style={{
+                      padding: '0.5rem 1rem',
+                      backgroundColor: pageSafe <= 1 ? '#e5e7eb' : '#3b82f6',
+                      color: pageSafe <= 1 ? '#9ca3af' : 'white',
+                      border: 'none',
+                      borderRadius: '0.375rem',
+                      cursor: pageSafe <= 1 ? 'not-allowed' : 'pointer',
+                      fontSize: '0.875rem'
+                    }}
+                  >
+                    Prev
+                  </button>
+                  <div style={{ fontSize: '0.875rem', fontWeight: '500' }}>
+                    Page {pageSafe} / {totalPages}
+                  </div>
+                  <button
+                    disabled={pageSafe >= totalPages}
+                    onClick={() => setPage(pageSafe + 1)}
+                    style={{
+                      padding: '0.5rem 1rem',
+                      backgroundColor: pageSafe >= totalPages ? '#e5e7eb' : '#3b82f6',
+                      color: pageSafe >= totalPages ? '#9ca3af' : 'white',
+                      border: 'none',
+                      borderRadius: '0.375rem',
+                      cursor: pageSafe >= totalPages ? 'not-allowed' : 'pointer',
+                      fontSize: '0.875rem'
+                    }}
+                  >
+                    Next
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="info-section">
