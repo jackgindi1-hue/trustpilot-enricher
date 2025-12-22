@@ -25,7 +25,7 @@ from .phase2_final import email_waterfall_enrich, phase2_enrich
 # PHASE 4: Phase 0 gating + website email scan + rate limiting
 from .phase0_gating import should_run_phase2, should_run_opencorporates, domain_from_url, is_high_enough_for_skip
 from .website_email_scan import micro_scan_for_email
-from .entity_match import normalize_company_key
+from .entity_match import normalize_company_key, should_try_entity_match, entity_match_80_verified
 from .retry_ratelimit import SimpleRateLimiter, with_retry
 
 logger = setup_logger(__name__)
@@ -278,6 +278,47 @@ def enrich_single_business(name: str, region: str | None = None) -> Dict[str, An
         if d:
             row["domain"] = d
             logger.info(f"   -> Phase 0: Canonical domain={d} from website={website}")
+
+    # ============================================================
+    # PHASE 4.5: Entity Matching (80%) - Only when state known
+    # ============================================================
+    state = row.get("state_region")
+    if should_try_entity_match(state) and not website and not row.get("domain"):
+        # Only try entity matching if we don't have good data yet
+        logger.info(f"   -> PHASE 4.5: Entity matching for {name} in state {state}")
+        try:
+            def _google_findplace_wrapper(q: str):
+                # Use existing Google Places enrichment
+                return local_enrichment.enrich_local_business(q, state)
+
+            em = entity_match_80_verified(name, state, _google_findplace_wrapper, logger=logger)
+            if em.get("matched") and em.get("google_place"):
+                # Accept verified match and update local data
+                local = em["google_place"]
+                logger.info(f"   -> ENTITY_MATCH: Accepted (confidence={em.get('confidence'):.2f})")
+                # Update row with verified data
+                if local:
+                    for f in ["address", "city", "state_region", "postal_code", "country"]:
+                        if local.get(f):
+                            row[f] = local[f]
+                    if local.get("website"):
+                        row["website"] = local["website"]
+                        website = row["website"]
+                        # Re-extract domain from verified website
+                        if website:
+                            try:
+                                parsed = urlparse(website)
+                                host = parsed.netloc or parsed.path
+                                if host.startswith("www."):
+                                    host = host[4:]
+                                row["domain"] = host.lower()
+                            except Exception:
+                                pass
+            else:
+                logger.info(f"   -> ENTITY_MATCH: Rejected (reason={em.get('reason')})")
+        except Exception as e:
+            logger.warning(f"   -> ENTITY_MATCH: Error: {e}")
+    # ============================================================
 
     domain = row.get("domain")
     phone_layer = enrich_business_phone_waterfall(

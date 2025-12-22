@@ -2,8 +2,12 @@ import { useState } from 'react'
 import config from './config'
 import './App.css'
 
-// PHASE 4 DEPLOY - Version 1766174734
-// BUILD TIMESTAMP: 2025-12-19 20:05 UTC
+// PHASE 4.5 DEPLOY - Entity Matching + Resilient Polling
+// BUILD TIMESTAMP: 2025-12-22 21:30 UTC
+
+// PHASE 4.5: Pagination constants
+const PAGE_SIZE = 100
+const CHECKPOINT_EVERY = 250
 
 function App() {
   const [file, setFile] = useState(null)
@@ -14,6 +18,27 @@ function App() {
   const [rowCount, setRowCount] = useState(null)
   const [currentJobId, setCurrentJobId] = useState(null)
   const [showPartialDownload, setShowPartialDownload] = useState(false)
+  const [page, setPage] = useState(1)
+  const [progress, setProgress] = useState(0)
+
+  // PHASE 4.5: Helper functions
+  const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n))
+
+  const safeFetchJson = async (url, tries = 5) => {
+    let lastErr = null
+    for (let i = 0; i < tries; i++) {
+      try {
+        const r = await fetch(url, { cache: 'no-store' })
+        const t = await r.text()
+        const js = t ? JSON.parse(t) : {}
+        return { ok: r.ok, status: r.status, json: js, raw: t }
+      } catch (e) {
+        lastErr = e
+        await new Promise(r => setTimeout(r, 500 * (i + 1))) // backoff
+      }
+    }
+    throw lastErr || new Error("network_error")
+  }
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0]
@@ -96,32 +121,20 @@ function App() {
       setCurrentJobId(jobId) // Save jobId for partial download
       setStatus('running')
 
-      // 2) POLL STATUS UNTIL DONE (resilient polling with transient failure tolerance)
+      // 2) POLL STATUS UNTIL DONE (PHASE 4.5: stronger retry with safeFetchJson)
       let pollCount = 0
-      let pollFails = 0
       const maxPolls = 600 // 10 minutes
 
       while (pollCount < maxPolls) {
         await new Promise(r => setTimeout(r, 1000))
         pollCount++
 
-        let meta = {}
-        try {
-          const statusRes = await fetch(`${config.API_BASE_URL}/jobs/${jobId}`, { cache: 'no-store' })
-          if (!statusRes.ok) {
-            const txt = await statusRes.text().catch(() => '')
-            throw new Error(`poll_http_${statusRes.status}:${txt.slice(0, 120)}`)
-          }
-          meta = await statusRes.json().catch(() => ({}))
-          pollFails = 0 // reset on successful poll
-        } catch (e) {
-          pollFails += 1
-          console.log(`Poll glitch (${pollFails}/12): ${String(e).slice(0, 160)}`)
-          setStatus(`running (retrying poll ${pollFails}/12...)`)
-          // tolerate up to 12 consecutive failures (~18-30 seconds)
-          if (pollFails >= 12) throw e
-          await new Promise(r => setTimeout(r, 1500))
-          continue
+        const st = await safeFetchJson(`${config.API_BASE_URL}/jobs/${jobId}`, 6)
+        const meta = st.json || {}
+
+        setStatus(meta.status || "")
+        if (typeof meta.progress === "number") {
+          setProgress(meta.progress)
         }
 
         const jobStatus = (meta.status || '').toLowerCase()
@@ -338,7 +351,7 @@ function App() {
                   📥 Download partial results
                 </button>
                 <p className="help-text" style={{ marginTop: '0.5rem', fontSize: '0.875rem', color: '#6b7280' }}>
-                  Some businesses may have been enriched before the error occurred.
+                  Stop-loss checkpoints (every {CHECKPOINT_EVERY} businesses). Some data may be recoverable.
                 </p>
               </div>
             )}
@@ -361,6 +374,7 @@ function App() {
           <h3>Data sources (what we try)</h3>
           <ul>
             <li><strong>🗺️ Google Places</strong>: phone, address, website (best source when matched)</li>
+            <li><strong>🎯 Entity Matching</strong>: 80% confidence matching with Google verification when state is known</li>
             <li><strong>⭐ Yelp</strong>: backup phone + business verification when Google misses</li>
             <li><strong>📧 Hunter</strong> + website scan: email discovery (generic + sometimes person emails)</li>
             <li><strong>🔎 Phase 2 discovery</strong> (select cases): BBB / YellowPages / OpenCorporates lookups
@@ -388,7 +402,7 @@ function App() {
           Powered by multi-source business data enrichment
         </p>
         <div style={{ opacity: 0.6, fontSize: 12, marginTop: 12, borderTop: '1px solid rgba(255,255,255,0.2)', paddingTop: 8 }}>
-          🔧 UI Build: <strong>BUILD-2025-12-19-20:10-UTC</strong> | Frontend is LIVE if you see this timestamp
+          🔧 UI Build: <strong>PHASE-4.5-2025-12-22-21:30-UTC</strong> | Entity Matching + Resilient Polling + Checkpoints
         </div>
       </footer>
     </div>
