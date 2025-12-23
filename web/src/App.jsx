@@ -2,12 +2,15 @@ import { useState, useEffect } from 'react'
 import config from './config'
 import './App.css'
 
-// PHASE 4.5.4 DEPLOY - Stale Job Polling Fix + Stable Partial Button
-// BUILD TIMESTAMP: 2025-12-23 03:15 UTC
+// PHASE 4.5.5 DEPLOY - Stop 404 Spam PERMANENTLY (Hardened Polling)
+// BUILD TIMESTAMP: 2025-12-23 04:30 UTC
 
 // PHASE 4.5: Pagination constants
 const PAGE_SIZE = 100
 const CHECKPOINT_EVERY = 250
+
+// PHASE 4.5.5: Single source of truth for job ID storage
+const JOB_ID_KEY = "tp_active_job_id"
 
 /* ============================================================
    PHASE 4.5 FRONTEND UI PATCH (REACT)
@@ -90,6 +93,21 @@ function App() {
   // PHASE 4.5: Helper functions
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n))
 
+  // PHASE 4.5.5: Absolute stop helpers
+  const clearJobId = () => {
+    try {
+      localStorage.removeItem(JOB_ID_KEY)
+    } catch (e) {
+      console.warn("Failed to clear job ID from localStorage:", e)
+    }
+  }
+
+  const isTerminal = (status) => {
+    return ["completed", "done", "failed", "error", "cancelled"].includes(
+      String(status || "").toLowerCase()
+    )
+  }
+
   const safeFetchJson = async (url, tries = 5) => {
     let lastErr = null
     for (let i = 0; i < tries; i++) {
@@ -130,44 +148,81 @@ function App() {
     setPage(1);
   }, [totalRows]);
 
-  /* ---- Polling helper ---- */
+  /* ---- PHASE 4.5.5: Hardened polling with absolute stop ---- */
   const pollUntilDone = async (jobId, options = {}) => {
-    while (true) {
-      let meta = {};
-      try {
-        const result = await safeFetchJson(apiUrl(`/jobs/${jobId}`), 3);
-        meta = result.json || {};
-      } catch (e) {
-        // 🔥 PHASE 4.5.4: If 404, job not found -> clear and stop
-        if (e.code === 404 || String(e.message || "").includes("job_not_found")) {
-          console.warn("Job ID not found; clearing stored job id", jobId);
-          setCurrentJobId(null);
-          localStorage.removeItem("tp_active_job_id");
-          throw new Error("Job not found (404). Please start a new job.");
+    return new Promise((resolve, reject) => {
+      let cancelled = false;
+      let timeoutId = null;
+
+      const cleanup = () => {
+        cancelled = true;
+        if (timeoutId) clearTimeout(timeoutId);
+      };
+
+      const tick = async () => {
+        if (cancelled) return;
+
+        try {
+          const res = await fetch(apiUrl(`/jobs/${jobId}`), { cache: 'no-store' });
+
+          // ✅ ABSOLUTE STOP on 404
+          if (res.status === 404) {
+            console.warn("Job not found; stopping polling permanently", jobId);
+            clearJobId();
+            setCurrentJobId(null);
+            setJobMeta(null);
+            cleanup();
+            reject(new Error("Job not found (404). Please start a new job."));
+            return;
+          }
+
+          if (!res.ok) {
+            throw new Error(`Job fetch failed: ${res.status}`);
+          }
+
+          const meta = await res.json();
+          const status = String(meta.status || "").toLowerCase();
+          const progress = typeof meta.progress === "number" ? meta.progress : null;
+
+          // Update UI state
+          setJobMeta(meta);
+          if (progress !== null) setProgress(progress);
+
+          // Update status display
+          if (progress !== null && progress > 0) {
+            setStatus(`running (${Math.round(progress * 100)}%)`);
+          }
+
+          // ✅ ABSOLUTE STOP on terminal status
+          if (isTerminal(status)) {
+            console.info("Job terminal; stopping polling", status);
+            clearJobId();
+            setCurrentJobId(null);
+            cleanup();
+
+            if (status === "done") {
+              resolve(); // Success
+            } else {
+              reject(new Error(meta.error || `Job ${status}`));
+            }
+            return;
+          }
+
+          // Continue polling with chained timeout (prevents overlap)
+          if (!cancelled) {
+            timeoutId = setTimeout(tick, 1000);
+          }
+
+        } catch (e) {
+          if (!cancelled) {
+            cleanup();
+            reject(e);
+          }
         }
+      };
 
-        // keep retrying on transient fetch errors
-        await new Promise((r) => setTimeout(r, 1500));
-        continue;
-      }
-
-      const s = String(meta.status || "").toLowerCase();
-      const p = typeof meta.progress === "number" ? meta.progress : null;
-      if (p !== null) setProgress(p);
-
-      // PHASE 4.5.4: Update job metadata for stable partial button
-      setJobMeta(meta);
-
-      // Update status display
-      if (p !== null && p > 0) {
-        setStatus(`running (${Math.round(p * 100)}%)`);
-      }
-
-      if (s === "done") break;
-      if (s === "error") throw new Error(meta.error || "Job failed");
-
-      await new Promise((r) => setTimeout(r, 1000));
-    }
+      tick(); // Start polling
+    });
   };
 
   /* ---- RUN button handler ---- */
@@ -212,7 +267,7 @@ function App() {
       if (!id) throw new Error("Missing job_id from /jobs");
 
       setCurrentJobId(id);
-      localStorage.setItem("tp_active_job_id", id);
+      localStorage.setItem(JOB_ID_KEY, id); // PHASE 4.5.5: Single source of truth
 
       setStatus("running");
 
@@ -224,7 +279,7 @@ function App() {
       await safeDownloadCsv(apiUrl(`/jobs/${id}/download`), `enriched-${id}.csv`);
 
       setStatus("done");
-      localStorage.removeItem("tp_active_job_id");
+      clearJobId(); // PHASE 4.5.5: Use clearJobId helper
       setIsProcessing(false);
 
       // Reset form after success
@@ -265,9 +320,9 @@ function App() {
     }
   };
 
-  // ---- localStorage resume effect ----
+  // ---- PHASE 4.5.5: localStorage resume effect (hardened) ----
   useEffect(() => {
-    const saved = localStorage.getItem("tp_active_job_id");
+    const saved = localStorage.getItem(JOB_ID_KEY); // Single source of truth
     if (!saved) return;
 
     setCurrentJobId(saved);
@@ -591,7 +646,7 @@ function App() {
           Powered by multi-source business data enrichment
         </p>
         <div style={{ opacity: 0.6, fontSize: 12, marginTop: 12, borderTop: '1px solid rgba(255,255,255,0.2)', paddingTop: 8 }}>
-          🔧 UI Build: <strong>🟢 PHASE-4.5.4-2025-12-23-03:15-UTC 🟢</strong> | Stale Job Fix + Stable Partial Button ✅
+          🔧 UI Build: <strong>🔴 PHASE-4.5.5-2025-12-23-04:30-UTC 🔴</strong> | Stop 404 Spam PERMANENTLY ✅
         </div>
       </footer>
     </div>
