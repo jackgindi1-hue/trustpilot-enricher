@@ -1,10 +1,35 @@
 # Trustpilot Enricher - Task Tracker
 
+## 🚨 CRITICAL FIX - Import Bug in api_server.py
+
+**Date**: December 23, 2025
+**Status**: ✅ **FIXED**
+
+### Problem
+api_server.py had **broken imports** that would crash on startup:
+- Imported from old `tp_enrich.jobs` module
+- But then called functions from `durable_jobs` that wasn't imported
+- Would have caused immediate crashes: `NameError: name 'durable_jobs' is not defined`
+
+### Fix Applied
+1. ✅ Updated imports to use `durable_jobs` module
+2. ✅ Updated all job creation/status calls to use durable storage API
+3. ✅ Deleted orphaned files (jobs.py, api_jobs.py, job_runner.py)
+4. ✅ Verified all files compile successfully
+
+### Files Changed
+- **api_server.py**: Fixed imports and all durable_jobs calls
+- **Deleted**: tp_enrich/jobs.py (old in-memory storage)
+- **Deleted**: tp_enrich/api_jobs.py (unused)
+- **Deleted**: tp_enrich/job_runner.py (unused)
+
+---
+
 ## ✅ COMPLETED - Phase 4.5 Entity Matching + Resilient Polling
 
 **Date**: December 22, 2025, 21:30 UTC
-**Status**: 🚀 **READY TO DEPLOY**
-**Commit**: `PENDING`
+**Status**: 🟢 **DEPLOYED**
+**Latest Commit**: `8613091`
 
 ### Goals (All Complete)
 1. ✅ Entity matching with 80% confidence threshold

@@ -20,8 +20,8 @@ from dotenv import load_dotenv
 
 from tp_enrich.pipeline import run_pipeline
 from tp_enrich.logging_utils import setup_logger
-# PHASE 4: Job management imports
-from tp_enrich.jobs import new_job_id, job_paths, read_meta, read_log_tail, write_meta
+# PHASE 4.5.2: Durable job storage imports
+from tp_enrich import durable_jobs
 from tp_enrich.progress import set_job_status, set_job_progress, make_job_logger
 
 # Load environment variables
@@ -196,7 +196,8 @@ async def enrich_csv(
 
 def _run_job_thread(job_id: str, csv_bytes: bytes, config: dict):
     """Background thread for async job processing"""
-    meta_path, log_path, out_path = job_paths(job_id)
+    paths = durable_jobs.get_csv_paths(job_id)
+    out_path = paths["out_csv"]
     log = make_job_logger(job_id)
 
     try:
@@ -239,7 +240,7 @@ def _run_job_thread(job_id: str, csv_bytes: bytes, config: dict):
 
         # Progress: complete
         set_job_progress(job_id, total_rows, total_rows, stage="done")
-        set_job_status(job_id, "done", {"output": out_path, "stats": stats})
+        set_job_status(job_id, "done", {"output": out_path, "stats": stats, "out_csv_path": out_path})
         log(f"JOB {job_id} DONE | output={out_path} | stats={stats}")
 
     except Exception as e:
@@ -326,11 +327,11 @@ def job_stream(job_id: str):
             if not job:
                 yield f"data: ERROR:job_not_found\n\n"
                 break
-            
+
             # Get log from durable storage
             paths = durable_jobs.get_csv_paths(job_id)
             log_path = paths["log"]
-            
+
             tail = ""
             if os.path.exists(log_path):
                 with open(log_path, 'r', encoding='utf-8') as f:
@@ -383,10 +384,10 @@ def job_download(job_id: str, partial: int = Query(0)):
             status_code=404,
             headers={"Content-Type": "application/json"}
         )
-    
+
     # Get CSV paths from durable storage
     paths = durable_jobs.get_csv_paths(job_id)
-    
+
     # PHASE 4.5.1: Partial download support
     if partial:
         partial_path = job.get("partial_csv_path") or paths["partial_csv"]
@@ -423,7 +424,7 @@ def job_download(job_id: str, partial: int = Query(0)):
 
     # Get output CSV path from job metadata
     out_csv_path = job.get("out_csv_path") or paths["out_csv"]
-    
+
     # Check file exists
     if not out_csv_path or not os.path.exists(out_csv_path):
         logger.error(f"Job {job_id} marked done but output file missing: {out_csv_path}")
