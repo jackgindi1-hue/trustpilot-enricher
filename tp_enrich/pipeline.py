@@ -164,6 +164,9 @@ def merge_enrichment_back_to_rows(df: pd.DataFrame, enriched_businesses: list) -
         "overall_lead_confidence",
         "enrichment_status",
         "enrichment_notes",
+        # PHASE 4.5 CANONICAL: entity matching fields
+        "canonical_source",
+        "canonical_match_score",
     ]
 
     # ============================================================
@@ -489,14 +492,18 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache, run_id: str = N
     # Get enrichment context
     context = get_enrichment_context(business_info)
     region = context.get('state') or context.get('region')
-    # Use the simplified enrichment function
-    enriched_data = enrich_single_business(company_name, region=region)
+
+    # ============================================================
+    # PHASE 4.5 FINAL LOCK: Use canonical enrichment
+    # ============================================================
+    from tp_enrich.canonical_enrich import enrich_single_business_canonical
+    enriched_data = enrich_single_business_canonical(company_name, region=region, logger=logger)
     enriched_row = {
         # identity / keys
         "company_normalized_key": normalized_key,
         "company_search_name": company_name,
-        "company_domain": enriched_data.get("domain"),
-        "domain_confidence": "high" if enriched_data.get("domain") else "none",
+        "company_domain": enriched_data.get("business_domain") or enriched_data.get("domain"),
+        "domain_confidence": "high" if enriched_data.get("business_domain") or enriched_data.get("domain") else "none",
         # primary phone
         "primary_phone": enriched_data.get("primary_phone"),
         "primary_phone_display": enriched_data.get("primary_phone"),
@@ -508,15 +515,18 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache, run_id: str = N
         "primary_email_source": enriched_data.get("primary_email_source") or enriched_data.get("email_source"),
         "primary_email_confidence": enriched_data.get("primary_email_confidence") or ("medium" if enriched_data.get("primary_email") else "none"),
         # address
-        "business_address": enriched_data.get("address"),
-        "business_city": enriched_data.get("city"),
-        "business_state_region": enriched_data.get("state_region"),
-        "business_postal_code": enriched_data.get("postal_code"),
-        "business_country": enriched_data.get("country"),
+        "business_address": enriched_data.get("business_address") or enriched_data.get("address"),
+        "business_city": enriched_data.get("business_city") or enriched_data.get("city"),
+        "business_state_region": enriched_data.get("business_state_region") or enriched_data.get("state_region"),
+        "business_postal_code": enriched_data.get("business_postal_code") or enriched_data.get("postal_code"),
+        "business_country": enriched_data.get("business_country") or enriched_data.get("country"),
         # metadata
-        "overall_lead_confidence": enriched_data.get("confidence", "failed"),
+        "overall_lead_confidence": enriched_data.get("overall_lead_confidence") or enriched_data.get("confidence", "failed"),
         "enrichment_status": "completed",
-        "enrichment_notes": "",
+        "enrichment_notes": enriched_data.get("debug_notes", ""),
+        # PHASE 4.5 CANONICAL: entity matching metadata
+        "canonical_source": enriched_data.get("canonical_source", ""),
+        "canonical_match_score": enriched_data.get("canonical_match_score", 0.0),
         # debug payloads
         "all_phones_json": enriched_data.get("all_phones_json", "{}"),
         "generic_emails_json": "[]",

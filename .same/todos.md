@@ -1,5 +1,59 @@
 # Trustpilot Enricher - Task Tracker
 
+## ✅ PHASE 4.5 FINAL LOCK — Canonical Entity Matching
+
+**Date**: December 23, 2025, 03:00 UTC
+**Status**: ✅ **IMPLEMENTED - READY TO TEST**
+
+### What Was Built
+**Canonical Entity Matching Architecture**:
+- ONE canonical business decision per row
+- All providers must pass entity_match ≥ 80%
+- OpenCorporates ONLY when state is known (hard guard)
+- Deterministic, auditable, no guessing
+
+### New Modules Created
+1. **`tp_enrich/entity_match.py`** (+100 lines)
+   - `pick_best()` - Scores candidates and returns best ≥80%
+   - `_score_candidate()` - Multi-factor scoring (name 60%, state 20%, domain 10%, phone 10%)
+
+2. **`tp_enrich/canonical.py`** (+150 lines)
+   - `choose_canonical_business()` - Chooses ONE canonical from Google/Yelp
+   - `apply_canonical_to_row()` - Applies canonical data to row
+   - `should_run_opencorporates()` - HARD STATE GUARD
+
+3. **`tp_enrich/canonical_enrich.py`** (+200 lines)
+   - `enrich_single_business_canonical()` - Full canonical enrichment flow
+   - Integrates entity matching, phone/email waterfalls, OpenCorporates guard
+
+### Integration
+- **`pipeline.py`** updated to use canonical enrichment
+- New CSV columns: `canonical_source`, `canonical_match_score`
+- OpenCorporates only runs when state known (2-3 char codes)
+
+### Flow
+```
+1. Get Google + Yelp candidates
+2. Entity match chooses ONE canonical (≥80%)
+   - Name similarity: 60% weight (Jaccard)
+   - State match: 20% weight (exact)
+   - Domain match: 10% weight (exact)
+   - Phone match: 10% weight (normalized)
+3. Apply canonical data to row
+4. Phone/email waterfalls use canonical anchors
+5. OpenCorporates ONLY if state known
+6. Phase 2 discovery uses canonical data
+```
+
+### Testing Required
+- [ ] Upload CSV with state-known businesses
+- [ ] Verify `canonical_source` = "google" or "yelp"
+- [ ] Verify `canonical_match_score` ≥ 0.80
+- [ ] Check OpenCorporates only runs when state present
+- [ ] Verify debug_notes shows "|oc_skipped_no_state" when no state
+
+---
+
 ## 🚨 CRITICAL FIX - Import Bug in api_server.py
 
 **Date**: December 23, 2025

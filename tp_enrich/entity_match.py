@@ -2,7 +2,7 @@
 # ENTITY MATCHING: Fuzzy key generation for deduplication
 # ============================================================
 import re
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from tp_enrich.phase0_gating import domain_from_url
 
 _WS = re.compile(r"\s+")
@@ -150,4 +150,104 @@ def entity_match_80_verified(
         "verified_by_google": bool(verified),
         "google_place": gp if accepted else None,
         "reason": reason,
+    }
+
+
+# ============================================================
+# PHASE 4.5 FINAL LOCK — CANONICAL ENTITY MATCHER
+# ============================================================
+
+def _score_candidate(query: Dict[str, Any], candidate: Dict[str, Any]) -> float:
+    """
+    Score a candidate against the query business.
+    Returns score 0.0-1.0 based on name similarity, state match, domain match.
+
+    Scoring:
+    - Name match (Jaccard): 60%
+    - State match (exact): 20%
+    - Domain match (exact): 10%
+    - Phone match (normalized): 10%
+    """
+    score = 0.0
+
+    # Name similarity (60% weight)
+    q_name = query.get("name", "")
+    c_name = candidate.get("name", "")
+    if q_name and c_name:
+        name_score = _token_jaccard(q_name, c_name)
+        score += 0.6 * name_score
+
+    # State match (20% weight) - exact match required
+    q_state = (query.get("state") or "").strip().upper()
+    c_state = (candidate.get("state") or "").strip().upper()
+    if q_state and c_state and q_state == c_state:
+        score += 0.2
+
+    # Domain match (10% weight) - exact match
+    q_domain = (query.get("domain") or "").strip().lower()
+    c_domain = (candidate.get("domain") or "").strip().lower()
+    if q_domain and c_domain and q_domain == c_domain:
+        score += 0.1
+
+    # Phone match (10% weight) - normalized digits
+    q_phone = re.sub(r"\D", "", query.get("phone") or "")
+    c_phone = re.sub(r"\D", "", candidate.get("phone") or "")
+    if q_phone and c_phone and len(q_phone) >= 10 and len(c_phone) >= 10:
+        # Compare last 10 digits (US phone numbers)
+        if q_phone[-10:] == c_phone[-10:]:
+            score += 0.1
+
+    return score
+
+
+def pick_best(
+    query: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    threshold: float = 0.80
+) -> Dict[str, Any]:
+    """
+    Choose the best candidate that meets the threshold.
+
+    Args:
+        query: Business query dict with name, state, city, address, domain, phone
+        candidates: List of candidate dicts from Google, Yelp, etc.
+        threshold: Minimum score required (default 0.80)
+
+    Returns:
+        {
+            "chosen": candidate dict or None,
+            "best_score": float,
+            "all_scores": list of (source, score) tuples,
+            "passed_threshold": bool
+        }
+    """
+    if not candidates:
+        return {
+            "chosen": None,
+            "best_score": 0.0,
+            "all_scores": [],
+            "passed_threshold": False,
+            "reason": "no_candidates"
+        }
+
+    # Score all candidates
+    scored = []
+    for candidate in candidates:
+        score = _score_candidate(query, candidate)
+        scored.append((candidate, score))
+
+    # Sort by score descending
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    best_candidate, best_score = scored[0]
+    all_scores = [(c.get("source", "unknown"), s) for c, s in scored]
+
+    passed = best_score >= threshold
+
+    return {
+        "chosen": best_candidate if passed else None,
+        "best_score": best_score,
+        "all_scores": all_scores,
+        "passed_threshold": passed,
+        "reason": "accepted" if passed else f"below_threshold_{threshold}"
     }
