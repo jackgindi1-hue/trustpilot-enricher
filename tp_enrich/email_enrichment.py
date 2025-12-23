@@ -398,6 +398,84 @@ def _fullenrich_contact_email(domain: str, company_name: Optional[str], logger=N
         return {"ok": False, "attempted": True, "reason": f"exception: {repr(e)}"}
 
 # ============================================================
+# PHASE 4.6.1: DIRECTORY EMAIL PRESERVATION
+# Prevent directory/aggregator emails from becoming primary_email
+# ============================================================
+
+DIRECTORY_EMAIL_DOMAINS = {
+    "chamberofcommerce.com",
+    "thebluebook.com",
+    "buzzfile.com",
+    "brokersnapshot.com",
+    "zoominfo.com",
+    "opencorporates.com",
+    "yelp.com",
+    "facebookmail.com",
+}
+
+
+def _email_domain(email: str) -> str:
+    """Extract domain from email address"""
+    if not email or "@" not in email:
+        return ""
+    return email.split("@", 1)[1].strip().lower()
+
+
+def _append_secondary_email(row: dict, email: str, source: str = ""):
+    """Append email to secondary_email field without duplicates"""
+    if not email:
+        return
+
+    existing = row.get("secondary_email") or ""
+    parts = [p.strip() for p in existing.split("|") if p.strip()] if existing else []
+
+    token = email.strip()
+    if token not in parts:
+        parts.append(token)
+
+    row["secondary_email"] = " | ".join(parts)
+
+    # Track source in debug notes
+    notes = row.get("debug_notes") or ""
+    if source:
+        note_token = f"|secondary_email:{source}"
+        if note_token not in notes:
+            notes += note_token
+    row["debug_notes"] = notes
+
+
+def assign_email(row: dict, email: str, source: str):
+    """
+    Smart email assignment that preserves directory emails as secondary.
+
+    Rules:
+    - If email belongs to directory/aggregator -> store as secondary_email
+    - Else -> set as primary_email if empty; otherwise store as secondary_email
+
+    Args:
+        row: Business row dict
+        email: Email address to assign
+        source: Source of the email (e.g., 'google', 'yelp', 'canonical')
+    """
+    if not email:
+        return
+
+    dom = _email_domain(email)
+
+    # Directory/aggregator emails always go to secondary
+    if dom in DIRECTORY_EMAIL_DOMAINS:
+        _append_secondary_email(row, email, source=f"{source}_directory")
+        return
+
+    # If no primary email yet, use this one
+    if not row.get("primary_email"):
+        row["primary_email"] = email
+        row["primary_email_source"] = source
+    else:
+        # Already have primary, store as secondary
+        _append_secondary_email(row, email, source=source)
+
+# ============================================================
 # PUBLIC ENTRYPOINT EXPECTED BY pipeline.py
 # ============================================================
 def run_email_waterfall(domain: Optional[str], company_name: Optional[str] = None, logger: Any = None, **kwargs) -> Dict[str, Any]:
