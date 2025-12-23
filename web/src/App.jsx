@@ -2,8 +2,8 @@ import { useState, useEffect } from 'react'
 import config from './config'
 import './App.css'
 
-// PHASE 4.5.1 DEPLOY - Pagination Fix + Partial Download
-// BUILD TIMESTAMP: 2025-12-22 22:45 UTC
+// PHASE 4.5.4 DEPLOY - Stale Job Polling Fix + Stable Partial Button
+// BUILD TIMESTAMP: 2025-12-23 03:15 UTC
 
 // PHASE 4.5: Pagination constants
 const PAGE_SIZE = 100
@@ -85,6 +85,7 @@ function App() {
   const [page, setPage] = useState(1)
   const [progress, setProgress] = useState(0)
   const [rowsPreview, setRowsPreview] = useState([])
+  const [jobMeta, setJobMeta] = useState(null) // PHASE 4.5.4: Track job metadata
 
   // PHASE 4.5: Helper functions
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n))
@@ -94,10 +95,21 @@ function App() {
     for (let i = 0; i < tries; i++) {
       try {
         const r = await fetch(url, { cache: 'no-store' })
+
+        // 🔥 PHASE 4.5.4: If 404, stop retrying (job not found)
+        if (r.status === 404) {
+          const err = new Error("job_not_found")
+          err.code = 404
+          throw err
+        }
+
         const t = await r.text()
         const js = t ? JSON.parse(t) : {}
         return { ok: r.ok, status: r.status, json: js, raw: t }
       } catch (e) {
+        // If 404, don't retry
+        if (e.code === 404) throw e
+
         lastErr = e
         await new Promise(r => setTimeout(r, 500 * (i + 1))) // backoff
       }
@@ -123,9 +135,17 @@ function App() {
     while (true) {
       let meta = {};
       try {
-        const st = await fetch(apiUrl(`/jobs/${jobId}`));
-        meta = await st.json().catch(() => ({}));
-      } catch (_) {
+        const result = await safeFetchJson(apiUrl(`/jobs/${jobId}`), 3);
+        meta = result.json || {};
+      } catch (e) {
+        // 🔥 PHASE 4.5.4: If 404, job not found -> clear and stop
+        if (e.code === 404 || String(e.message || "").includes("job_not_found")) {
+          console.warn("Job ID not found; clearing stored job id", jobId);
+          setCurrentJobId(null);
+          localStorage.removeItem("tp_active_job_id");
+          throw new Error("Job not found (404). Please start a new job.");
+        }
+
         // keep retrying on transient fetch errors
         await new Promise((r) => setTimeout(r, 1500));
         continue;
@@ -134,6 +154,9 @@ function App() {
       const s = String(meta.status || "").toLowerCase();
       const p = typeof meta.progress === "number" ? meta.progress : null;
       if (p !== null) setProgress(p);
+
+      // PHASE 4.5.4: Update job metadata for stable partial button
+      setJobMeta(meta);
 
       // Update status display
       if (p !== null && p > 0) {
@@ -411,29 +434,45 @@ function App() {
               )}
             </div>
 
-            {((status === 'running' && currentJobId) || (showPartialDownload && currentJobId)) && (
-              <div className="partial-download-section" style={{ marginTop: '1rem' }}>
-                <button
-                  onClick={handleDownloadPartial}
-                  className="partial-download-button"
-                  style={{
-                    padding: '0.75rem 1.5rem',
-                    backgroundColor: '#f59e0b',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '0.375rem',
-                    cursor: 'pointer',
-                    fontSize: '1rem',
-                    fontWeight: '500'
-                  }}
-                >
-                  📥 Download partial results
-                </button>
-                <p className="help-text" style={{ marginTop: '0.5rem', fontSize: '0.875rem', color: '#6b7280' }}>
-                  Stop-loss checkpoints (every {CHECKPOINT_EVERY} businesses). Some data may be recoverable.
-                </p>
-              </div>
-            )}
+            {(() => {
+              // PHASE 4.5.4: Stable partial button logic (no blink/disappear)
+              const rowsProcessed = jobMeta?.rows_processed ?? jobMeta?.current ?? 0;
+              const jobStatus = (jobMeta?.status || status || "").toLowerCase();
+              const partialAvailable = Boolean(jobMeta?.partial_available || jobMeta?.partial_csv_path);
+
+              // Show button if:
+              // 1. partial_available flag is set, OR
+              // 2. job is running AND has processed some rows
+              const showPartial = currentJobId && (
+                partialAvailable ||
+                (['running', 'processing', 'queued'].includes(jobStatus) && rowsProcessed > 0) ||
+                (showPartialDownload && currentJobId)
+              );
+
+              return showPartial ? (
+                <div className="partial-download-section" style={{ marginTop: '1rem' }}>
+                  <button
+                    onClick={handleDownloadPartial}
+                    className="partial-download-button"
+                    style={{
+                      padding: '0.75rem 1.5rem',
+                      backgroundColor: '#f59e0b',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '0.375rem',
+                      cursor: 'pointer',
+                      fontSize: '1rem',
+                      fontWeight: '500'
+                    }}
+                  >
+                    📥 Download partial results
+                  </button>
+                  <p className="help-text" style={{ marginTop: '0.5rem', fontSize: '0.875rem', color: '#6b7280' }}>
+                    Stop-loss checkpoints (every {CHECKPOINT_EVERY} businesses). Some data may be recoverable.
+                  </p>
+                </div>
+              ) : null;
+            })()}
           </div>
 
           {rowsPreview.length > 0 && (
@@ -552,7 +591,7 @@ function App() {
           Powered by multi-source business data enrichment
         </p>
         <div style={{ opacity: 0.6, fontSize: 12, marginTop: 12, borderTop: '1px solid rgba(255,255,255,0.2)', paddingTop: 8 }}>
-          🔧 UI Build: <strong>🔴 LIVE-NOW-2025-12-22-23:30-UTC 🔴</strong> | Phase 4.5.1: Pagination Fix + Partial Download WORKING ✅
+          🔧 UI Build: <strong>🟢 PHASE-4.5.4-2025-12-23-03:15-UTC 🟢</strong> | Stale Job Fix + Stable Partial Button ✅
         </div>
       </footer>
     </div>

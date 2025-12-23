@@ -105,23 +105,15 @@ def enrich_single_business_canonical(
                 f"   -> CANONICAL: No match (reason={match_meta.get('reason')})"
             )
         row["debug_notes"] += "|entity_match_below_80"
+        row["canonical_source"] = ""
+        row["canonical_match_score"] = 0.0
+        row["canonical_match_reason"] = match_meta.get("reason", "below_threshold_0.8")
 
-        # Fallback: use Google data directly if no canonical match
-        if google_hit:
-            if logger:
-                logger.info("   -> Fallback: Using Google data directly (no entity match)")
-            row["business_address"] = google_hit.get("address")
-            row["business_city"] = google_hit.get("city")
-            row["business_state_region"] = google_hit.get("state_region") or google_hit.get("state")
-            row["business_postal_code"] = google_hit.get("postal_code")
-            row["business_country"] = google_hit.get("country")
-            row["business_website"] = google_hit.get("website")
-
-            # Extract domain from website
-            if google_hit.get("website"):
-                domain = domain_from_url(google_hit["website"])
-                if domain:
-                    row["business_domain"] = domain
+        # 🔥 PHASE 4.5.4 GATEKEEPER: NO FALLBACK BYPASS
+        # IMPORTANT: Do NOT merge google/yelp data when below threshold
+        # This enforces the entity matching gatekeeper at ≥80%
+        if logger:
+            logger.info("   -> Gatekeeper: Rejecting providers (below 80% threshold)")
 
     # ============================================================
     # (3) PHONE WATERFALL — Use canonical anchors

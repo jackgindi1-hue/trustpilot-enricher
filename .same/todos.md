@@ -1,5 +1,67 @@
 # Trustpilot Enricher - Task Tracker
 
+## ✅ PHASE 4.5.4 — UI Gatekeeper Patch (One Shot)
+
+**Date**: December 23, 2025, 03:20 UTC
+**Status**: ✅ **IMPLEMENTED - READY TO DEPLOY**
+
+### Problem Fixed
+1. **UI keeps polling stale job_id → 404 spam**
+   - When GET /jobs/:id returns 404, localStorage still held stale job_id
+   - UI continued polling invalid job_id forever
+   - Logs filled with 404 errors
+
+2. **Partial download button blinks/disappears**
+   - Button showed/hid based on status changes
+   - Disappeared when status changed during processing
+   - Confusing UX for users
+
+3. **Backend canonical gatekeeper bypass**
+   - When entity match failed (<80%), fell back to Google data directly
+   - Bypassed the ≥80% gatekeeper requirement
+   - Defeated purpose of canonical entity matching
+
+### Solution Implemented
+
+**Frontend Fixes** (`web/src/App.jsx`):
+1. **404 Detection**: `safeFetchJson` now catches 404 and throws with `code: 404`
+2. **Stale Job Clear**: `pollUntilDone` clears job_id and stops polling on 404
+3. **Stable Partial Button**: Show button if:
+   - `job.partial_available` is true, OR
+   - Status is running/processing AND `rows_processed > 0`
+4. **Job Metadata Tracking**: Added `jobMeta` state to track job progress
+
+**Backend Fixes** (`tp_enrich/canonical_enrich.py`):
+1. **Removed Fallback Bypass**: Deleted "use Google data directly" when below threshold
+2. **Hard Stop**: When canonical match < 80%, set:
+   - `canonical_source` = ""
+   - `canonical_match_score` = 0.0
+   - `canonical_match_reason` = rejection reason
+3. **No Data Merge**: Do NOT apply Google/Yelp data when below threshold
+4. **Gatekeeper Enforcement**: Only canonical ≥80% data is accepted
+
+### Files Changed
+- **web/src/App.jsx** (+40 lines)
+  - Updated `safeFetchJson` to detect 404
+  - Updated `pollUntilDone` to clear stale job_id on 404
+  - Added `jobMeta` state for stable partial button
+  - Updated partial button logic (no blink)
+  - Updated build stamp: PHASE-4.5.4-2025-12-23-03:15-UTC
+
+- **tp_enrich/canonical_enrich.py** (-17 lines)
+  - Removed Google data fallback when canonical < 80%
+  - Added gatekeeper enforcement logging
+  - Set canonical_match_reason on rejection
+
+### Testing Checklist
+- [ ] Upload CSV, cancel mid-job → verify partial button stable
+- [ ] Refresh browser during job → verify resume works
+- [ ] Wait for job to complete, then refresh → verify no 404 spam
+- [ ] Check logs for "Gatekeeper: Rejecting providers (below 80%)"
+- [ ] Verify no "Fallback: Using Google data directly" logs
+
+---
+
 ## ✅ PHASE 4.5 FINAL LOCK — Canonical Entity Matching
 
 **Date**: December 23, 2025, 03:00 UTC
