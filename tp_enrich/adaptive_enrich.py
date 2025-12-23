@@ -210,9 +210,10 @@ def enrich_single_business_adaptive(
     canonical, match_meta = choose_canonical_business(row, google_hit, yelp_hit)
     if canonical:
         if logger:
-            logger.info(
-                f"   -> CANONICAL: {canonical['source']} (score={match_meta['best_score']:.2f})"
-            )
+            msg = f"   -> CANONICAL: {canonical['source']} (score={match_meta['best_score']:.2f}, reason={match_meta.get('reason', 'unknown')})"
+            if "soft_threshold" in match_meta.get("reason", ""):
+                msg += f" [SOFT: domain={match_meta.get('domain_match_exact')}, phone={match_meta.get('phone_match_exact')}]"
+            logger.info(msg)
         row = apply_canonical_to_row(row, canonical, match_meta)
         # ============================================================
         # STEP 7: Full enrichment (phone/email waterfalls)
