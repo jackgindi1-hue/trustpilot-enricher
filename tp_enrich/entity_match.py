@@ -30,7 +30,7 @@ and verifying matches against Google Places API.
 def _clean_name(s: str) -> str:
     """Normalize business name for matching"""
     s = (s or "").strip().lower()
-    s = re.sub(r"[\.\ ,\(\)\[\]\{\}\-\_]+", " ", s)
+    s = re.sub(r"[\.\,\(\)\[\]\{\}\-\_]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     # light suffix stripping (don't overdo it)
     for suf in [" llc", " inc", " ltd", " corp", " co", " company", " limited"]:
@@ -127,31 +127,6 @@ def entity_match_80_verified(
 # ============================================================
 # PHASE 4.5 FINAL LOCK — CANONICAL ENTITY MATCHER
 # ============================================================
-# ============================================================
-# PHASE 4.6.3 — CANONICAL THRESHOLD OVERRIDE (SAFE)
-# Accept >=0.80 normally
-# Accept >=0.75 only if domain OR phone matches exactly
-# ============================================================
-DEFAULT_THRESHOLD = 0.80
-SOFT_THRESHOLD = 0.75
-def passes_threshold(best_score: float, meta: Dict[str, Any]) -> bool:
-    """
-    Smart threshold with override for exact domain/phone matches.
-    Args:
-        best_score: Overall match score (0.0-1.0)
-        meta: Match metadata with exact match flags
-    Returns:
-        True if passes threshold (0.80 default, 0.75 if domain/phone exact)
-    """
-    phone_ok = bool(meta.get("phone_match_exact"))
-    domain_ok = bool(meta.get("domain_match_exact"))
-    # Pass if meets default threshold
-    if best_score >= DEFAULT_THRESHOLD:
-        return True
-    # Pass if meets soft threshold AND has exact domain or phone match
-    if best_score >= SOFT_THRESHOLD and (phone_ok or domain_ok):
-        return True
-    return False
 def _score_candidate(query: Dict[str, Any], candidate: Dict[str, Any]) -> float:
     """
     Score a candidate against the query business.
@@ -186,29 +161,29 @@ def _score_candidate(query: Dict[str, Any], candidate: Dict[str, Any]) -> float:
             phone_score = 1.0
     # Total weighted score
     total_score = (0.6 * name_score) + (0.2 * state_score) + (0.1 * domain_score) + (0.1 * phone_score)
-    # PHASE 4.6.3: Track exact matches for threshold override
-    domain_match_exact = (domain_score == 1.0)
-    phone_match_exact = (phone_score == 1.0)
     # PHASE 4.6: Return tuple (total_score, component_scores) for diagnostic analysis
     return (total_score, {
         "score_name": name_score,
         "score_state": state_score,
         "score_domain": domain_score,
         "score_phone": phone_score,
-        "domain_match_exact": domain_match_exact,
-        "phone_match_exact": phone_match_exact,
     })
 def pick_best(
     query: Dict[str, Any],
     candidates: List[Dict[str, Any]],
-    threshold: float = 0.80
+    threshold: float = 0.80,
+    soft_threshold: float = 0.75
 ) -> Dict[str, Any]:
     """
     Choose the best candidate that meets the threshold.
+    PHASE 4.6.1 SMART THRESHOLD RULES:
+    - Accept if best_score >= threshold (default 0.80)
+    - ELSE accept if best_score >= soft_threshold (0.75) AND (phone_match OR domain_match)
     Args:
         query: Business query dict with name, state, city, address, domain, phone
         candidates: List of candidate dicts from Google, Yelp, etc.
         threshold: Minimum score required (default 0.80)
+        soft_threshold: Lower threshold requiring phone or domain match (default 0.75)
     Returns:
         {
             "chosen": candidate dict or None,
@@ -234,16 +209,26 @@ def pick_best(
     scored.sort(key=lambda x: x[1], reverse=True)
     best_candidate, best_score, best_components = scored[0]
     all_scores = [(c.get("source", "unknown"), s) for c, s, _ in scored]
-    # PHASE 4.6.3: Use smart threshold with override for exact domain/phone matches
-    passed = passes_threshold(best_score, best_components)
-    # Build reason string
-    if passed:
-        if best_score >= DEFAULT_THRESHOLD:
-            reason = "accepted_default_threshold"
+    # PHASE 4.6.1: SMART THRESHOLD LOGIC
+    # Hard gate: accept if >= 0.80
+    if best_score >= threshold:
+        passed = True
+        reason = "accepted_threshold_0.80"
+    # Soft gate: accept if >= 0.75 AND (phone OR domain exact match)
+    elif best_score >= soft_threshold:
+        phone_or_domain_match = (
+            best_components.get("score_phone", 0.0) == 1.0
+            or best_components.get("score_domain", 0.0) == 1.0
+        )
+        if phone_or_domain_match:
+            passed = True
+            reason = "accepted_soft_0.75_strong_anchor"
         else:
-            reason = f"accepted_soft_threshold_exact_match"
+            passed = False
+            reason = f"below_soft_threshold_no_anchor"
     else:
-        reason = f"below_threshold_{SOFT_THRESHOLD}"
+        passed = False
+        reason = f"below_threshold_{soft_threshold}"
     # PHASE 4.6: Include component scores in result for diagnostic analysis
     return {
         "chosen": best_candidate if passed else None,
@@ -256,7 +241,4 @@ def pick_best(
         "score_state": best_components.get("score_state", 0.0),
         "score_domain": best_components.get("score_domain", 0.0),
         "score_phone": best_components.get("score_phone", 0.0),
-        # PHASE 4.6.3: Exact match flags for threshold override
-        "phone_match_exact": best_components.get("phone_match_exact", False),
-        "domain_match_exact": best_components.get("domain_match_exact", False),
     }

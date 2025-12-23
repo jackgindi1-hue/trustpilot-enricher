@@ -10,6 +10,7 @@
 
 from typing import Dict, Any, Optional, Tuple
 from tp_enrich.entity_match import pick_best
+from tp_enrich.candidates import build_google_candidate, build_yelp_candidate
 
 
 def choose_canonical_business(
@@ -30,7 +31,7 @@ def choose_canonical_business(
     match_metadata contains:
         - best_score, all_scores, passed_threshold, reason
     """
-    # Build query from row
+    # Build query from row (for entity matching)
     query = {
         "name": row.get("business_name") or row.get("company_search_name") or row.get("raw_display_name"),
         "state": row.get("business_state_region") or row.get("state_region"),
@@ -40,40 +41,19 @@ def choose_canonical_business(
         "phone": row.get("business_phone") or row.get("primary_phone") or row.get("phone"),
     }
 
-    # Build candidate list
+    # Build candidate list using new builders (fixes name=None bug)
     candidates = []
 
-    if google_hit:
-        candidates.append({
-            "source": "google",
-            "name": google_hit.get("name") or google_hit.get("business_name"),
-            "state": google_hit.get("state_region") or google_hit.get("state"),
-            "city": google_hit.get("city"),
-            "address": google_hit.get("address"),
-            "domain": google_hit.get("domain"),
-            "phone": google_hit.get("phone"),
-            "website": google_hit.get("website"),
-            "lat": google_hit.get("lat"),
-            "lng": google_hit.get("lng") or google_hit.get("lon"),
-            "place_id": google_hit.get("place_id"),
-        })
+    google_candidate = build_google_candidate(row, google_hit)
+    if google_candidate:
+        candidates.append(google_candidate)
 
-    if yelp_hit:
-        candidates.append({
-            "source": "yelp",
-            "name": yelp_hit.get("name") or yelp_hit.get("business_name"),
-            "state": yelp_hit.get("state_region") or yelp_hit.get("state"),
-            "city": yelp_hit.get("city"),
-            "address": yelp_hit.get("address"),
-            "domain": yelp_hit.get("domain"),
-            "phone": yelp_hit.get("phone"),
-            "website": yelp_hit.get("website"),
-            "rating": yelp_hit.get("rating"),
-            "review_count": yelp_hit.get("review_count"),
-        })
+    yelp_candidate = build_yelp_candidate(row, yelp_hit)
+    if yelp_candidate:
+        candidates.append(yelp_candidate)
 
-    # Pick best candidate (≥80% threshold)
-    result = pick_best(query, candidates, threshold=0.80)
+    # Pick best candidate (≥80% threshold, or ≥75% with phone/domain match)
+    result = pick_best(query, candidates, threshold=0.80, soft_threshold=0.75)
 
     if not result["passed_threshold"]:
         return None, result
