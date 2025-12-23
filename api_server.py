@@ -102,17 +102,17 @@ async def enrich_csv(
 
     if rows > MAX_SYNC_ROWS:
         # Create async job instead of holding the request open
-        job_id = new_job_id()
+        job_id = durable_jobs.create_job()
         config = {}
         if lender_name_override:
             config['lender_name_override'] = lender_name_override
 
-        set_job_status(job_id, "queued", {
-            "stage": "queued",
-            "note": f"auto_upgraded_sync_limit_{MAX_SYNC_ROWS}",
-            "rows": rows,
-            "filename": file.filename
-        })
+        durable_jobs.set_job_status(job_id, "queued",
+            stage="queued",
+            note=f"auto_upgraded_sync_limit_{MAX_SYNC_ROWS}",
+            rows=rows,
+            filename=file.filename
+        )
 
         t = threading.Thread(
             target=_run_job_thread,
@@ -268,7 +268,7 @@ async def create_job(
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV file")
 
-    job_id = new_job_id()
+    job_id = durable_jobs.create_job()
     csv_bytes = await file.read()
     rows = _count_rows(csv_bytes)
 
@@ -277,7 +277,7 @@ async def create_job(
         config['lender_name_override'] = lender_name_override
     config['concurrency'] = int(concurrency or 8)
 
-    set_job_status(job_id, "queued", {"stage": "queued", "filename": file.filename, "rows": rows})
+    durable_jobs.set_job_status(job_id, "queued", stage="queued", filename=file.filename, rows=rows)
 
     # Start background thread
     t = threading.Thread(target=_run_job_thread, args=(job_id, csv_bytes, config), daemon=True)
@@ -302,7 +302,10 @@ def job_status(job_id: str):
     Returns:
         Job metadata and status
     """
-    return read_meta(job_id)
+    job = durable_jobs.get_job(job_id)
+    if not job:
+        return JSONResponse({"error": "not_found", "job_id": job_id}, status_code=404)
+    return JSONResponse(job)
 
 
 @app.get("/jobs/{job_id}/stream")
@@ -319,8 +322,23 @@ def job_stream(job_id: str):
     def gen():
         last = ""
         while True:
-            meta = read_meta(job_id)
-            tail = read_log_tail(job_id)
+            job = durable_jobs.get_job(job_id)
+            if not job:
+                yield f"data: ERROR:job_not_found\n\n"
+                break
+            
+            # Get log from durable storage
+            paths = durable_jobs.get_csv_paths(job_id)
+            log_path = paths["log"]
+            
+            tail = ""
+            if os.path.exists(log_path):
+                with open(log_path, 'r', encoding='utf-8') as f:
+                    f.seek(0, os.SEEK_END)
+                    sz = f.tell()
+                    start = max(0, sz - 12000)  # Last 12KB
+                    f.seek(start)
+                    tail = f.read()
 
             # Only emit new tail chunks
             if tail != last:
@@ -330,13 +348,13 @@ def job_stream(job_id: str):
                 safe = chunk.replace("\n", "\\n")
                 yield f"data: {safe}\n\n"
 
-            if meta.get("status") in ("done", "error", "missing"):
+            if job.get("status") in ("done", "error", "missing"):
                 break
 
             time.sleep(0.5)
 
         # Final status push
-        yield f"data: __STATUS__:{meta.get('status')}\n\n"
+        yield f"data: __STATUS__:{job.get('status')}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -344,7 +362,7 @@ def job_stream(job_id: str):
 @app.get("/jobs/{job_id}/download")
 def job_download(job_id: str, partial: int = Query(0)):
     """
-    Download enriched CSV for completed job (PHASE 4.5.1)
+    Download enriched CSV for completed job (PHASE 4.5.2 - DURABLE STORAGE)
 
     CRITICAL: NEVER returns CSV unless status == "done"
     Returns 409 (Conflict) JSON if job is still running/queued/error
@@ -357,13 +375,21 @@ def job_download(job_id: str, partial: int = Query(0)):
     Returns:
         CSV file download OR JSON error
     """
-    # Get output CSV path
-    _, _, out_csv_path = job_paths(job_id)
+    # Get job from durable storage
+    job = durable_jobs.get_job(job_id)
+    if not job:
+        return JSONResponse(
+            {"error": "not_found", "job_id": job_id},
+            status_code=404,
+            headers={"Content-Type": "application/json"}
+        )
+    
+    # Get CSV paths from durable storage
+    paths = durable_jobs.get_csv_paths(job_id)
     
     # PHASE 4.5.1: Partial download support
-    partial_path = out_csv_path.replace(".enriched.csv", ".partial.csv") if out_csv_path else None
-    
     if partial:
+        partial_path = job.get("partial_csv_path") or paths["partial_csv"]
         if partial_path and os.path.exists(partial_path):
             logger.info(f"Serving partial CSV download for job {job_id}: {partial_path}")
             return FileResponse(
@@ -384,8 +410,7 @@ def job_download(job_id: str, partial: int = Query(0)):
         )
 
     # Read job metadata
-    meta = read_meta(job_id) or {}
-    status = (meta.get("status") or "").lower().strip()
+    status = (job.get("status") or "").lower().strip()
 
     # ✅ HARD GUARD: NEVER return CSV unless status == "done"
     if status != "done":
@@ -396,6 +421,9 @@ def job_download(job_id: str, partial: int = Query(0)):
             headers={"Content-Type": "application/json"}
         )
 
+    # Get output CSV path from job metadata
+    out_csv_path = job.get("out_csv_path") or paths["out_csv"]
+    
     # Check file exists
     if not out_csv_path or not os.path.exists(out_csv_path):
         logger.error(f"Job {job_id} marked done but output file missing: {out_csv_path}")
@@ -418,7 +446,6 @@ def job_download(job_id: str, partial: int = Query(0)):
             "X-Content-Type-Options": "nosniff",  # PHASE 4 CLEANUP: Security header
         }
     )
-
 
 @app.get("/")
 async def root():
