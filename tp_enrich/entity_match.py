@@ -39,7 +39,7 @@ and verifying matches against Google Places API.
 def _clean_name(s: str) -> str:
     """Normalize business name for matching"""
     s = (s or "").strip().lower()
-    s = re.sub(r"[\.\,\(\)\[\]\{\}\-\_]+", " ", s)
+    s = re.sub(r"[\.\ ,\(\)\[\]\{\}\-\_]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     # light suffix stripping (don't overdo it)
     for suf in [" llc", " inc", " ltd", " corp", " co", " company", " limited"]:
@@ -168,36 +168,42 @@ def _score_candidate(query: Dict[str, Any], candidate: Dict[str, Any]) -> float:
     - Domain match (exact): 10%
     - Phone match (normalized): 10%
     """
-    score = 0.0
-
     # Name similarity (60% weight)
     q_name = query.get("name", "")
     c_name = candidate.get("name", "")
+    name_score = 0.0
     if q_name and c_name:
         name_score = _token_jaccard(q_name, c_name)
-        score += 0.6 * name_score
 
     # State match (20% weight) - exact match required
     q_state = (query.get("state") or "").strip().upper()
     c_state = (candidate.get("state") or "").strip().upper()
-    if q_state and c_state and q_state == c_state:
-        score += 0.2
+    state_score = 1.0 if (q_state and c_state and q_state == c_state) else 0.0
 
     # Domain match (10% weight) - exact match
     q_domain = (query.get("domain") or "").strip().lower()
     c_domain = (candidate.get("domain") or "").strip().lower()
-    if q_domain and c_domain and q_domain == c_domain:
-        score += 0.1
+    domain_score = 1.0 if (q_domain and c_domain and q_domain == c_domain) else 0.0
 
     # Phone match (10% weight) - normalized digits
     q_phone = re.sub(r"\D", "", query.get("phone") or "")
     c_phone = re.sub(r"\D", "", candidate.get("phone") or "")
+    phone_score = 0.0
     if q_phone and c_phone and len(q_phone) >= 10 and len(c_phone) >= 10:
         # Compare last 10 digits (US phone numbers)
         if q_phone[-10:] == c_phone[-10:]:
-            score += 0.1
+            phone_score = 1.0
 
-    return score
+    # Total weighted score
+    total_score = (0.6 * name_score) + (0.2 * state_score) + (0.1 * domain_score) + (0.1 * phone_score)
+
+    # PHASE 4.6: Return tuple (total_score, component_scores) for diagnostic analysis
+    return (total_score, {
+        "score_name": name_score,
+        "score_state": state_score,
+        "score_domain": domain_score,
+        "score_phone": phone_score,
+    })
 
 
 def pick_best(
@@ -233,21 +239,27 @@ def pick_best(
     # Score all candidates
     scored = []
     for candidate in candidates:
-        score = _score_candidate(query, candidate)
-        scored.append((candidate, score))
+        total_score, components = _score_candidate(query, candidate)  # PHASE 4.6: Unpack tuple
+        scored.append((candidate, total_score, components))
 
     # Sort by score descending
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    best_candidate, best_score = scored[0]
-    all_scores = [(c.get("source", "unknown"), s) for c, s in scored]
+    best_candidate, best_score, best_components = scored[0]
+    all_scores = [(c.get("source", "unknown"), s) for c, s, _ in scored]
 
     passed = best_score >= threshold
 
+    # PHASE 4.6: Include component scores in result for diagnostic analysis
     return {
         "chosen": best_candidate if passed else None,
         "best_score": best_score,
         "all_scores": all_scores,
         "passed_threshold": passed,
-        "reason": "accepted" if passed else f"below_threshold_{threshold}"
+        "reason": "accepted" if passed else f"below_threshold_{threshold}",
+        # Component scores for tuning threshold intelligently
+        "score_name": best_components.get("score_name", 0.0),
+        "score_state": best_components.get("score_state", 0.0),
+        "score_domain": best_components.get("score_domain", 0.0),
+        "score_phone": best_components.get("score_phone", 0.0),
     }
