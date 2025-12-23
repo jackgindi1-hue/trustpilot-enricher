@@ -889,6 +889,13 @@ def run_pipeline(
                 # Merge current enrichment results into df for checkpoint
                 df_checkpoint = merge_enrichment_back_to_rows(df.copy(), list(enrichment_results.values()))
                 _write_checkpoint_csv(df_checkpoint, partial_path, logger)
+
+                # Update durable metadata so API knows partial exists
+                job_id = config.get('job_id') if config else None
+                if job_id:
+                    from tp_enrich import durable_jobs
+                    durable_jobs.update_job(job_id, {"partial_csv_path": partial_path})
+                    logger.info(f"  CHECKPOINT: Updated job metadata with partial_csv_path")
             except Exception as e:
                 logger.warning(f"  CHECKPOINT: Failed to write partial CSV: {e}")
         # ============================================================
@@ -905,6 +912,13 @@ def run_pipeline(
         try:
             df_final_checkpoint = merge_enrichment_back_to_rows(df.copy(), list(enrichment_results.values()))
             _write_checkpoint_csv(df_final_checkpoint, partial_path, logger)
+
+            # Update durable metadata so API knows partial exists
+            job_id = config.get('job_id') if config else None
+            if job_id:
+                from tp_enrich import durable_jobs
+                durable_jobs.update_job(job_id, {"partial_csv_path": partial_path})
+                logger.info(f"  CHECKPOINT (FINAL): Updated job metadata with partial_csv_path")
         except Exception as e:
             logger.warning(f"  CHECKPOINT (FINAL): Failed to write final partial CSV: {e}")
     # ============================================================
