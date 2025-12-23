@@ -1,5 +1,94 @@
 # Trustpilot Enricher - Task Tracker
 
+## ✅ PHASE 4.6 — Anchor Discovery + Adaptive Enrichment
+
+**Date**: December 23, 2025, 03:45 UTC
+**Status**: ✅ **IMPLEMENTED - READY TO TEST**
+
+### Problem Solved
+**Phase 4.5 Issue**: Many rows had ZERO candidates → canonical score = 0 → rejected with empty row
+
+**Phase 4.6 Solution**: When canonical matching fails, discover anchors from web sources, then retry providers with better queries, keep discovered data even if still rejected
+
+### Key Changes vs Phase 4.5
+| Scenario | Phase 4.5 Behavior | Phase 4.6 Behavior |
+|----------|-------------------|-------------------|
+| No Google/Yelp candidates | Reject → empty row | Discover anchors → retry → keep discovered data |
+| Canonical < 80% | Reject → empty row | Keep discovered_* fields with evidence |
+| Missing state/domain | Skip enrichment | Discover from SERP scrape |
+
+### Architecture Flow
+```
+1. Try Google Places (if state/city exists)
+2. Try Yelp (optional)
+3. If no candidates → Anchor Discovery:
+   - SERP organic queries (DuckDuckGo)
+   - Scrape top 3 URLs
+   - Extract: domain, phone, address, state, email
+   - Pick BEST by evidence strength
+4. If discovered anchors:
+   - Retry Google/Yelp with discovered state
+   - Run Hunter/Apollo with discovered domain
+5. Canonical matching (≥80%)
+   - Pass → full enrichment
+   - Fail → Keep discovered_* fields (NO empty row)
+6. Return enriched data + discovered anchors + evidence
+```
+
+### New Modules Created
+1. **`tp_enrich/anchor_discovery.py`** (+350 lines)
+   - `phase46_anchor_discovery()` - Main discovery function
+   - `google_search_urls()` - DuckDuckGo SERP queries
+   - `scrape_page_for_anchors()` - Web scraping + extraction
+   - `extract_phone_from_text()` - Phone regex extraction
+   - `extract_address_from_text()` - Address pattern extraction
+   - `extract_state_from_text()` - US state code extraction
+
+2. **`tp_enrich/adaptive_enrich.py`** (+300 lines)
+   - `enrich_single_business_adaptive()` - Adaptive waterfall
+   - Tries providers → discovers anchors → retries → canonical match
+   - Keeps discovered data even if canonical fails
+
+### New CSV Fields (Phase 4.6)
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| `discovered_domain` | string | Domain found via SERP scrape | `"acmecorp.com"` |
+| `discovered_phone` | string | Phone found via web scraping | `"(555) 123-4567"` |
+| `discovered_state_region` | string | State found via text extraction | `"CA"` |
+| `discovered_address` | string | Address found via pattern matching | `"123 Main St, City, CA 12345"` |
+| `discovered_email` | string | Email found via web scraping | `"info@acmecorp.com"` |
+| `discovered_evidence_url` | string | URL where anchors were found | `"https://acmecorp.com/contact"` |
+| `discovered_evidence_source` | string | Discovery source | `"serp_scrape"` |
+| `discovery_evidence_json` | JSON string | Full evidence list from all URLs | `[{...}, {...}]` |
+
+### Integration
+- **`pipeline.py`** updated to use `enrich_single_business_adaptive()`
+- Enriched rows now have 8 new discovered_* columns
+- "Rejected" rows (canonical < 80%) keep discovered data
+
+### Benefits
+1. **Max Coverage**: No empty rows when canonical fails
+2. **Evidence Trail**: Every discovered field has evidence URL
+3. **Adaptive**: Discovers anchors → retries with better queries
+4. **Efficient**: Only discovers when needed (no candidates or low score)
+5. **Quality + Quantity**: High-quality canonical matches + discovered fallback data
+
+### Example Row (Canonical Rejected but Discovered Data)
+```csv
+business_name,canonical_source,canonical_match_score,discovered_domain,discovered_phone,discovered_email,discovered_evidence_url
+"Unknown LLC","",0.0,"unknownllc.com","(555) 123-4567","info@unknownllc.com","https://unknownllc.com/contact"
+```
+
+### Testing Required
+- [ ] Upload CSV with poorly matching businesses (no Google/Yelp hits)
+- [ ] Verify anchor discovery triggered (logs: "ANCHOR DISCOVERY: Searching for...")
+- [ ] Check CSV for discovered_* fields populated
+- [ ] Verify discovered_evidence_url points to scraped page
+- [ ] Check discovery_evidence_json contains full evidence list
+- [ ] Confirm "rejected" rows still have discovered data (not empty)
+
+---
+
 ## ✅ PHASE 4.5.4 — UI Gatekeeper Patch (One Shot)
 
 **Date**: December 23, 2025, 03:20 UTC

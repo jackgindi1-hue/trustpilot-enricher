@@ -167,6 +167,15 @@ def merge_enrichment_back_to_rows(df: pd.DataFrame, enriched_businesses: list) -
         # PHASE 4.5 CANONICAL: entity matching fields
         "canonical_source",
         "canonical_match_score",
+        # PHASE 4.6 DISCOVERED: anchor discovery fields
+        "discovered_domain",
+        "discovered_phone",
+        "discovered_state_region",
+        "discovered_address",
+        "discovered_email",
+        "discovered_evidence_url",
+        "discovered_evidence_source",
+        "discovery_evidence_json",
     ]
 
     # ============================================================
@@ -494,10 +503,10 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache, run_id: str = N
     region = context.get('state') or context.get('region')
 
     # ============================================================
-    # PHASE 4.5 FINAL LOCK: Use canonical enrichment
+    # PHASE 4.6: Use adaptive enrichment (with anchor discovery)
     # ============================================================
-    from tp_enrich.canonical_enrich import enrich_single_business_canonical
-    enriched_data = enrich_single_business_canonical(company_name, region=region, logger=logger)
+    from tp_enrich.adaptive_enrich import enrich_single_business_adaptive
+    enriched_data = enrich_single_business_adaptive(company_name, region=region, logger=logger)
     enriched_row = {
         # identity / keys
         "company_normalized_key": normalized_key,
@@ -527,6 +536,15 @@ def enrich_business(business_info: Dict, cache: EnrichmentCache, run_id: str = N
         # PHASE 4.5 CANONICAL: entity matching metadata
         "canonical_source": enriched_data.get("canonical_source", ""),
         "canonical_match_score": enriched_data.get("canonical_match_score", 0.0),
+        # PHASE 4.6 DISCOVERED: anchor discovery fields
+        "discovered_domain": enriched_data.get("discovered_domain", ""),
+        "discovered_phone": enriched_data.get("discovered_phone", ""),
+        "discovered_state_region": enriched_data.get("discovered_state_region", ""),
+        "discovered_address": enriched_data.get("discovered_address", ""),
+        "discovered_email": enriched_data.get("discovered_email", ""),
+        "discovered_evidence_url": enriched_data.get("discovered_evidence_url", ""),
+        "discovered_evidence_source": enriched_data.get("discovered_evidence_source", ""),
+        "discovery_evidence_json": enriched_data.get("discovery_evidence_json", "[]"),
         # debug payloads
         "all_phones_json": enriched_data.get("all_phones_json", "{}"),
         "generic_emails_json": "[]",
