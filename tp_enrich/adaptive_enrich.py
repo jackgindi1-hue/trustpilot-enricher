@@ -163,18 +163,84 @@ def enrich_single_business_adaptive(
                 )
 
             # ============================================================
-            # STEP 5: Retry providers with discovered anchors
+            # STEP 5: FEEDBACK LOOP - Retry providers with discovered anchors
             # ============================================================
-            if has_state and not google_hit:
-                # Retry Google Places with discovered state
+
+            # 5A. Retry Google Places with discovered state/phone
+            if (has_state or has_phone) and not google_hit:
+                if logger:
+                    logger.info("   -> FEEDBACK: Retrying Google Places with discovered anchors")
+
                 try:
-                    state = row["business_state_region"]
-                    google_hit = local_enrichment.enrich_local_business(name, state)
+                    # Build better query with discovered anchors
+                    query_name = name
+                    query_region = row.get("business_state_region") or region
+
+                    # If we have discovered phone, add it to search
+                    if has_phone:
+                        discovered_phone = row.get("discovered_phone")
+                        if logger:
+                            logger.info(f"   -> Retrying Google Places: {query_name} + phone={discovered_phone}")
+                        # Try with phone-enhanced query
+                        google_hit = local_enrichment.enrich_local_business(
+                            f"{query_name} {discovered_phone}",
+                            query_region
+                        )
+
+                    # If still no hit and we have state, try with state
+                    if not google_hit and has_state:
+                        if logger:
+                            logger.info(f"   -> Retrying Google Places: {query_name} + state={query_region}")
+                        google_hit = local_enrichment.enrich_local_business(query_name, query_region)
+
                     if logger and google_hit:
-                        logger.info(f"   -> Google Places (retry with state): SUCCESS")
+                        logger.info(f"   -> FEEDBACK: Google Places retry SUCCESS - got new candidate!")
+
                 except Exception as e:
                     if logger:
-                        logger.warning(f"   -> Google Places (retry) failed: {e}")
+                        logger.warning(f"   -> FEEDBACK: Google Places retry failed: {e}")
+
+            # 5B. Run Hunter/Apollo/Snov immediately with discovered domain
+            if has_domain and not row.get("primary_email"):
+                discovered_domain = row.get("discovered_domain")
+
+                if logger:
+                    logger.info(f"   -> FEEDBACK: Running email providers with discovered domain={discovered_domain}")
+
+                try:
+                    # Run email waterfall with discovered domain
+                    wf = email_waterfall_enrich(
+                        company=name,
+                        domain=discovered_domain,
+                        person_name=None,
+                        logger=logger
+                    )
+
+                    if wf.get("primary_email"):
+                        row["primary_email"] = wf["primary_email"]
+                        row["primary_email_source"] = wf.get("email_source")
+                        row["primary_email_confidence"] = wf.get("email_confidence")
+                        row["email_type"] = wf.get("email_type")
+                        row["email_providers_attempted"] = wf.get("email_tried") or ""
+
+                        if logger:
+                            logger.info(
+                                f"   -> FEEDBACK: Email waterfall SUCCESS - "
+                                f"got {row['primary_email']} from {row['primary_email_source']}"
+                            )
+
+                except Exception as e:
+                    if logger:
+                        logger.warning(f"   -> FEEDBACK: Email waterfall with discovered domain failed: {e}")
+
+            # 5C. Update candidates flag after retry (feeds into canonical matching)
+            has_candidates = bool(google_hit or yelp_hit)
+
+            if logger:
+                logger.info(
+                    f"   -> FEEDBACK: After retry, has_candidates={has_candidates} "
+                    f"(google_hit={bool(google_hit)}, yelp_hit={bool(yelp_hit)})"
+                )
 
         except Exception as e:
             if logger:

@@ -1,5 +1,114 @@
 # Trustpilot Enricher - Task Tracker
 
+## ✅ PHASE 4.6.1 — Anchor Discovery Feedback Loop
+
+**Date**: December 23, 2025, 04:00 UTC
+**Status**: ✅ **IMPLEMENTED - READY TO TEST**
+
+### Problem
+Phase 4.6 was discovering anchors correctly, but **not feeding them back into providers**.
+- Discovered state/phone/domain were stored but **not used for retry**
+- Providers (Google, Yelp, Hunter, Apollo) didn't benefit from discovered data
+- Canonical matching still had weak/no candidates after discovery
+
+### Solution: Comprehensive Feedback Loop
+After anchor discovery completes:
+
+**5A. Retry Google Places with discovered anchors**:
+- If `discovered_phone`: retry with `"{name} {phone}"` query
+- If `discovered_state_region`: retry with `name + state`
+- Updates `google_hit` with new candidate for canonical matching
+
+**5B. Run email providers immediately with discovered domain**:
+- If `discovered_domain`: run Hunter/Apollo/Snov waterfall
+- Populates `primary_email` before canonical matching
+- No waiting for canonical to pass
+
+**5C. Update candidates flag**:
+- After retry, recalculate `has_candidates = bool(google_hit or yelp_hit)`
+- Feeds NEW candidates into canonical matching
+
+### Flow Enhancement
+```
+Before (Phase 4.6):
+1. No Google/Yelp candidates
+2. Anchor discovery → finds domain/phone/state
+3. Store in discovered_* fields
+4. Canonical matching (still no candidates) → fail
+5. Keep discovered data ✓
+
+After (Phase 4.6.1):
+1. No Google/Yelp candidates
+2. Anchor discovery → finds domain/phone/state
+3. FEEDBACK: Retry Google Places with discovered state/phone
+4. FEEDBACK: Run Hunter/Apollo with discovered domain
+5. Canonical matching with NEW candidates → likely pass ✅
+6. Full enrichment proceeds
+```
+
+### Code Changes
+**File**: `tp_enrich/adaptive_enrich.py`
+
+**Before** (weak retry):
+```python
+if has_state and not google_hit:
+    google_hit = local_enrichment.enrich_local_business(name, state)
+```
+
+**After** (comprehensive feedback):
+```python
+# 5A. Retry Google Places with phone OR state
+if (has_state or has_phone) and not google_hit:
+    # Try with phone-enhanced query
+    if has_phone:
+        google_hit = local_enrichment.enrich_local_business(
+            f"{name} {discovered_phone}",
+            discovered_state
+        )
+
+    # Try with state if still no hit
+    if not google_hit and has_state:
+        google_hit = local_enrichment.enrich_local_business(name, discovered_state)
+
+# 5B. Run email waterfall with discovered domain
+if has_domain and not row.get("primary_email"):
+    wf = email_waterfall_enrich(company=name, domain=discovered_domain)
+    row["primary_email"] = wf.get("primary_email")
+
+# 5C. Update candidates for canonical matching
+has_candidates = bool(google_hit or yelp_hit)
+```
+
+### Benefits
+1. **Higher Canonical Pass Rate**: Discovered anchors → better queries → more candidates → higher scores
+2. **Immediate Email Enrichment**: Don't wait for canonical, use discovered domain immediately
+3. **Max Coverage**: Discovery + feedback → canonical matching with strong candidates
+4. **Efficient**: Only retries when discovery found new anchors
+
+### Testing
+- [ ] Upload CSV with no Google hits initially
+- [ ] Verify anchor discovery finds domain/state/phone
+- [ ] Check logs for "FEEDBACK: Retrying Google Places with discovered anchors"
+- [ ] Verify "FEEDBACK: Google Places retry SUCCESS - got new candidate!"
+- [ ] Confirm canonical matching score improves after feedback
+- [ ] Check email populated from discovered domain before canonical
+
+### Expected Logs
+```
+INFO: No candidates from Google/Yelp, triggering anchor discovery
+INFO: ANCHOR DISCOVERY: Searching for Unknown Business
+INFO: Anchor discovery complete: domain=True, phone=True, state=True
+INFO: FEEDBACK: Retrying Google Places with discovered anchors
+INFO: Retrying Google Places: Unknown Business + phone=(555) 123-4567
+INFO: FEEDBACK: Google Places retry SUCCESS - got new candidate!
+INFO: FEEDBACK: Running email providers with discovered domain=unknown.com
+INFO: FEEDBACK: Email waterfall SUCCESS - got info@unknown.com from hunter
+INFO: FEEDBACK: After retry, has_candidates=True (google_hit=True, yelp_hit=False)
+INFO: CANONICAL: google (score=0.88)
+```
+
+---
+
 ## ✅ PHASE 4.6 — Anchor Discovery + Adaptive Enrichment
 
 **Date**: December 23, 2025, 03:45 UTC
@@ -378,7 +487,7 @@ api_server.py had **broken imports** that would crash on startup:
 
 ## 🚀 NEXT STEPS
 
-1. **Commit Phase 4.5** ✅
+1. **Commit Phase 4.6.1** ✅
 2. **Push to GitHub** ⏳
 3. **Railway auto-deploy** (backend)
 4. **Netlify auto-deploy** (frontend)
@@ -388,6 +497,6 @@ api_server.py had **broken imports** that would crash on startup:
 
 ---
 
-**Current Focus**: ✅ **PHASE 4.5 COMPLETE - READY TO DEPLOY**
+**Current Focus**: ✅ **PHASE 4.6.1 COMPLETE - READY TO DEPLOY**
 **Status**: 🟢 **ALL CODE IMPLEMENTED**
 **Next**: Push to GitHub and verify auto-deploy
