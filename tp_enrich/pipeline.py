@@ -41,9 +41,9 @@ PHASE2_OC_EXPORT_COLS = [
 _rate = SimpleRateLimiter(min_interval_s=0.2)
 
 # ============================================================
-# PHASE 4: Checkpoint configuration for partial CSV exports
+# PHASE 4.5.3: Checkpoint configuration for partial CSV exports
 # ============================================================
-CHECKPOINT_EVERY = 250  # Write partial CSV every N businesses (250 = ~10-15 min chunks)
+CHECKPOINT_EVERY = 50  # Write partial CSV every N businesses (lowered for testing & early partials)
 
 def _safe_str(x):
     """Safely convert value to string, handling None and NaN."""
