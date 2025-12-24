@@ -2,7 +2,7 @@
 Local business enrichment - Google Places + Yelp
 """
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from .logging_utils import setup_logger
 logger = setup_logger(__name__)
 
@@ -18,6 +18,103 @@ logger.info(
     bool(YELP_API_KEY),
     len(YELP_API_KEY) if YELP_API_KEY else 0,
 )
+
+# ============================================================
+# PHASE 4.6.3 — GOOGLE PLACES SCOUT MODE (NAME-ONLY)
+# ============================================================
+
+def google_places_scout_by_name(
+    business_name: str,
+    google_api_key: str,
+    timeout: int = 8,
+) -> Optional[Dict[str, Any]]:
+    """
+    PHASE 4.6.3: NAME-ONLY Scout Mode for Google Places.
+
+    - Uses Find Place From Text (no state/city required)
+    - If we get a place_id, pulls Details
+    - Returns a normalized dict that can become a candidate
+
+    This increases coverage by not requiring state/city anchors upfront.
+    """
+    import requests
+
+    business_name = (business_name or "").strip()
+    if not business_name:
+        return None
+
+    # 1) FindPlace: name-only
+    find_url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
+    find_params = {
+        "input": business_name,
+        "inputtype": "textquery",
+        "fields": "place_id,name",
+        "key": google_api_key,
+    }
+
+    try:
+        r = requests.get(find_url, params=find_params, timeout=timeout)
+        if r.status_code >= 400:
+            return None
+
+        data = r.json() or {}
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return None
+
+        place_id = candidates[0].get("place_id")
+        if not place_id:
+            return None
+
+        # 2) Details
+        details_url = "https://maps.googleapis.com/maps/api/place/details/json"
+        details_params = {
+            "place_id": place_id,
+            "fields": "name,formatted_address,formatted_phone_number,website,address_components",
+            "key": google_api_key,
+        }
+
+        r2 = requests.get(details_url, params=details_params, timeout=timeout)
+        if r2.status_code >= 400:
+            return None
+
+        d2 = (r2.json() or {}).get("result") or {}
+        if not d2:
+            return None
+
+        # Parse state/city from address components
+        state = None
+        city = None
+        postal_code = None
+
+        for comp in (d2.get("address_component") or d2.get("address_components") or []):
+            types = comp.get("types") or []
+            if "administrative_area_level_1" in types:
+                state = comp.get("short_name") or comp.get("long_name")
+            if "locality" in types:
+                city = comp.get("long_name") or comp.get("short_name")
+            if "postal_code" in types:
+                postal_code = comp.get("long_name") or comp.get("short_name")
+
+        return {
+            "source": "google_scout",
+            "name": d2.get("name") or business_name,  # ✅ NEVER None
+            "address": d2.get("formatted_address") or "",
+            "phone": d2.get("formatted_phone_number") or "",
+            "website": d2.get("website") or "",
+            "state": (state or "").strip(),
+            "state_region": (state or "").strip(),
+            "city": (city or "").strip(),
+            "postal_code": (postal_code or "").strip(),
+            "place_id": place_id,
+            "scout_mode": True,
+        }
+
+    except Exception as e:
+        logger.warning(f"Google Places scout mode failed for '{business_name}': {e}")
+        return None
+
+
 
 
 def enrich_local_business(name: str, region: Optional[str] = None) -> Dict:

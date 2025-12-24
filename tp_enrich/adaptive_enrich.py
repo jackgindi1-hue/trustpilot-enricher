@@ -282,17 +282,31 @@ def enrich_single_business_adaptive(
     # ============================================================
     google_hit = None
     yelp_hit = None
+
+    # Try anchored Google Places if we have state/city
     if has_state or region:
         try:
             google_hit = local_enrichment.enrich_local_business(name, region)
             if logger and google_hit:
-                logger.info(f"   -> Google Places: name={google_hit.get('name')} state={google_hit.get('state_region')}")
+                logger.info(f"   -> Google Places (anchored): name={google_hit.get('name')} state={google_hit.get('state_region')}")
         except Exception as e:
             if logger:
-                logger.warning(f"   -> Google Places failed: {e}")
-    else:
-        if logger:
-            logger.info("   -> Skipping Google Places (no state/city anchor)")
+                logger.warning(f"   -> Google Places (anchored) failed: {e}")
+
+    # PHASE 4.6.3: Scout mode fallback (name-only) if no hit yet
+    if not google_hit:
+        try:
+            import os
+            google_key = os.getenv("GOOGLE_PLACES_API_KEY")
+            if google_key:
+                if logger:
+                    logger.info(f"   -> GOOGLE SCOUT: Trying name-only lookup for '{name}'")
+                google_hit = local_enrichment.google_places_scout_by_name(name, google_key)
+                if logger and google_hit:
+                    logger.info(f"   -> GOOGLE SCOUT SUCCESS: name={google_hit.get('name')} state={google_hit.get('state_region')} place_id={google_hit.get('place_id')}")
+        except Exception as e:
+            if logger:
+                logger.warning(f"   -> Google scout mode failed: {e}")
     # ============================================================
     # STEP 2: Try Yelp (same logic)
     # ============================================================
