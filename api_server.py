@@ -278,6 +278,10 @@ async def create_job(
         config['lender_name_override'] = lender_name_override
     config['concurrency'] = int(concurrency or 8)
 
+    # PHASE 4.6.4: Clamp concurrency to max 4 when anchor discovery is enabled
+    # High concurrency + anchor discovery = 429 storms from SerpAPI
+    config['concurrency'] = min(config['concurrency'], 4)
+
     durable_jobs.set_job_status(job_id, "queued", stage="queued", filename=file.filename, rows=rows)
 
     # Start background thread

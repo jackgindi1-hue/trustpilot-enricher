@@ -78,7 +78,7 @@ def _run_email_step(name: str, row: dict, logger=None) -> dict:
 
     if not canonical_source and discovered_domain:
         if logger:
-            logger.info(f"   -> EMAIL: Canonical rejected, but running email due to domain={email_domain}")
+            logger.info("CANONICAL rejected; still running email due to discovered_domain")
 
     if logger:
         logger.info(
