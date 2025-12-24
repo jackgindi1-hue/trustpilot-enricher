@@ -13,6 +13,7 @@
 # ============================================================
 
 import re
+import time
 import requests
 from typing import Dict, Any, Optional, List
 from urllib.parse import urlparse, urljoin
@@ -408,3 +409,152 @@ def phase46_anchor_discovery(
     done(f"found_domain={bool(result.get('discovered_domain'))} found_phone={bool(result.get('discovered_phone'))}")
 
     return result
+
+
+# ============================================================
+# PHASE 4.6.3 — ANCHOR DISCOVERY WITH CACHING + 429 RETRY
+# ============================================================
+
+# Per-job cache for anchor discovery (prevents duplicate lookups)
+DISCOVERY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _norm_key(s: str) -> str:
+    """Normalize company name for cache key."""
+    return " ".join((s or "").lower().split()).strip()
+
+
+def _sleep_backoff(attempt: int):
+    """Exponential backoff for retries."""
+    sleep_time = min(8.0, 0.6 * (2 ** attempt))  # 0.6, 1.2, 2.4, 4.8, 8.0
+    time.sleep(sleep_time)
+
+
+def phase46_anchor_discovery_cached(
+    business_name: str,
+    vertical: Optional[str] = None,
+    max_urls: int = 2,
+    logger=None,
+    max_retries: int = 3
+) -> Dict[str, Any]:
+    """
+    PHASE 4.6.3: Cached anchor discovery with 429 retry logic.
+    
+    Improvements over base function:
+    - Per-job caching (prevents duplicate lookups)
+    - 429 retry with exponential backoff
+    - Explicit debug notes on failure
+    - Never silently returns empty (logs failures)
+    
+    Args:
+        business_name: Business name to search
+        vertical: Optional vertical (e.g., "trucking", "plumbing")
+        max_urls: Max URLs to scrape (default 2)
+        logger: Optional logger
+        max_retries: Max retry attempts for 429 errors (default 3)
+    
+    Returns:
+        Dict with discovered anchors + evidence (same as phase46_anchor_discovery)
+    """
+    # Check cache first
+    cache_key = _norm_key(business_name)
+    if cache_key in DISCOVERY_CACHE:
+        if logger:
+            logger.info(f"   -> ANCHOR DISCOVERY: Using cached result for '{business_name}'")
+        return DISCOVERY_CACHE[cache_key].copy()
+    
+    # Try discovery with retry logic
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            result = phase46_anchor_discovery(
+                business_name=business_name,
+                vertical=vertical,
+                max_urls=max_urls,
+                logger=logger
+            )
+            
+            # Cache successful result
+            DISCOVERY_CACHE[cache_key] = result.copy()
+            return result
+            
+        except requests.exceptions.HTTPError as ex:
+            last_error = ex
+            status_code = getattr(ex.response, 'status_code', None) if hasattr(ex, 'response') else None
+            
+            # Retry on 429 (rate limit)
+            if status_code == 429:
+                if logger:
+                    logger.warning(
+                        f"   -> ANCHOR DISCOVERY: 429 rate limit hit (attempt {attempt + 1}/{max_retries}) "
+                        f"for '{business_name}'"
+                    )
+                if attempt < max_retries - 1:
+                    _sleep_backoff(attempt)
+                    continue
+                else:
+                    if logger:
+                        logger.error(f"   -> ANCHOR DISCOVERY: Max retries exceeded for '{business_name}'")
+                    break
+            else:
+                # Non-429 HTTP error, don't retry
+                if logger:
+                    logger.error(
+                        f"   -> ANCHOR DISCOVERY: HTTP {status_code} error for '{business_name}': {ex}"
+                    )
+                break
+                
+        except Exception as ex:
+            last_error = ex
+            error_msg = str(ex).lower()
+            
+            # Check if error message indicates rate limiting
+            if "429" in error_msg or "rate" in error_msg or "quota" in error_msg:
+                if logger:
+                    logger.warning(
+                        f"   -> ANCHOR DISCOVERY: Rate limit detected (attempt {attempt + 1}/{max_retries}) "
+                        f"for '{business_name}': {ex}"
+                    )
+                if attempt < max_retries - 1:
+                    _sleep_backoff(attempt)
+                    continue
+                else:
+                    if logger:
+                        logger.error(f"   -> ANCHOR DISCOVERY: Max retries exceeded for '{business_name}'")
+                    break
+            else:
+                # Non-rate-limit error, don't retry
+                if logger:
+                    logger.error(f"   -> ANCHOR DISCOVERY: Error for '{business_name}': {ex}")
+                break
+    
+    # All retries failed - return empty result with debug notes
+    if logger:
+        logger.error(
+            f"   -> ANCHOR DISCOVERY: FAILED for '{business_name}' after {max_retries} attempts. "
+            f"Last error: {repr(last_error)}"
+        )
+    
+    empty_result = {
+        "discovered_domain": None,
+        "discovered_phone": None,
+        "discovered_state_region": None,
+        "discovered_address": None,
+        "discovered_email": None,
+        "discovered_evidence_url": None,
+        "discovered_evidence_source": None,
+        "discovery_evidence_json": "[]",
+        "discovery_error": repr(last_error),
+        "discovery_failed": True,
+    }
+    
+    # Cache the failure to avoid retrying same business repeatedly
+    DISCOVERY_CACHE[cache_key] = empty_result.copy()
+    
+    return empty_result
+
+
+def clear_discovery_cache():
+    """Clear the per-job discovery cache (call at job start/end)."""
+    global DISCOVERY_CACHE
+    DISCOVERY_CACHE.clear()

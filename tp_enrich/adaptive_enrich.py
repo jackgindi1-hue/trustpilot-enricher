@@ -14,7 +14,7 @@
 # 6. Always merge results with source tags and evidence URLs
 # ============================================================
 from typing import Dict, Any, Optional
-from tp_enrich.anchor_discovery import phase46_anchor_discovery
+from tp_enrich.anchor_discovery import phase46_anchor_discovery_cached
 from tp_enrich.canonical import choose_canonical_business, apply_canonical_to_row, should_run_opencorporates
 from tp_enrich import local_enrichment
 from tp_enrich.phone_enrichment import enrich_business_phone_waterfall
@@ -323,7 +323,7 @@ def enrich_single_business_adaptive(
         # ============================================================
         try:
             # PHASE 4.6.4: Reduced max_urls from 3 to 2 for speed
-            discovered = phase46_anchor_discovery(name, vertical=None, max_urls=2, logger=logger)
+            discovered = phase46_anchor_discovery_cached(name, vertical=None, max_urls=2, logger=logger)
             # Merge discovered anchors into row
             row["discovered_domain"] = discovered.get("discovered_domain")
             row["discovered_phone"] = discovered.get("discovered_phone")
