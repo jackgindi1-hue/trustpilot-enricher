@@ -14,7 +14,7 @@
 # 6. Always merge results with source tags and evidence URLs
 # ============================================================
 from typing import Dict, Any, Optional
-from tp_enrich.anchor_discovery import phase46_anchor_discovery_cached
+from tp_enrich.anchor_discovery import phase46_anchor_discovery
 from tp_enrich.canonical import choose_canonical_business, apply_canonical_to_row, should_run_opencorporates
 from tp_enrich import local_enrichment
 from tp_enrich.phone_enrichment import enrich_business_phone_waterfall
@@ -282,31 +282,17 @@ def enrich_single_business_adaptive(
     # ============================================================
     google_hit = None
     yelp_hit = None
-
-    # Try anchored Google Places if we have state/city
     if has_state or region:
         try:
             google_hit = local_enrichment.enrich_local_business(name, region)
             if logger and google_hit:
-                logger.info(f"   -> Google Places (anchored): name={google_hit.get('name')} state={google_hit.get('state_region')}")
+                logger.info(f"   -> Google Places: name={google_hit.get('name')} state={google_hit.get('state_region')}")
         except Exception as e:
             if logger:
-                logger.warning(f"   -> Google Places (anchored) failed: {e}")
-
-    # PHASE 4.6.3: Scout mode fallback (name-only) if no hit yet
-    if not google_hit:
-        try:
-            import os
-            google_key = os.getenv("GOOGLE_PLACES_API_KEY")
-            if google_key:
-                if logger:
-                    logger.info(f"   -> GOOGLE SCOUT: Trying name-only lookup for '{name}'")
-                google_hit = local_enrichment.google_places_scout_by_name(name, google_key)
-                if logger and google_hit:
-                    logger.info(f"   -> GOOGLE SCOUT SUCCESS: name={google_hit.get('name')} state={google_hit.get('state_region')} place_id={google_hit.get('place_id')}")
-        except Exception as e:
-            if logger:
-                logger.warning(f"   -> Google scout mode failed: {e}")
+                logger.warning(f"   -> Google Places failed: {e}")
+    else:
+        if logger:
+            logger.info("   -> Skipping Google Places (no state/city anchor)")
     # ============================================================
     # STEP 2: Try Yelp (same logic)
     # ============================================================
@@ -315,15 +301,31 @@ def enrich_single_business_adaptive(
     # STEP 3: Check if we have weak candidates or missing anchors
     # ============================================================
     has_candidates = bool(google_hit or yelp_hit)
-    if not has_candidates:
-        if logger:
-            logger.info("   -> No candidates from Google/Yelp, triggering anchor discovery")
+    
+    # PHASE 4.6.4: Also trigger discovery when missing key anchors (not just no candidates)
+    missing_domain = not bool((row.get("company_domain") or row.get("business_domain") or "").strip())
+    missing_phone = not bool((row.get("primary_phone") or "").strip())
+    missing_state = not bool((row.get("business_state_region") or "").strip())
+    missing_key_anchors = missing_domain and (missing_phone or missing_state)
+    
+    should_discover = (not has_candidates) or missing_key_anchors
+    
+    if should_discover:
+        if not has_candidates:
+            if logger:
+                logger.info("   -> No candidates from Google/Yelp, triggering anchor discovery")
+        else:
+            if logger:
+                logger.info(
+                    f"   -> Weak anchors (domain={not missing_domain}, phone={not missing_phone}, "
+                    f"state={not missing_state}), triggering anchor discovery"
+                )
         # ============================================================
         # STEP 4: Run anchor discovery
         # ============================================================
         try:
             # PHASE 4.6.4: Reduced max_urls from 3 to 2 for speed
-            discovered = phase46_anchor_discovery_cached(name, vertical=None, max_urls=2, logger=logger)
+            discovered = phase46_anchor_discovery(name, vertical=None, max_urls=2, logger=logger)
             # Merge discovered anchors into row
             row["discovered_domain"] = discovered.get("discovered_domain")
             row["discovered_phone"] = discovered.get("discovered_phone")
