@@ -301,15 +301,15 @@ def enrich_single_business_adaptive(
     # STEP 3: Check if we have weak candidates or missing anchors
     # ============================================================
     has_candidates = bool(google_hit or yelp_hit)
-    
+
     # PHASE 4.6.4: Also trigger discovery when missing key anchors (not just no candidates)
     missing_domain = not bool((row.get("company_domain") or row.get("business_domain") or "").strip())
     missing_phone = not bool((row.get("primary_phone") or "").strip())
     missing_state = not bool((row.get("business_state_region") or "").strip())
     missing_key_anchors = missing_domain and (missing_phone or missing_state)
-    
+
     should_discover = (not has_candidates) or missing_key_anchors
-    
+
     if should_discover:
         if not has_candidates:
             if logger:
@@ -345,9 +345,13 @@ def enrich_single_business_adaptive(
                 # then _promote_discovered_phone() will use it if waterfall fails
             if discovered.get("discovered_state_region"):
                 has_state = True
-                row["business_state_region"] = discovered["discovered_state_region"]
+                # PHASE 4.6.5: CRITICAL - NEVER overwrite business_state_region
+                # discovered_state_region stays separate and is only used as query fallback
+                # Overwriting caused state poisoning (VA -> ID) which killed canonical matching
             if discovered.get("discovered_address"):
-                row["business_address"] = discovered["discovered_address"]
+                # PHASE 4.6.5: Only set address if currently missing (don't overwrite)
+                if not row.get("business_address"):
+                    row["business_address"] = discovered["discovered_address"]
             if discovered.get("discovered_email"):
                 assign_email(row, discovered["discovered_email"], source="anchor_discovery")
             if logger:
@@ -365,7 +369,12 @@ def enrich_single_business_adaptive(
                 try:
                     # Build better query with discovered anchors
                     query_name = name
-                    query_region = row.get("business_state_region") or region
+                    # PHASE 4.6.5: Use discovered_state_region as query fallback only (NOT as replacement)
+                    query_region = (
+                        row.get("business_state_region")  # Original input (sacred, never overwrite)
+                        or row.get("discovered_state_region")  # Discovery fallback (for queries only)
+                        or region  # Initial region param
+                    )
                     # If we have discovered phone, add it to search
                     if has_phone:
                         discovered_phone = row.get("discovered_phone")

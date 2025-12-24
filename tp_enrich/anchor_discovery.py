@@ -30,6 +30,14 @@ ANCHOR_HTML_CAP = 80_000  # Cap HTML bytes for faster parsing
 ANCHOR_MAX_URLS = 4  # Reduced from unlimited
 ANCHOR_MAX_QUERIES = 2  # Limit number of search queries
 
+# PHASE 4.6.5: Directory domains that should NOT become discovered_domain
+DIRECTORY_DOMAINS = {
+    "chamberofcommerce.com", "buildzoom.com", "mapquest.com", "facebook.com",
+    "linkedin.com", "yelp.com", "yellowpages.com", "bbb.org", "brokersnapshot.com",
+    "usarestaurants.info", "opencorporates.com", "bizapedia.com", "zoominfo.com",
+    "superpages.com", "manta.com", "dnb.com", "bbb.org", "yellowpages.ca"
+}
+
 
 # ============================================================
 # SERP Query Helpers
@@ -126,6 +134,35 @@ def extract_domain_from_url(url: str) -> Optional[str]:
         return None
 
 
+def is_directory_domain(domain: str) -> bool:
+    """
+    PHASE 4.6.5: Check if domain is a directory/aggregator site.
+
+    Directory domains should NOT become discovered_domain because:
+    - They're not the actual business website
+    - They poison email enrichment (Hunter searches wrong domain)
+    - They cause canonical matching failures
+
+    Returns:
+        True if domain is a known directory site, False otherwise
+    """
+    if not domain:
+        return False
+
+    domain = domain.lower().strip()
+
+    # Direct match
+    if domain in DIRECTORY_DOMAINS:
+        return True
+
+    # Subdomain match (e.g., "maps.google.com" matches "google.com" if in list)
+    for dir_domain in DIRECTORY_DOMAINS:
+        if domain.endswith('.' + dir_domain) or domain == dir_domain:
+            return True
+
+    return False
+
+
 def extract_phone_from_text(text: str) -> Optional[str]:
     """
     Extract phone number from text using regex.
@@ -177,26 +214,33 @@ def extract_address_from_text(text: str) -> Optional[str]:
 
 def extract_state_from_text(text: str) -> Optional[str]:
     """
-    Extract US state code from text.
-    Looks for 2-letter state codes (CA, NY, TX, etc.)
+    PHASE 4.6.5: Extract US state code from VISIBLE TEXT only.
+
+    CRITICAL: Must match state codes in address-like contexts, NOT in HTML attributes.
+    Pattern matches state codes that appear after commas or spaces (typical address format).
+
+    Examples that SHOULD match:
+    - "123 Main St, Springfield, VA 12345"
+    - "Located in VA"
+    - "Springfield, VA"
+
+    Examples that should NOT match:
+    - 'id="VA"' or 'class="VA"' (HTML attributes)
+    - Random uppercase VA in middle of word
     """
     if not text:
         return None
 
-    # Common US state codes
-    states = [
-        'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
-        'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
-        'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
-        'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
-        'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'
-    ]
+    # PHASE 4.6.5: Strict pattern - state code must be preceded by comma/space
+    # This prevents matching HTML attributes like id="VA"
+    pattern = r'(?:(?:,\s*)|(?:\s))(' \
+              r'AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|' \
+              r'NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY' \
+              r')(?:\s|,|$|\d)'  # Must be followed by space, comma, end, or digit (zip code)
 
-    # Look for state codes in common contexts
-    for state in states:
-        # Match state code with word boundaries
-        if re.search(rf'\b{state}\b', text, re.I):
-            return state
+    match = re.search(pattern, text)
+    if match:
+        return match.group(1)
 
     return None
 
@@ -230,7 +274,17 @@ def scrape_page_for_anchors(url: str, timeout: int = ANCHOR_HTTP_TIMEOUT) -> Dic
         response.raise_for_status()
 
         # Extract domain from final URL (after redirects)
-        anchors["domain"] = extract_domain_from_url(response.url)
+        extracted_domain = extract_domain_from_url(response.url)
+
+        # PHASE 4.6.5: Filter directory domains
+        # Directory domains should NOT become discovered_domain (they're not the business site)
+        # But we keep them as evidence for debugging
+        if extracted_domain and not is_directory_domain(extracted_domain):
+            anchors["domain"] = extracted_domain
+        elif extracted_domain:
+            # Keep directory domain as evidence only (not as discovered_domain)
+            anchors["directory_domain"] = extracted_domain
+            anchors["domain"] = None  # Explicitly None so it doesn't poison results
 
         # PHASE 4.6.3: Cap HTML size for faster parsing
         html = response.text[:ANCHOR_HTML_CAP]
@@ -439,20 +493,20 @@ def phase46_anchor_discovery_cached(
 ) -> Dict[str, Any]:
     """
     PHASE 4.6.3: Cached anchor discovery with 429 retry logic.
-    
+
     Improvements over base function:
     - Per-job caching (prevents duplicate lookups)
     - 429 retry with exponential backoff
     - Explicit debug notes on failure
     - Never silently returns empty (logs failures)
-    
+
     Args:
         business_name: Business name to search
         vertical: Optional vertical (e.g., "trucking", "plumbing")
         max_urls: Max URLs to scrape (default 2)
         logger: Optional logger
         max_retries: Max retry attempts for 429 errors (default 3)
-    
+
     Returns:
         Dict with discovered anchors + evidence (same as phase46_anchor_discovery)
     """
@@ -462,7 +516,7 @@ def phase46_anchor_discovery_cached(
         if logger:
             logger.info(f"   -> ANCHOR DISCOVERY: Using cached result for '{business_name}'")
         return DISCOVERY_CACHE[cache_key].copy()
-    
+
     # Try discovery with retry logic
     last_error = None
     for attempt in range(max_retries):
@@ -473,15 +527,15 @@ def phase46_anchor_discovery_cached(
                 max_urls=max_urls,
                 logger=logger
             )
-            
+
             # Cache successful result
             DISCOVERY_CACHE[cache_key] = result.copy()
             return result
-            
+
         except requests.exceptions.HTTPError as ex:
             last_error = ex
             status_code = getattr(ex.response, 'status_code', None) if hasattr(ex, 'response') else None
-            
+
             # Retry on 429 (rate limit)
             if status_code == 429:
                 if logger:
@@ -503,11 +557,11 @@ def phase46_anchor_discovery_cached(
                         f"   -> ANCHOR DISCOVERY: HTTP {status_code} error for '{business_name}': {ex}"
                     )
                 break
-                
+
         except Exception as ex:
             last_error = ex
             error_msg = str(ex).lower()
-            
+
             # Check if error message indicates rate limiting
             if "429" in error_msg or "rate" in error_msg or "quota" in error_msg:
                 if logger:
@@ -527,14 +581,14 @@ def phase46_anchor_discovery_cached(
                 if logger:
                     logger.error(f"   -> ANCHOR DISCOVERY: Error for '{business_name}': {ex}")
                 break
-    
+
     # All retries failed - return empty result with debug notes
     if logger:
         logger.error(
             f"   -> ANCHOR DISCOVERY: FAILED for '{business_name}' after {max_retries} attempts. "
             f"Last error: {repr(last_error)}"
         )
-    
+
     empty_result = {
         "discovered_domain": None,
         "discovered_phone": None,
@@ -547,10 +601,10 @@ def phase46_anchor_discovery_cached(
         "discovery_error": repr(last_error),
         "discovery_failed": True,
     }
-    
+
     # Cache the failure to avoid retrying same business repeatedly
     DISCOVERY_CACHE[cache_key] = empty_result.copy()
-    
+
     return empty_result
 
 
