@@ -16,6 +16,7 @@
 from typing import Dict, Any, Optional
 from tp_enrich.anchor_discovery import phase46_anchor_discovery
 from tp_enrich.canonical import choose_canonical_business, apply_canonical_to_row, should_run_opencorporates
+from tp_enrich.candidates import build_google_candidate, build_yelp_candidate, apply_candidate_anchors_to_row
 from tp_enrich import local_enrichment
 from tp_enrich.phone_enrichment import enrich_business_phone_waterfall
 from tp_enrich.phase2_final import email_waterfall_enrich, phase2_enrich
@@ -435,7 +436,21 @@ def enrich_single_business_adaptive(
     # ============================================================
     # STEP 6: Canonical matching (≥80%)
     # ============================================================
-    canonical, match_meta = choose_canonical_business(row, google_hit, yelp_hit)
+
+    # PHASE 4.6.5: Build normalized candidates from raw hits
+    # This ensures canonical matching can see website/phone from Google Details
+    google_candidate = build_google_candidate(row, google_hit) if google_hit else None
+    yelp_candidate = build_yelp_candidate(row, yelp_hit) if yelp_hit else None
+
+    # PHASE 4.6.5: Apply candidate anchors to row BEFORE canonical matching
+    # This ensures row has company_domain/primary_phone for scoring
+    if google_candidate:
+        apply_candidate_anchors_to_row(row, google_candidate, logger=logger, source="google")
+    if yelp_candidate:
+        apply_candidate_anchors_to_row(row, yelp_candidate, logger=logger, source="yelp")
+
+    # PHASE 4.6.5: Pass normalized candidates (not raw hits) to matcher
+    canonical, match_meta = choose_canonical_business(row, google_candidate, yelp_candidate)
     if canonical:
         if logger:
             msg = f"   -> CANONICAL: {canonical['source']} (score={match_meta['best_score']:.2f}, reason={match_meta.get('reason', 'unknown')})"
