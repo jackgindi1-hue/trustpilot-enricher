@@ -398,105 +398,107 @@ def enrich_single_business_adaptive(
     google_candidate = build_google_candidate(row, google_hit) if google_hit else None
     yelp_candidate = build_yelp_candidate(row, yelp_hit) if yelp_hit else None
     # PHASE 4.6.5: Apply candidate anchors to row BEFORE canonical matching
-    # This preserves website/phone that Google Details API returned
-    row = apply_candidate_anchors_to_row(row, google_candidate, yelp_candidate)
-    # PHASE 4.6.4: Add meta dict to track canonical decision
-    meta = {"best_score": 0.0, "reason": "no_candidates"}
-    # Run canonical matching with normalized candidates
-    canonical, meta = choose_canonical_business(
-        business_name=name,
-        google_candidate=google_candidate,
-        yelp_candidate=yelp_candidate,
-        logger=logger
-    )
-    # PHASE 4.6.5: PRESERVE canonical scores even on reject (for threshold tuning)
-    # Critical: Don't zero out scores - they're diagnostic data
-    row["canonical_match_score"] = meta.get("best_score", 0.0)
-    row["canonical_match_reason"] = meta.get("reason", "unknown")
-    if canonical:
-        # ✅ Canonical match succeeded (≥80%)
-        row = apply_canonical_to_row(row, canonical, logger=logger)
-        if logger:
-            logger.info(
-                f"   -> CANONICAL: {row['canonical_source']} "
-                f"(score={row['canonical_match_score']:.2f})"
-            )
-    else:
-        # ⚠️ Canonical match failed (<80%) - preserve discovered data
-        # PHASE 4.6.5: Don't zero out canonical_match_score - keep it for analysis
-        row["canonical_source"] = ""  # Mark as rejected
-        if logger:
-            logger.info(
-                f"   -> CANONICAL: Rejected (score={meta.get('best_score', 0.0):.2f} < 0.80) - "
-                f"keeping discovered anchors"
-            )
-    # ============================================================
-    # STEP 7: Phone enrichment waterfall
-    # ============================================================
-    phone_domain = (row.get("business_domain") or row.get("discovered_domain") or "").strip()
-    if phone_domain and not row.get("primary_phone"):
-        if logger:
-            logger.info(f"   -> PHONE: Running waterfall with domain={phone_domain}")
+    # This copies website/phone from candidates to the row, fixing empty row inputs
+    if google_candidate:
+        apply_candidate_anchors_to_row(row, google_candidate)
+    if yelp_candidate:
+        apply_candidate_anchors_to_row(row, yelp_candidate)
+    # Now run canonical matching with enriched row
+    candidates = [c for c in [google_candidate, yelp_candidate] if c]
+    if candidates:
         try:
-            phone_result = enrich_business_phone_waterfall(
-                name=name,
-                domain=phone_domain,
-                logger=logger
-            )
-            if phone_result.get("primary_phone"):
-                row["primary_phone"] = phone_result["primary_phone"]
-                row["primary_phone_display"] = phone_result.get("primary_phone_display")
-                row["primary_phone_source"] = phone_result.get("primary_phone_source")
-                row["primary_phone_confidence"] = phone_result.get("primary_phone_confidence")
+            canonical = choose_canonical_business(name, candidates)
+            if canonical and canonical.get("match_score", 0.0) >= 0.80:
+                # Apply canonical data to row
+                apply_canonical_to_row(row, canonical)
                 if logger:
                     logger.info(
-                        f"   -> PHONE: SUCCESS {row['primary_phone']} "
-                        f"(source={row['primary_phone_source']})"
+                        f"   -> CANONICAL: Accepted {canonical.get('source')} "
+                        f"(score={canonical.get('match_score', 0.0):.2f})"
+                    )
+            else:
+                if logger:
+                    logger.info(
+                        f"   -> CANONICAL: Rejected - score too low "
+                        f"({canonical.get('match_score', 0.0) if canonical else 0.0:.2f} < 0.80)"
                     )
         except Exception as e:
             if logger:
-                logger.warning(f"   -> PHONE: Waterfall failed domain={phone_domain} err={repr(e)}")
-    # PHASE 4.6.4: Promote discovered_phone if waterfall failed
-    row = _promote_discovered_phone(row, logger=logger)
+                logger.warning(f"   -> CANONICAL: Matching failed: {e}")
     # ============================================================
-    # STEP 8: Email enrichment waterfall
+    # STEP 7: Fill gaps with phase2 enrichment
     # ============================================================
-    # PHASE 4.6.4: ALWAYS run email when ANY domain exists (canonical OR discovered)
+    # PHASE 4.6.5: Run OpenCorporates ONLY for specific patterns
+    # Don't run on every business - this was too slow
+    if should_run_opencorporates(row):
+        try:
+            if logger:
+                logger.info("   -> Running OpenCorporates (missing critical anchors)")
+            oc_data = phase2_enrich(
+                row.get("business_name"),
+                city=row.get("business_city"),
+                state=row.get("business_state_region"),
+                logger=logger
+            )
+            # Merge OpenCorporates data into row (only if missing)
+            if oc_data:
+                for k in ["business_address", "business_city", "business_state_region", "business_postal_code"]:
+                    if not row.get(k) and oc_data.get(k):
+                        row[k] = oc_data[k]
+                if logger:
+                    logger.info("   -> OpenCorporates: Data merged")
+        except Exception as e:
+            if logger:
+                logger.warning(f"   -> OpenCorporates failed: {e}")
+    # ============================================================
+    # STEP 8: Phone enrichment
+    # ============================================================
+    # PHASE 4.6.5: Always run phone enrichment when we have anchors
+    # This was previously skipped when canonical matching failed
+    if row.get("business_domain") or row.get("discovered_domain") or row.get("business_address"):
+        if not row.get("primary_phone"):
+            try:
+                if logger:
+                    logger.info("   -> Running phone enrichment waterfall")
+                phone_data = enrich_business_phone_waterfall(
+                    business_name=name,
+                    domain=row.get("business_domain") or row.get("discovered_domain"),
+                    address=row.get("business_address"),
+                    city=row.get("business_city"),
+                    state=row.get("business_state_region"),
+                    logger=logger
+                )
+                if phone_data and phone_data.get("phone"):
+                    row["primary_phone"] = phone_data["phone"]
+                    row["primary_phone_display"] = phone_data.get("display") or phone_data["phone"]
+                    row["primary_phone_source"] = phone_data.get("source") or "phone_waterfall"
+                    row["primary_phone_confidence"] = phone_data.get("confidence") or "medium"
+                    if logger:
+                        logger.info(f"   -> PHONE: SUCCESS {row['primary_phone']} (source={row['primary_phone_source']})")
+            except Exception as e:
+                if logger:
+                    logger.warning(f"   -> Phone enrichment failed: {e}")
+        # PHASE 4.6.4: Promote discovered phone if waterfall failed
+        row = _promote_discovered_phone(row, logger=logger)
+    # ============================================================
+    # STEP 9: Email enrichment
+    # ============================================================
+    # PHASE 4.6.3/4.6.4: ALWAYS run email when ANY domain exists
+    # This is CRITICAL - email must run even when canonical matching fails
     row = _run_email_step(name, row, logger=logger)
     # ============================================================
-    # STEP 9: Phase 2 discovery (BBB/YP/OpenCorporates)
+    # STEP 10: Final cleanup
     # ============================================================
-    # PHASE 4.6.5: OpenCorporates guard - only when state known
-    should_oc = should_run_opencorporates(row)
-    if not should_oc:
-        row["debug_notes"] += "|oc_skipped_no_state"
-    # PHASE 4.6.4: ALWAYS run Phase 2 discovery (BBB/YP) for secondary data
-    # Even when canonical fails, we want BBB/YP emails/phones
-    try:
-        phase2_data = phase2_enrich(row, run_opencorporates=should_oc, logger=logger)
-        # Merge Phase 2 emails/phones (preserve directory data)
-        for src, col in [
-            ("bbb", "phase2_bbb_email"),
-            ("yp", "phase2_yp_email")
-        ]:
-            ev = (phase2_data.get(col) or "").strip()
-            if ev:
-                assign_email(row, ev, source=src)
-                row[col] = ev  # Keep original column for reference
-        # Update row with Phase 2 data
-        row.update(phase2_data)
-    except Exception as e:
-        if logger:
-            logger.warning(f"   -> Phase 2 discovery failed: {e}")
-        row["debug_notes"] += f"|phase2_error_{repr(e)[:50]}"
-    # ============================================================
-    # STEP 10: Return enriched row
-    # ============================================================
+    # Ensure we have at least discovered data even if canonical failed
+    if not row.get("business_domain") and row.get("discovered_domain"):
+        row["business_domain"] = row["discovered_domain"]
+    if not row.get("primary_phone") and row.get("discovered_phone"):
+        row = _promote_discovered_phone(row, logger=logger)
+    if not row.get("business_address") and row.get("discovered_address"):
+        row["business_address"] = row["discovered_address"]
     if logger:
         logger.info(
-            f"   -> COMPLETE: domain={bool(row.get('business_domain') or row.get('discovered_domain'))}, "
-            f"phone={bool(row.get('primary_phone'))}, "
-            f"email={bool(row.get('primary_email'))}, "
-            f"canonical={row.get('canonical_source') or 'rejected'}"
+            f"Enrichment complete: domain={bool(row.get('business_domain'))}, "
+            f"phone={bool(row.get('primary_phone'))}, email={bool(row.get('primary_email'))}"
         )
     return row
