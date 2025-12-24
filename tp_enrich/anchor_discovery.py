@@ -18,6 +18,17 @@ from typing import Dict, Any, Optional, List
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 
+from tp_enrich.retry_ratelimit import SimpleRateLimiter, timed
+
+# PHASE 4.6.3: Global rate limiter for DDG searches
+_ANCHOR_RATE = SimpleRateLimiter(min_interval_s=0.5)
+
+# PHASE 4.6.3: Performance tuning
+ANCHOR_HTTP_TIMEOUT = 6  # Reduced from 10s
+ANCHOR_HTML_CAP = 80_000  # Cap HTML bytes for faster parsing
+ANCHOR_MAX_URLS = 4  # Reduced from unlimited
+ANCHOR_MAX_QUERIES = 2  # Limit number of search queries
+
 
 # ============================================================
 # SERP Query Helpers
@@ -61,6 +72,9 @@ def google_search_urls(query: str, max_results: int = 5) -> List[str]:
     urls = []
 
     try:
+        # PHASE 4.6.3: Rate limit DDG searches
+        _ANCHOR_RATE.wait("ddg_search", 0.5)
+
         # Use DuckDuckGo HTML search (no API key needed, no captcha)
         search_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
 
@@ -68,7 +82,7 @@ def google_search_urls(query: str, max_results: int = 5) -> List[str]:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
 
-        response = requests.get(search_url, headers=headers, timeout=10)
+        response = requests.get(search_url, headers=headers, timeout=ANCHOR_HTTP_TIMEOUT)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -186,7 +200,7 @@ def extract_state_from_text(text: str) -> Optional[str]:
     return None
 
 
-def scrape_page_for_anchors(url: str, timeout: int = 5) -> Dict[str, Any]:
+def scrape_page_for_anchors(url: str, timeout: int = ANCHOR_HTTP_TIMEOUT) -> Dict[str, Any]:
     """
     Scrape a single page and extract anchors.
 
@@ -217,8 +231,11 @@ def scrape_page_for_anchors(url: str, timeout: int = 5) -> Dict[str, Any]:
         # Extract domain from final URL (after redirects)
         anchors["domain"] = extract_domain_from_url(response.url)
 
+        # PHASE 4.6.3: Cap HTML size for faster parsing
+        html = response.text[:ANCHOR_HTML_CAP]
+
         # Parse HTML
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(html, 'html.parser')
 
         # Remove script and style elements
         for script in soup(["script", "style"]):
@@ -248,10 +265,19 @@ def scrape_page_for_anchors(url: str, timeout: int = 5) -> Dict[str, Any]:
 # PHASE 4.6 MAIN ANCHOR DISCOVERY
 # ============================================================
 
+def _anchors_strong(discovered: dict) -> bool:
+    """PHASE 4.6.3: Check if we have strong enough anchors to stop early."""
+    d = bool((discovered.get("discovered_domain") or "").strip())
+    p = bool((discovered.get("discovered_phone") or "").strip())
+    s = bool((discovered.get("discovered_state_region") or "").strip())
+    # Strong if we have: (domain + state) OR (phone + state) OR (domain + phone)
+    return (s and d) or (s and p) or (d and p)
+
+
 def phase46_anchor_discovery(
     business_name: str,
     vertical: Optional[str] = None,
-    max_urls: int = 3,
+    max_urls: int = 2,
     logger=None
 ) -> Dict[str, Any]:
     """
@@ -260,7 +286,7 @@ def phase46_anchor_discovery(
     Args:
         business_name: Business name to search
         vertical: Optional vertical (e.g., "trucking", "plumbing")
-        max_urls: Max URLs to scrape (default 3)
+        max_urls: Max URLs to scrape (default 2)
         logger: Optional logger
 
     Returns:
@@ -276,6 +302,9 @@ def phase46_anchor_discovery(
             "discovery_evidence_json": str (JSON list of all evidence),
         }
     """
+    # PHASE 4.6.3: Add timing
+    done = timed(logger, "ANCHOR_DISCOVERY")
+
     if logger:
         logger.info(f"   -> ANCHOR DISCOVERY: Searching for {business_name}")
 
@@ -288,6 +317,7 @@ def phase46_anchor_discovery(
     if not urls:
         if logger:
             logger.warning(f"   -> ANCHOR DISCOVERY: No URLs found for {business_name}")
+        done("no_urls_found")
         return {
             "discovered_domain": None,
             "discovered_phone": None,
@@ -313,9 +343,22 @@ def phase46_anchor_discovery(
         if any(anchors.values()):  # If we found any anchor
             evidence_list.append(anchors)
 
+            # PHASE 4.6.3: Early stopping if we have strong anchors
+            # Build a temporary result to check
+            temp_result = {
+                "discovered_domain": anchors.get("domain"),
+                "discovered_phone": anchors.get("phone"),
+                "discovered_state_region": anchors.get("state"),
+            }
+            if _anchors_strong(temp_result):
+                if logger:
+                    logger.info(f"   -> ANCHOR DISCOVERY: Strong anchors found, stopping early")
+                break
+
     if not evidence_list:
         if logger:
             logger.warning(f"   -> ANCHOR DISCOVERY: No anchors found in scraped pages")
+        done("no_anchors_found")
         return {
             "discovered_domain": None,
             "discovered_phone": None,
@@ -350,7 +393,7 @@ def phase46_anchor_discovery(
     # Return discovered anchors
     import json
 
-    return {
+    result = {
         "discovered_domain": best.get("domain"),
         "discovered_phone": best.get("phone"),
         "discovered_state_region": best.get("state"),
@@ -360,3 +403,8 @@ def phase46_anchor_discovery(
         "discovered_evidence_source": "serp_scrape",
         "discovery_evidence_json": json.dumps(evidence_list, indent=2),
     }
+
+    # PHASE 4.6.3: Log timing
+    done(f"found_domain={bool(result.get('discovered_domain'))} found_phone={bool(result.get('discovered_phone'))}")
+
+    return result
