@@ -22,7 +22,18 @@ from tp_enrich.phase2_final import email_waterfall_enrich, phase2_enrich
 from tp_enrich.website_email_scan import micro_scan_for_email
 from tp_enrich.retry_ratelimit import SimpleRateLimiter
 from tp_enrich.phase0_gating import domain_from_url
+from tp_enrich.email_enrichment import assign_email  # PHASE 4.6.2
 _rate = SimpleRateLimiter(min_interval_s=0.2)
+
+def _pick_email_domain(row: dict) -> str:
+    """PHASE 4.6.2: Pick best domain for email enrichment."""
+    for k in ["company_domain", "business_domain", "canonical_domain", "discovered_domain"]:
+        d = (row.get(k) or "").strip()
+        if d:
+            d = d.replace("http://", "").replace("https://", "").replace("www.", "").split("/")[0]
+            return d
+    return ""
+
 def enrich_single_business_adaptive(
     name: str,
     region: Optional[str] = None,
@@ -127,9 +138,7 @@ def enrich_single_business_adaptive(
             if discovered.get("discovered_address"):
                 row["business_address"] = discovered["discovered_address"]
             if discovered.get("discovered_email"):
-                row["primary_email"] = discovered["discovered_email"]
-                row["primary_email_source"] = "anchor_discovery"
-                row["primary_email_confidence"] = "low"
+                assign_email(row, discovered["discovered_email"], source="anchor_discovery")
             if logger:
                 logger.info(
                     f"   -> Anchor discovery complete: domain={bool(has_domain)}, "
@@ -180,8 +189,7 @@ def enrich_single_business_adaptive(
                         logger=logger
                     )
                     if wf.get("primary_email"):
-                        row["primary_email"] = wf["primary_email"]
-                        row["primary_email_source"] = wf.get("email_source")
+                        assign_email(row, wf["primary_email"], source=wf.get("email_source") or "feedback_waterfall")
                         row["primary_email_confidence"] = wf.get("email_confidence")
                         row["email_type"] = wf.get("email_type")
                         row["email_providers_attempted"] = wf.get("email_tried") or ""
@@ -231,31 +239,7 @@ def enrich_single_business_adaptive(
             row["primary_phone_source"] = phone_layer.get("primary_phone_source")
             row["primary_phone_confidence"] = phone_layer.get("primary_phone_confidence")
             row["all_phones_json"] = phone_layer.get("all_phones_json")
-        # Email waterfall
-        if not row.get("primary_email"):
-            if logger:
-                logger.info(f"   -> Email enrichment for {name} domain={domain}")
-            wf = email_waterfall_enrich(company=name, domain=domain, person_name=None, logger=logger)
-            row["primary_email"] = wf.get("primary_email")
-            row["primary_email_source"] = wf.get("email_source")
-            row["primary_email_confidence"] = wf.get("email_confidence")
-            row["email_type"] = wf.get("email_type")
-            row["email_providers_attempted"] = wf.get("email_tried") or ""
-        # Website micro-scan fallback
-        if not row.get("primary_email") and website:
-            try:
-                _rate.wait("website_email_scan")
-                if logger:
-                    logger.info(f"   -> Website scan for email: {website}")
-                e2 = micro_scan_for_email(website, logger=logger)
-                if e2:
-                    row["primary_email"] = e2
-                    row["primary_email_source"] = "website_scan"
-                    row["email_type"] = "generic"
-                    row["primary_email_confidence"] = "low"
-            except Exception as e:
-                if logger:
-                    logger.warning(f"   -> Website scan failed: {e}")
+        # PHASE 4.6.2: Email enrichment MOVED to after canonical block (runs even if canonical fails)
         # OpenCorporates (if state known)
         if should_run_opencorporates(row):
             state = row["business_state_region"]
@@ -310,6 +294,52 @@ def enrich_single_business_adaptive(
                 f"domain={row['canonical_score_domain']:.2f}, phone={row['canonical_score_phone']:.2f})"
             )
     # ============================================================
+    # STEP 7.5: Email enrichment (runs AFTER canonical, even if canonical failed)
+    # ============================================================
+    if not row.get("primary_email"):
+        best_domain = _pick_email_domain(row)
+        if best_domain:
+            if logger:
+                logger.info(f"   -> Email enrichment: domain={best_domain}")
+            try:
+                wf = email_waterfall_enrich(
+                    company=name,
+                    domain=best_domain,
+                    person_name=None,
+                    logger=logger
+                )
+                if wf.get("primary_email"):
+                    assign_email(row, wf["primary_email"], source=wf.get("email_source") or "email_waterfall")
+                    row["primary_email_confidence"] = wf.get("email_confidence")
+                    row["email_type"] = wf.get("email_type")
+                    row["email_providers_attempted"] = wf.get("email_tried") or ""
+                    if logger:
+                        logger.info(
+                            f"   -> Email waterfall SUCCESS: {row['primary_email']} "
+                            f"(source={row.get('primary_email_source')})"
+                        )
+            except Exception as e:
+                if logger:
+                    logger.warning(f"   -> Email waterfall failed: {e}")
+    # Website micro-scan fallback (if still no email)
+    if not row.get("primary_email"):
+        website = row.get("business_website") or row.get("canonical_website") or row.get("discovered_website")
+        if website:
+            try:
+                _rate.wait("website_email_scan")
+                if logger:
+                    logger.info(f"   -> Website scan for email: {website}")
+                e2 = micro_scan_for_email(website, logger=logger)
+                if e2:
+                    assign_email(row, e2, source="website_scan")
+                    row["email_type"] = "generic"
+                    row["primary_email_confidence"] = "low"
+                    if logger:
+                        logger.info(f"   -> Website scan found: {e2}")
+            except Exception as e:
+                if logger:
+                    logger.warning(f"   -> Website scan failed: {e}")
+        # ============================================================
     # STEP 8: Compute confidence
     # ============================================================
     has_phone = bool(row.get("primary_phone") or row.get("discovered_phone"))
