@@ -111,8 +111,8 @@ def _google_is_strong_anchor(google_hit: dict) -> bool:
     """
     PHASE 4.6.5 FINAL: Returns True if Google hit has a strong anchor.
 
-    Strong anchor = phone OR website present (from Place Details).
-    When Google provides these, it's usually the correct entity match.
+    Strong anchor = Google provides a real phone or website (from Place Details).
+    This is the 90% case where Google data is authoritative.
 
     Args:
         google_hit: Google Places API result dict
@@ -124,7 +124,7 @@ def _google_is_strong_anchor(google_hit: dict) -> bool:
         return False
 
     phone = (google_hit.get("formatted_phone_number") or google_hit.get("phone") or "").strip()
-    website = (google_hit.get("website") or "").strip()
+    website = (google_hit.get("website") or google_hit.get("domain") or "").strip()
 
     return bool(phone or website)
 
@@ -517,16 +517,33 @@ def enrich_single_business_adaptive(
     if google_hit and _google_is_strong_anchor(google_hit):
         # ✅ AUTO-ACCEPT GOOGLE (STRONG ANCHOR)
         if logger:
-            logger.info("   -> CANONICAL: Auto-accepting Google strong anchor (phone/website present)")
+            logger.info("   -> CANONICAL: auto-accepting Google strong anchor")
 
-        meta = {
-            "reason": "google_strong_anchor",
-            "score": 1.0,
-            "source": "google",
-        }
+        # If apply_canonical_to_row supports a meta arg, pass it.
+        # If it does NOT support meta, then call apply_canonical_to_row(row, google_hit) ONLY
+        try:
+            apply_canonical_to_row(
+                row,
+                google_hit,
+                meta={
+                    "reason": "google_strong_anchor",
+                    "score": 1.0,
+                    "source": "google",
+                },
+            )
+        except TypeError:
+            # apply_canonical_to_row(row, candidate) style
+            apply_canonical_to_row(row, google_hit)
 
-        # IMPORTANT: call signature must be positional: apply_canonical_to_row(row, canonical, meta)
-        apply_canonical_to_row(row, google_hit, meta)
+        # ✅ Force canonical bookkeeping to be correct and not "unknown"
+        row["canonical_source"] = "google"
+        row["canonical_match_score"] = 1.0
+        # Keep the reason if your schema supports it; otherwise leave debug_notes
+        if "canonical_match_reason" in row:
+            row["canonical_match_reason"] = "google_strong_anchor"
+        else:
+            row["debug_notes"] = (row.get("debug_notes") or "") + "|google_strong_anchor"
+
     else:
         # PHASE 4.6.5: Pass normalized candidates (not raw hits) to matcher
         canonical, match_meta = choose_canonical_business(row, google_candidate, yelp_candidate)
@@ -537,6 +554,13 @@ def enrich_single_business_adaptive(
                     msg += f" [SOFT: domain={match_meta.get('domain_match_exact')}, phone={match_meta.get('phone_match_exact')}]"
                 logger.info(msg)
             row = apply_canonical_to_row(row, canonical, match_meta)
+
+            # ✅ Ensure canonical_source never becomes "unknown"
+            if not (row.get("canonical_source") or "").strip() or str(row.get("canonical_source")).strip().lower() == "unknown":
+                # if meta has a source, use it; else default to google if canonical came from google_hit
+                src = (match_meta.get("source") if isinstance(match_meta, dict) else None) or "google"
+                row["canonical_source"] = src
+
         else:
             # ============================================================
             # CANONICAL REJECTED - Keep discovered data (NO empty row)
@@ -547,7 +571,7 @@ def enrich_single_business_adaptive(
                 )
             row["canonical_source"] = ""
             row["canonical_match_score"] = float(match_meta.get("best_score") or 0.0)  # PHASE 4.6: Keep REAL best score for analysis
-            row["canonical_match_reason"] = match_meta.get("reason", "below_threshold_0.8")
+            row["canonical_match_reason"] = (match_meta.get("reason") if isinstance(match_meta, dict) else None) or "below_threshold"
             row["debug_notes"] += "|entity_match_below_80"
             # PHASE 4.6: Keep component scores for threshold tuning
             row["canonical_score_name"] = float(match_meta.get("score_name") or 0.0)
