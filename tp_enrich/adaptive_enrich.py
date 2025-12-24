@@ -23,6 +23,7 @@ from tp_enrich.website_email_scan import micro_scan_for_email
 from tp_enrich.retry_ratelimit import SimpleRateLimiter
 from tp_enrich.phase0_gating import domain_from_url
 from tp_enrich.email_enrichment import assign_email  # PHASE 4.6.2
+from tp_enrich.retry_ratelimit import timed  # PHASE 4.6.3
 _rate = SimpleRateLimiter(min_interval_s=0.2)
 
 def _pick_email_domain(row: dict) -> str:
@@ -33,6 +34,48 @@ def _pick_email_domain(row: dict) -> str:
             d = d.replace("http://", "").replace("https://", "").replace("www.", "").split("/")[0]
             return d
     return ""
+
+# ============================================================
+# PHASE 4.6.3 — EMAIL SPEED + COVERAGE GUARD
+# ============================================================
+
+DIRECTORY_DOMAINS = {
+    "yelp.com", "bbb.org", "yellowpages.com",
+    "brokersnapshot.com", "opencorporates.com",
+    "zoominfo.com", "bizapedia.com"
+}
+
+def _domain_is_directory(domain: str) -> bool:
+    """Check if domain is a directory/aggregator site."""
+    d = (domain or "").lower()
+    return any(d.endswith(x) for x in DIRECTORY_DOMAINS)
+
+def _should_run_full_email(row: dict) -> bool:
+    """
+    PHASE 4.6.3: Only run full email waterfall when we have real signal.
+    This prevents slow + empty runs on directory domains or missing anchors.
+
+    Returns:
+        True if we should run the full waterfall, False to skip
+    """
+    domain = (row.get("company_domain") or row.get("discovered_domain") or "").lower()
+    phone = (row.get("primary_phone") or row.get("discovered_phone") or "").strip()
+    html_flag = row.get("website_has_mailto")  # set earlier if available
+
+    if not domain:
+        return False
+
+    if _domain_is_directory(domain):
+        return False
+
+    # Run if we have phone or mailto signal
+    if phone:
+        return True
+
+    if html_flag:
+        return True
+
+    return False
 
 def _promote_discovered_phone(row: dict, logger=None) -> dict:
     """
@@ -58,10 +101,12 @@ def _promote_discovered_phone(row: dict, logger=None) -> dict:
 
 def _run_email_step(name: str, row: dict, logger=None) -> dict:
     """
-    PHASE 4.6.4: ALWAYS run email enrichment when ANY domain exists.
+    PHASE 4.6.3/4.6.4: ALWAYS run email enrichment when ANY domain exists.
 
     Critical fix: Email must run even when canonical matching fails (<80%).
     This ensures max email coverage using discovered OR canonical domains.
+
+    Phase 4.6.3 adds guard to skip slow/empty waterfalls on directory domains.
 
     Uses assign_email() to preserve directory emails as secondary.
     """
@@ -80,20 +125,43 @@ def _run_email_step(name: str, row: dict, logger=None) -> dict:
         if logger:
             logger.info("CANONICAL rejected; still running email due to discovered_domain")
 
+    # PHASE 4.6.3: Guard against slow/empty waterfalls
+    if not _should_run_full_email(row):
+        if logger:
+            logger.info(
+                f"   -> EMAIL: Skipping full waterfall (directory domain or no signal) domain={email_domain}"
+            )
+
+        # Still preserve directory emails even if we skip waterfall
+        for dsrc, col in [
+            ("bbb", "phase2_bbb_email"),
+            ("yp", "phase2_yp_email"),
+            ("discovery", "discovered_email")
+        ]:
+            ev = (row.get(col) or "").strip()
+            if ev:
+                assign_email(row, ev, source=dsrc)
+
+        return row
+
     if logger:
         logger.info(
-            f"   -> EMAIL: Running waterfall domain={email_domain} "
+            f"   -> EMAIL: Running FULL waterfall domain={email_domain} "
             f"(canonical_source={canonical_source or 'none'} score={row.get('canonical_match_score', 0.0):.2f})"
         )
 
     try:
         # Run email waterfall with best available domain
+        done = timed(logger, "EMAIL_WATERFALL")
+
         wf = email_waterfall_enrich(
             company=name,
             domain=email_domain,
             person_name=None,
             logger=logger
         )
+
+        done(f"domain={email_domain}")
 
         # Collect ALL found emails and route through assign_email
         found = []
