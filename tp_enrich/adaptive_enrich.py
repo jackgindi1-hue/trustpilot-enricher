@@ -34,6 +34,133 @@ def _pick_email_domain(row: dict) -> str:
             return d
     return ""
 
+def _promote_discovered_phone(row: dict, logger=None) -> dict:
+    """
+    PHASE 4.6.4: Promote discovered_phone to primary_phone if primary is empty.
+
+    This ensures discovered phones are not lost when phone waterfall fails.
+    """
+    primary = (row.get("primary_phone") or "").strip()
+    disc = (row.get("discovered_phone") or "").strip()
+
+    if (not primary) and disc:
+        row["primary_phone"] = disc
+        row["primary_phone_display"] = disc
+        row["primary_phone_source"] = row.get("discovered_evidence_source") or "discovery"
+        # Don't claim high confidence for discovered-only phones
+        if not row.get("primary_phone_confidence"):
+            row["primary_phone_confidence"] = "medium"
+
+        if logger:
+            logger.info(f"   -> PHONE PROMOTION: Using discovered_phone={disc} (primary was empty)")
+
+    return row
+
+def _run_email_step(name: str, row: dict, logger=None) -> dict:
+    """
+    PHASE 4.6.4: ALWAYS run email enrichment when ANY domain exists.
+
+    Critical fix: Email must run even when canonical matching fails (<80%).
+    This ensures max email coverage using discovered OR canonical domains.
+
+    Uses assign_email() to preserve directory emails as secondary.
+    """
+    email_domain = _pick_email_domain(row)
+
+    if not email_domain:
+        if logger:
+            logger.info("   -> EMAIL: Skipped (no domain anchor present)")
+        return row
+
+    # REQUIRED REGRESSION LOG (Phase 4.6.4)
+    canonical_source = (row.get("canonical_source") or "").strip()
+    discovered_domain = (row.get("discovered_domain") or "").strip()
+
+    if not canonical_source and discovered_domain:
+        if logger:
+            logger.info(f"   -> EMAIL: Canonical rejected, but running email due to domain={email_domain}")
+
+    if logger:
+        logger.info(
+            f"   -> EMAIL: Running waterfall domain={email_domain} "
+            f"(canonical_source={canonical_source or 'none'} score={row.get('canonical_match_score', 0.0):.2f})"
+        )
+
+    try:
+        # Run email waterfall with best available domain
+        wf = email_waterfall_enrich(
+            company=name,
+            domain=email_domain,
+            person_name=None,
+            logger=logger
+        )
+
+        # Collect ALL found emails and route through assign_email
+        found = []
+
+        if isinstance(wf, dict):
+            # Primary email from waterfall
+            pe = (wf.get("primary_email") or "").strip()
+            if pe:
+                found.append(("waterfall_primary", pe))
+
+            # Additional emails from lists
+            for lk in ["emails", "all_emails", "found_emails"]:
+                vals = wf.get(lk)
+                if isinstance(vals, list):
+                    for e in vals:
+                        e = (e or "").strip()
+                        if e:
+                            found.append((lk, e))
+
+            # Provider-specific emails
+            src_map = wf.get("by_source") or wf.get("provider_emails")
+            if isinstance(src_map, dict):
+                for src, vals in src_map.items():
+                    if isinstance(vals, list):
+                        for e in vals:
+                            e = (e or "").strip()
+                            if e:
+                                found.append((str(src), e))
+
+        # Route all emails through assign_email (dedup + directory preservation)
+        seen = set()
+        for src, e in found:
+            k = e.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            # ✅ CRITICAL: assign_email() preserves directory emails as secondary
+            assign_email(row, e, source=str(src))
+
+        # Also preserve explicit directory emails (don't lose them)
+        for dsrc, col in [
+            ("bbb", "phase2_bbb_email"),
+            ("yp", "phase2_yp_email"),
+            ("discovery", "discovered_email")
+        ]:
+            ev = (row.get(col) or "").strip()
+            if ev:
+                assign_email(row, ev, source=dsrc)
+
+        # Update metadata
+        if row.get("primary_email"):
+            row["primary_email_confidence"] = wf.get("email_confidence") or row.get("primary_email_confidence")
+            row["email_type"] = wf.get("email_type") or row.get("email_type")
+            row["email_providers_attempted"] = wf.get("email_tried") or ""
+
+            if logger:
+                logger.info(
+                    f"   -> EMAIL: SUCCESS {row['primary_email']} "
+                    f"(source={row.get('primary_email_source')})"
+                )
+
+    except Exception as ex:
+        if logger:
+            logger.warning(f"   -> EMAIL: Waterfall failed domain={email_domain} err={repr(ex)}")
+
+    return row
+
 def enrich_single_business_adaptive(
     name: str,
     region: Optional[str] = None,
@@ -113,7 +240,8 @@ def enrich_single_business_adaptive(
         # STEP 4: Run anchor discovery
         # ============================================================
         try:
-            discovered = phase46_anchor_discovery(name, vertical=None, max_urls=3, logger=logger)
+            # PHASE 4.6.4: Reduced max_urls from 3 to 2 for speed
+            discovered = phase46_anchor_discovery(name, vertical=None, max_urls=2, logger=logger)
             # Merge discovered anchors into row
             row["discovered_domain"] = discovered.get("discovered_domain")
             row["discovered_phone"] = discovered.get("discovered_phone")
@@ -129,9 +257,8 @@ def enrich_single_business_adaptive(
                 row["business_domain"] = discovered["discovered_domain"]
             if discovered.get("discovered_phone"):
                 has_phone = True
-                row["primary_phone"] = discovered["discovered_phone"]
-                row["primary_phone_source"] = "anchor_discovery"
-                row["primary_phone_confidence"] = "medium"
+                # PHASE 4.6.4: Don't directly assign - let phone waterfall try first,
+                # then _promote_discovered_phone() will use it if waterfall fails
             if discovered.get("discovered_state_region"):
                 has_state = True
                 row["business_state_region"] = discovered["discovered_state_region"]
@@ -293,34 +420,18 @@ def enrich_single_business_adaptive(
                 f"(name={row['canonical_score_name']:.2f}, state={row['canonical_score_state']:.2f}, "
                 f"domain={row['canonical_score_domain']:.2f}, phone={row['canonical_score_phone']:.2f})"
             )
+
     # ============================================================
-    # STEP 7.5: Email enrichment (runs AFTER canonical, even if canonical failed)
+    # STEP 7.5: PHONE PROMOTION (Phase 4.6.4)
+    # Promote discovered_phone if primary is still empty
     # ============================================================
-    if not row.get("primary_email"):
-        best_domain = _pick_email_domain(row)
-        if best_domain:
-            if logger:
-                logger.info(f"   -> Email enrichment: domain={best_domain}")
-            try:
-                wf = email_waterfall_enrich(
-                    company=name,
-                    domain=best_domain,
-                    person_name=None,
-                    logger=logger
-                )
-                if wf.get("primary_email"):
-                    assign_email(row, wf["primary_email"], source=wf.get("email_source") or "email_waterfall")
-                    row["primary_email_confidence"] = wf.get("email_confidence")
-                    row["email_type"] = wf.get("email_type")
-                    row["email_providers_attempted"] = wf.get("email_tried") or ""
-                    if logger:
-                        logger.info(
-                            f"   -> Email waterfall SUCCESS: {row['primary_email']} "
-                            f"(source={row.get('primary_email_source')})"
-                        )
-            except Exception as e:
-                if logger:
-                    logger.warning(f"   -> Email waterfall failed: {e}")
+    row = _promote_discovered_phone(row, logger=logger)
+
+    # ============================================================
+    # STEP 7.6: EMAIL ENRICHMENT (Phase 4.6.4)
+    # ALWAYS run when ANY domain exists (canonical OR discovered)
+    # ============================================================
+    row = _run_email_step(name, row, logger=logger)
     # Website micro-scan fallback (if still no email)
     if not row.get("primary_email"):
         website = row.get("business_website") or row.get("canonical_website") or row.get("discovered_website")

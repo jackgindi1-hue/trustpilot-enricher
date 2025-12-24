@@ -283,8 +283,19 @@ true_email_waterfall = email_waterfall_enrich
 # SERPAPI GOOGLE SEARCH (for BBB/YP/OC URL discovery)
 # -----------------------------
 
+# PHASE 4.6.4: Global rate limiter to prevent 429 storms
+from tp_enrich.retry_ratelimit import SimpleRateLimiter
+_SERP_RATE = SimpleRateLimiter(min_interval_s=0.95)
+
 def serpapi_google_search(query: str, logger=None) -> Dict[str, Any]:
-    """DiffA: Pooled + cached + limited SerpApi calls"""
+    """
+    PHASE 4.6.4: Hardened SerpAPI with global rate limiting + 429 guard.
+
+    Fixes:
+    - Global rate limit 1 req/sec (not just semaphore)
+    - Cap retries to 2 (not 4)
+    - Hard stop on 429 (don't retry storm)
+    """
     key = _env_first("SERP_API_KEY", "SERPAPI_API_KEY", "SERPAPI_KEY")
     if not key:
         return {"attempted": False, "notes": "missing_serp_key", "json": None}
@@ -301,6 +312,9 @@ def serpapi_google_search(query: str, logger=None) -> Dict[str, Any]:
     except ImportError:
         pass  # cache not available, continue without it
 
+    # PHASE 4.6.4: GLOBAL RATE LIMIT (process-wide, thread-safe)
+    _SERP_RATE.wait("serpapi", 0.95)
+
     # Use pooled session + semaphore if available
     try:
         from tp_enrich.http_pool import get_session
@@ -315,12 +329,20 @@ def serpapi_google_search(query: str, logger=None) -> Dict[str, Any]:
                 with limiter:
                     return s.get("https://serpapi.com/search.json",
                                  params={"engine": "google", "q": qn, "api_key": key},
-                                 timeout=20)
+                                 timeout=12)  # PHASE 4.6.4: Reduced timeout
             return s.get("https://serpapi.com/search.json",
                          params={"engine": "google", "q": qn, "api_key": key},
-                         timeout=20)
+                         timeout=12)
 
-        r = request_with_retry(_do, logger=logger, tries=4, base_sleep=0.4, max_sleep=4.0)
+        # PHASE 4.6.4: Reduced retries from 4 to 2
+        r = request_with_retry(_do, logger=logger, tries=2, base_sleep=1.1, max_sleep=2.5)
+
+        # PHASE 4.6.4: Hard 429 guard - don't cache or retry
+        if r and r.status_code == 429:
+            if logger:
+                logger.warning(f"SerpApi 429 rate limit hit - stopping retries")
+            return {"attempted": True, "notes": "http_429_rate_limit", "json": None}
+
         if not r or r.status_code != 200:
             if logger:
                 logger.warning(f"SerpApi google failed: status={getattr(r,'status_code',None)}")
@@ -339,10 +361,18 @@ def serpapi_google_search(query: str, logger=None) -> Dict[str, Any]:
 
     except ImportError:
         # Fallback to basic requests if Phase 3 modules not available
+        # PHASE 4.6.4: Apply same hardening to fallback path
         url = "https://serpapi.com/search.json"
         params = {"engine": "google", "q": qn, "api_key": key}
         try:
-            r = requests.get(url, params=params, timeout=20)
+            r = requests.get(url, params=params, timeout=12)
+
+            # PHASE 4.6.4: Hard 429 guard in fallback too
+            if r.status_code == 429:
+                if logger:
+                    logger.warning(f"SerpApi 429 rate limit hit (fallback) - stopping")
+                return {"attempted": True, "notes": "http_429_rate_limit", "json": None}
+
             if r.status_code != 200:
                 if logger:
                     logger.warning(f"SerpApi google failed: status={r.status_code} body={r.text[:200]}")

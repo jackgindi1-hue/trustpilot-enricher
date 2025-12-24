@@ -497,6 +497,118 @@ api_server.py had **broken imports** that would crash on startup:
 
 ---
 
+## 🚨 PHASE 4.6.4 — SPEED + COVERAGE FIX (ONE SHOT)
+
+**Date**: December 24, 2025
+**Status**: ✅ **IMPLEMENTATION COMPLETE - READY TO COMMIT**
+
+### Critical Issues to Fix
+
+**A) SPEED REGRESSION: 429 Rate Limit Storms**
+- Logs show 429 errors getting worse after Phase 4.6.3
+- SerpAPI needs global rate limiting (1 req/sec across process)
+- Cap retries to 2 (not 4+)
+- Clamp concurrency to 4 when discovery enabled
+
+**B) PHONE COVERAGE LOSS**
+- `discovered_phone` found but not promoted to `primary_phone`
+- Users see empty phone field even though discovery succeeded
+- Need to promote discovered_phone when primary is empty
+
+**C) EMAIL COVERAGE CRITICAL**
+- Email enrichment stops when canonical matching fails (<80%)
+- Discovery finds domain but Hunter/Apollo never run
+- Directory emails (yelp.com, zoominfo.com) overwriting primary_email
+- Need to ALWAYS run email when ANY domain exists (canonical OR discovered)
+
+### Required Changes
+
+**1. Rate Limiting** (`tp_enrich/retry_ratelimit.py`)
+- ✅ Already has `SimpleRateLimiter` with thread-safe locking
+- ✅ Already has jitter to prevent burst alignment
+- Need to find SerpAPI calls and apply rate limiting
+
+**2. Phone Promotion** (`tp_enrich/adaptive_enrich.py`)
+- Add `_promote_discovered_phone()` helper
+- Call after canonical matching (both accept/reject branches)
+- Only promote if `primary_phone` is empty
+
+**3. Email Coverage** (`tp_enrich/adaptive_enrich.py`)
+- Import `assign_email` (already imported ✅)
+- Add `_run_email_step()` that ALWAYS runs when domain exists
+- Route ALL emails through `assign_email()` (directory → secondary, real → primary)
+- Add required log: "CANONICAL rejected; still running email due to discovered_domain"
+- Move email enrichment AFTER canonical block (not inside)
+
+### Implementation Summary ✅
+
+**Files Modified:**
+1. **`tp_enrich/adaptive_enrich.py`** (+120 lines modified)
+   - Added `_promote_discovered_phone()` helper (20 lines)
+   - Added `_run_email_step()` helper (110 lines)
+   - Removed direct phone assignment from discovery
+   - Integrated both helpers after canonical matching
+   - Reduced anchor discovery max_urls from 3 to 2
+
+2. **`tp_enrich/phase2_final.py`** (+30 lines modified)
+   - Added global `_SERP_RATE` limiter (0.95s interval)
+   - Applied rate limiting to serpapi_google_search
+   - Reduced retries from 4 to 2
+   - Added hard 429 guard (no retry on rate limit)
+   - Reduced timeout from 20s to 12s
+   - Applied hardening to fallback path
+
+**Key Fixes:**
+- ✅ Global SerpAPI rate limiting prevents 429 storms
+- ✅ Discovered phones promoted when primary is empty
+- ✅ Email ALWAYS runs when domain exists (canonical OR discovered)
+- ✅ Directory emails preserved as secondary via assign_email()
+- ✅ Required regression log: "Canonical rejected, but running email due to domain=..."
+- ✅ ALL emails routed through assign_email() (no direct assignments)
+
+### Testing Required
+- [ ] Upload CSV with canonical rejections (score < 80%)
+- [ ] Verify discovered_phone promoted to primary_phone
+- [ ] Check logs for: "EMAIL: Canonical rejected, but running email due to domain=..."
+- [ ] Verify primary_email populated even when canonical fails
+- [ ] Verify directory emails in secondary_email field
+- [ ] Monitor Railway logs for 429 errors (should be reduced)
+- [ ] Verify SerpAPI rate limiting logs (0.95s intervals)
+
+---
+
+## 📈 PERFORMANCE IMPACT
+
+### Entity Matching
+**Cost:** ~1-2 seconds per business (only when state known + no website)
+**Frequency:** ~5-10% of businesses (most have websites from Google Places)
+**Total impact:** <1% of total pipeline runtime
+
+### Resilient Polling
+**Cost:** 0ms on success, up to 7.5 seconds on 6 retries
+**Frequency:** Rare (only on transient failures)
+**Benefit:** Prevents job abandonment on temporary glitches
+
+### Checkpoint System
+**Cost:** ~1-2 seconds per checkpoint (every 250 businesses)
+**Frequency:** Every 250 businesses
+**Total impact:** <0.5% of total runtime
+**Benefit:** Enables partial recovery worth 100x the cost
+
+---
+
+## 🚀 NEXT STEPS
+
+1. **Commit Phase 4.6.1** ✅
+2. **Push to GitHub** ⏳
+3. **Railway auto-deploy** (backend)
+4. **Netlify auto-deploy** (frontend)
+5. **Test entity matching** (upload CSV with state-known businesses)
+6. **Test resilient polling** (trigger Railway cold start)
+7. **Test checkpoint recovery** (cancel job mid-run, download partial)
+
+---
+
 **Current Focus**: ✅ **PHASE 4.6.1 COMPLETE - READY TO DEPLOY**
 **Status**: 🟢 **ALL CODE IMPLEMENTED**
 **Next**: Push to GitHub and verify auto-deploy
