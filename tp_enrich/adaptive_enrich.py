@@ -100,6 +100,20 @@ def _promote_discovered_phone(row: dict, logger=None) -> dict:
 
     return row
 
+def _norm_domain(d: str) -> str:
+    """Normalize domain from URL or domain string."""
+    d = (d or "").strip().lower()
+    d = d.replace("http://", "").replace("https://", "").replace("www.", "").split("/")[0]
+    return d
+
+def _norm_phone(p: str) -> str:
+    """Normalize phone number to digits only."""
+    import re
+    digits = re.sub(r"\D", "", (p or ""))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits
+
 def _google_is_strong_anchor(google_hit: dict) -> bool:
     """
     PHASE 4.6.5: Returns True if Google hit has a strong anchor.
@@ -117,9 +131,39 @@ def _google_is_strong_anchor(google_hit: dict) -> bool:
         return False
 
     phone = (google_hit.get("formatted_phone_number") or google_hit.get("phone") or "").strip()
-    website = (google_hit.get("website") or "").strip()
+    website = (google_hit.get("website") or google_hit.get("domain") or "").strip()
 
+    # Strong = at least one real anchor
     return bool(phone or website)
+
+def _force_apply_google_anchors(row: dict, google_hit: dict):
+    """
+    PHASE 4.6.5 FINAL: Force-write Google anchors to prevent field collapse.
+
+    Even if apply_canonical_to_row exists, we still force-write the two
+    anchors that drive coverage: phone + domain.
+
+    This prevents the "022/6436 canonical empty" bug where Google is accepted
+    but domain/phone fields aren't written to the output row.
+    """
+    # Phone
+    g_phone = (google_hit.get("formatted_phone_number") or google_hit.get("phone") or "").strip()
+    if g_phone and not (row.get("primary_phone") or "").strip():
+        row["primary_phone"] = g_phone
+        row["primary_phone_source"] = row.get("primary_phone_source") or "google"
+
+    # Domain (from website)
+    g_web = (google_hit.get("website") or google_hit.get("domain") or "").strip()
+    g_dom = _norm_domain(g_web)
+    if g_dom and not (row.get("company_domain") or "").strip():
+        row["company_domain"] = g_dom
+        row["company_domain_source"] = row.get("company_domain_source") or "google"
+
+    # Business name (optional, but helps canonical consistency)
+    g_name = (google_hit.get("name") or "").strip()
+    if g_name and not (row.get("business_name") or "").strip():
+        row["business_name"] = g_name
+        row["business_name_source"] = row.get("business_name_source") or "google"
 
 def _run_email_step(name: str, row: dict, logger=None) -> dict:
     """
@@ -480,16 +524,29 @@ def enrich_single_business_adaptive(
         if logger:
             logger.info("   -> CANONICAL: Auto-accepting Google strong anchor (phone/website present)")
 
-        row = apply_canonical_to_row(
-            row,
-            google_candidate or google_hit,  # Use normalized candidate if available
-            meta={
-                "reason": "google_strong_anchor",
-                "best_score": 1.0,
-                "score": 1.0,
-                "source": "google",
-            },
-        )
+        # Apply canonical (keep your function if it populates fields)
+        try:
+            row = apply_canonical_to_row(
+                row,
+                google_candidate or google_hit,  # Use normalized candidate if available
+                meta={
+                    "reason": "google_strong_anchor",
+                    "best_score": 1.0,
+                    "score": 1.0,
+                    "source": "google",
+                },
+            )
+        except Exception as ex:
+            if logger:
+                logger.warning(f"   -> apply_canonical_to_row failed for google strong anchor err={repr(ex)} (continuing)")
+
+        # PHASE 4.6.5 FINAL: FORCE canonical audit fields (prevents 022/6436 'canonical empty' bug)
+        row["canonical_source"] = "google"
+        row["canonical_match_score"] = 1.0
+        row["canonical_match_reason"] = "google_strong_anchor"
+
+        # PHASE 4.6.5 FINAL: FORCE anchors into row (prevents domain/email collapse)
+        _force_apply_google_anchors(row, google_hit)
     else:
         # PHASE 4.6.5: Pass normalized candidates (not raw hits) to matcher
         canonical, match_meta = choose_canonical_business(row, google_candidate, yelp_candidate)
