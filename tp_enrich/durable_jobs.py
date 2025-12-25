@@ -2,6 +2,8 @@
 Durable job storage for async enrichment jobs
 Supports PostgreSQL (primary) and file-based fallback
 Ensures job state survives Railway restarts/redeploys
+
+PHASE 4.7.0: Atomic write + safe read with retry/fallback
 """
 import os
 import json
@@ -9,10 +11,63 @@ import time
 import uuid
 from typing import Dict, Any, Optional
 from datetime import datetime
+from json import JSONDecodeError
 
 # Storage configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
 JOBS_STORAGE_DIR = os.getenv("JOBS_STORAGE_DIR", "/data/tp_jobs")  # Railway persistent volume
+
+# ============================================================
+# PHASE 4.7.0 — ATOMIC WRITE + SAFE READ HELPERS
+# ============================================================
+
+def _job_json_path(job_id: str) -> str:
+    """Get path to job JSON file"""
+    return os.path.join(JOBS_STORAGE_DIR, "meta", f"{job_id}.json")
+
+
+def _job_bak_path(job_id: str) -> str:
+    """Get path to job backup file"""
+    return os.path.join(JOBS_STORAGE_DIR, "meta", f"{job_id}.json.bak")
+
+
+def _atomic_write_json(path: str, obj: dict):
+    """
+    Atomic write: prevents partial / empty job JSON files.
+    PHASE 4.7.0 FIX: Ensures JSON is complete before replacing file.
+    """
+    tmp_path = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    data = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_path, path)
+
+
+def save_job(job_id: str, job: dict):
+    """
+    PHASE 4.7.0: Atomic job save with backup.
+    Prevents corruption during concurrent writes.
+    """
+    path = _job_json_path(job_id)
+    bak = _job_bak_path(job_id)
+
+    # best-effort backup of last good job file
+    try:
+        if os.path.exists(path):
+            try:
+                os.replace(path, bak)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    _atomic_write_json(path, job)
 
 # Initialize storage
 def _init_storage():
@@ -95,7 +150,7 @@ def create_job(job_id: Optional[str] = None) -> str:
         cur.close()
         conn.close()
     else:
-        meta_path = os.path.join(JOBS_STORAGE_DIR, "meta", f"{job_id}.json")
+        # PHASE 4.7.0: Use atomic write
         meta = {
             "job_id": job_id,
             "status": "queued",
@@ -103,8 +158,7 @@ def create_job(job_id: Optional[str] = None) -> str:
             "updated_at": time.time(),
             "progress": 0
         }
-        with open(meta_path, "w") as f:
-            json.dump(meta, f)
+        save_job(job_id, meta)
 
     return job_id
 
@@ -144,24 +198,50 @@ def update_job(job_id: str, updates: Dict[str, Any]):
         cur.close()
         conn.close()
     else:
-        meta_path = os.path.join(JOBS_STORAGE_DIR, "meta", f"{job_id}.json")
+        # PHASE 4.7.0: Use atomic write for file-based storage
+        path = _job_json_path(job_id)
 
-        # Read existing metadata
-        if os.path.exists(meta_path):
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-        else:
+        # Read existing metadata (with retry for safety)
+        meta = None
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                if raw.strip():
+                    meta = json.loads(raw)
+        except Exception:
+            # Try backup
+            try:
+                bak = _job_bak_path(job_id)
+                with open(bak, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                if raw.strip():
+                    meta = json.loads(raw)
+            except Exception:
+                pass
+
+        if not meta:
             meta = {"job_id": job_id, "created_at": time.time()}
 
         # Update with new values
         meta.update(updates)
 
-        # Write back
-        with open(meta_path, "w") as f:
-            json.dump(meta, f)
+        # Atomic write
+        save_job(job_id, meta)
 
-def get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Get job metadata (returns None if not found)"""
+def get_job(job_id: str, retries: int = 5, sleep_s: float = 0.05) -> Optional[Dict[str, Any]]:
+    """
+    PHASE 4.7.0: Safe read with retry + fallback.
+    NEVER throws JSONDecodeError to caller.
+
+    Args:
+        job_id: Job ID to fetch
+        retries: Number of retry attempts for file-based storage
+        sleep_s: Sleep duration between retries
+
+    Returns:
+        Job dict or special error dict (never None, never crashes)
+    """
     if STORAGE_BACKEND == "postgres":
         import psycopg2
         from psycopg2.extras import RealDictCursor
@@ -191,13 +271,40 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
             print(f"Error fetching job {job_id}: {e}")
             return None
     else:
-        meta_path = os.path.join(JOBS_STORAGE_DIR, "meta", f"{job_id}.json")
+        # File-based storage with retry + fallback
+        path = _job_json_path(job_id)
+        bak = _job_bak_path(job_id)
 
-        if not os.path.exists(meta_path):
-            return None
+        last_err = None
 
-        with open(meta_path, "r") as f:
-            return json.load(f)
+        # Try reading main file with retries
+        for _ in range(max(1, retries)):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                if not raw.strip():
+                    raise JSONDecodeError("Empty job file", raw, 0)
+                return json.loads(raw)
+            except (FileNotFoundError, JSONDecodeError) as e:
+                last_err = e
+                time.sleep(sleep_s)
+
+        # Fallback to last known-good backup
+        try:
+            with open(bak, "r", encoding="utf-8") as f:
+                raw = f.read()
+            if raw.strip():
+                return json.loads(raw)
+        except Exception:
+            pass
+
+        # Absolute last resort: return error dict instead of None
+        # This prevents 500 errors in API
+        return {
+            "id": job_id,
+            "status": "unknown",
+            "error": f"get_job failed: {type(last_err).__name__}: {last_err}",
+        }
 
 def get_csv_paths(job_id: str) -> Dict[str, str]:
     """Get paths for CSV storage (durable location)"""

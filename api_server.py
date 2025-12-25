@@ -299,7 +299,7 @@ async def create_job(
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
     """
-    Get job status (PHASE 4)
+    Get job status (PHASE 4.7.0: Never crashes, always returns valid JSON)
 
     Args:
         job_id: Job ID from /jobs POST
@@ -307,10 +307,19 @@ def job_status(job_id: str):
     Returns:
         Job metadata and status
     """
-    job = durable_jobs.get_job(job_id)
-    if not job:
-        return JSONResponse({"error": "not_found", "job_id": job_id}, status_code=404)
-    return JSONResponse(job)
+    try:
+        job = durable_jobs.get_job(job_id)
+        if not job:
+            return JSONResponse({"error": "not_found", "job_id": job_id}, status_code=404)
+        return JSONResponse(job)
+    except Exception as e:
+        # PHASE 4.7.0: NEVER 500 the UI again
+        logger.exception(f"Error fetching job {job_id}: {e}")
+        return JSONResponse({
+            "id": job_id,
+            "status": "unknown",
+            "error": str(e),
+        })
 
 
 @app.get("/jobs/{job_id}/stream")
