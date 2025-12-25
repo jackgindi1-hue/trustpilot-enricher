@@ -1,0 +1,48 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Testing
+test_*.py
+*_test.py
+tests/
+
+# Cache and output
+enrichment_cache.json
+enriched_output.csv
+*.csv
+!sample_input.csv
+
+# Documentation
+*.md
+!README.md
+docs/
+.same/
+
+# Web frontend
+web/node_modules/
+web/dist/
+web/.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
