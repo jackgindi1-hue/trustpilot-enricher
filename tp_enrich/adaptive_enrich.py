@@ -449,6 +449,94 @@ def _run_email_step(name: str, row: dict, logger=None) -> dict:
 
     return row
 
+# ============================================================
+# PHASE 4.6.6 — ADDRESS-TRIGGERED RETRY (BBB + YP)
+# ============================================================
+
+def _all_blank(*vals) -> bool:
+    """Check if all values are blank/empty."""
+    for v in vals:
+        if (v or "").strip():
+            return False
+    return True
+
+
+def _needs_contact(row: dict) -> bool:
+    """
+    Returns True if we need more contact info (missing phone OR email).
+    Retry if we don't have both.
+    """
+    has_phone = bool((row.get("primary_phone") or "").strip())
+    has_email = bool((row.get("primary_email") or "").strip())
+    return (not has_phone) or (not has_email)
+
+
+def _bbbyp_outputs_empty(row: dict) -> bool:
+    """Check if BBB/YP outputs are all empty (not yet exploited)."""
+    return _all_blank(
+        row.get("phase2_bbb_phone"),
+        row.get("phase2_bbb_email"),
+        row.get("phase2_bbb_website"),
+        row.get("phase2_yp_phone"),
+        row.get("phase2_yp_email"),
+        row.get("phase2_yp_website"),
+    )
+
+
+def _should_retry_directories_post_address(row: dict) -> bool:
+    """
+    Decide if we should retry BBB/YP after discovering an address.
+
+    Conditions:
+    - discovered_address exists
+    - BBB/YP outputs are empty (not yet run with address)
+    - We need more contact info (missing phone OR email)
+    - We haven't already retried (prevent loops)
+    """
+    if not (row.get("discovered_address") or "").strip():
+        return False
+    if not _bbbyp_outputs_empty(row):
+        return False
+    if not _needs_contact(row):
+        return False
+    if row.get("address_retry_ran") is True:
+        return False
+    return True
+
+
+def _run_post_address_directory_retries(row: dict, logger):
+    """
+    Execute BBB + YP retries with discovered address.
+    Sets address_retry_ran flag to prevent loops.
+    """
+    row["address_retry_ran"] = True
+
+    logger.info(
+        "ADDRESS_RETRY_SENTINEL row_id=%s name=%s addr=%s",
+        row.get("row_id"),
+        row.get("company_search_name") or row.get("raw_display_name"),
+        row.get("discovered_address"),
+    )
+
+    # BBB retry with address
+    try:
+        # Import BBB lookup function
+        from tp_enrich.phase2_final import run_bbb_lookup
+        row = run_bbb_lookup(row, logger=logger)
+    except Exception as e:
+        logger.warning("BBB_RETRY_ERROR row_id=%s err=%s", row.get("row_id"), e)
+
+    # YP retry with address
+    try:
+        # Import YP lookup function
+        from tp_enrich.phase2_final import run_yp_lookup
+        row = run_yp_lookup(row, logger=logger)
+    except Exception as e:
+        logger.warning("YP_RETRY_ERROR row_id=%s err=%s", row.get("row_id"), e)
+
+    return row
+
+
 def enrich_single_business_adaptive(
     name: str,
     region: Optional[str] = None,
@@ -512,7 +600,7 @@ def enrich_single_business_adaptive(
     # PHASE 4.6.5.6: Google always run sentinel
     if logger:
         logger.info("GOOGLE_ALWAYS_RUN_SENTINEL name=%s", name)
-    
+
     try:
         google_hit = google_lookup_allow_name_only(
             name=name,
@@ -820,6 +908,13 @@ def enrich_single_business_adaptive(
                 if logger:
                     logger.warning(f"   -> Website scan failed: {e}")
         # ============================================================
+
+    # ============================================================
+    # PHASE 4.6.6: ADDRESS-TRIGGERED DIRECTORY RETRIES
+    # ============================================================
+    if _should_retry_directories_post_address(row):
+        row = _run_post_address_directory_retries(row, logger)
+
     # STEP 8: Compute confidence
     # ============================================================
     has_phone = bool(row.get("primary_phone") or row.get("discovered_phone"))
