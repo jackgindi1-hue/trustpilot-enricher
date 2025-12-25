@@ -212,6 +212,122 @@ def _run_email_step(name: str, row: dict, logger=None) -> dict:
         wf = email_waterfall_enrich(
             company=name,
             domain=email_domain,
+
+
+# ============================================================
+# PHASE 4.6.5.7 — SERP-FIRST + ANCHOR METRICS
+# ============================================================
+
+_PHONE_RE = re.compile(r"(\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}")
+
+def _safe_json_loads(s: str):
+    """Safe JSON parse, returns None on failure."""
+    import json
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def _extract_anchor_from_discovery_evidence(row: dict) -> dict:
+    """
+    PHASE 4.6.5.7: Extract anchor from discovery_evidence_json.
+    Expects JSON list of dicts with domain/phone/address/state/evidence_url.
+    Returns first useful anchor.
+    """
+    raw = _clean_scalar(row.get("discovery_evidence_json") or "")
+    if not raw:
+        return {}
+
+    data = _safe_json_loads(raw)
+    if not isinstance(data, list):
+        return {}
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        domain = _norm_domain(item.get("domain") or item.get("website") or item.get("evidence_url") or "")
+        phone = (item.get("phone") or item.get("telephone") or "").strip()
+        address = (item.get("address") or "").strip()
+        state = (item.get("state") or "").strip()
+        ev_url = (item.get("evidence_url") or item.get("url") or "").strip()
+
+        if not phone:
+            m = _PHONE_RE.search(str(item))
+            if m:
+                phone = m.group(0)
+
+        if domain or phone or address or state:
+            return {
+                "domain": domain,
+                "phone": phone,
+                "address": address,
+                "state": state,
+                "evidence_url": ev_url,
+                "source": "serp_scrape",
+            }
+
+    return {}
+
+
+def _apply_anchor_to_row(row: dict, anchor: dict, logger=None) -> bool:
+    """
+    PHASE 4.6.5.7: Apply anchor to discovered_* fields + set first-class metrics.
+    Returns True if anything changed.
+    
+    Adds CSV columns: anchor_source, anchor_applied, google_retried, anchor_evidence_url
+    """
+    changed = False
+
+    # Ensure first-class metric columns exist (for CSV)
+    if "anchor_source" not in row:
+        row["anchor_source"] = ""
+    if "anchor_applied" not in row:
+        row["anchor_applied"] = False
+    if "google_retried" not in row:
+        row["google_retried"] = False
+    if "anchor_evidence_url" not in row:
+        row["anchor_evidence_url"] = ""
+
+    if not anchor:
+        return False
+
+    # Apply discovered fields only if empty
+    if _is_blank(row.get("discovered_domain")) and anchor.get("domain"):
+        row["discovered_domain"] = anchor["domain"]
+        changed = True
+
+    if _is_blank(row.get("discovered_phone")) and anchor.get("phone"):
+        row["discovered_phone"] = anchor["phone"]
+        changed = True
+
+    if _is_blank(row.get("discovered_address")) and anchor.get("address"):
+        row["discovered_address"] = anchor["address"]
+        changed = True
+
+    if _is_blank(row.get("discovered_state_region")) and anchor.get("state"):
+        row["discovered_state_region"] = anchor["state"]
+        changed = True
+
+    if changed:
+        row["anchor_source"] = anchor.get("source") or "serp_scrape"
+        row["anchor_applied"] = True
+        row["anchor_evidence_url"] = anchor.get("evidence_url") or ""
+        row["discovered_evidence_source"] = anchor.get("source") or "serp_scrape"
+        row["discovered_evidence_url"] = anchor.get("evidence_url") or row.get("discovered_evidence_url") or ""
+        if logger:
+            logger.info(
+                "ANCHOR_APPLIED source=%s domain=%s phone=%s addr=%s state=%s",
+                row["anchor_source"],
+                bool(anchor.get("domain")),
+                bool(anchor.get("phone")),
+                bool(anchor.get("address")),
+                bool(anchor.get("state")),
+            )
+
+    return changed
+
             person_name=None,
             logger=logger
         )
@@ -677,3 +793,25 @@ def enrich_single_business_adaptive(
     else:
         row["overall_lead_confidence"] = "failed"
     return row
+    
+    # ============================================================
+    # PHASE 4.6.5.7: SERP-FIRST + ANCHOR METRICS
+    # ============================================================
+    if logger:
+        logger.info("SERP_FIRST_SENTINEL name=%s", name)
+    
+    # Initialize first-class metrics columns (ensures they appear in CSV)
+    row.setdefault("anchor_source", "")
+    row.setdefault("anchor_applied", False)
+    row.setdefault("google_retried", False)
+    row.setdefault("anchor_evidence_url", "")
+    
+    # Extract SERP anchor from discovery_evidence_json if available
+    ev_anchor = _extract_anchor_from_discovery_evidence(row)
+    anchor_changed = _apply_anchor_to_row(row, ev_anchor, logger=logger)
+    
+    # If anchor changed, mark for Google retry
+    if anchor_changed:
+        row["google_retried"] = True
+    
+    # ============================================================
