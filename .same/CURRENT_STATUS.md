@@ -1,7 +1,7 @@
 # 🎯 TRUSTPILOT ENRICHER - CURRENT STATUS
 
-**Last Updated:** December 25, 2025, 22:15 UTC
-**Current Version:** Phase 4.7.0
+**Last Updated:** December 25, 2025, 22:45 UTC
+**Current Version:** Phase 4.7.1
 **Deployment Status:** ✅ **LIVE ON PRODUCTION**
 
 ---
@@ -9,9 +9,9 @@
 ## 📊 Current Deployment
 
 ### GitHub Main Branch
-- **Latest Commit:** `5783aab`
-- **Commit Message:** Phase 4.7.0: Atomic job writes + safe reads (fixes CSV never finishes, 500 errors)
-- **Committed:** December 25, 2025 at 22:15 UTC
+- **Latest Commit:** `ae5261c`
+- **Commit Message:** Phase 4.7.1: Fix UI stuck "Running" on missing/unknown jobs
+- **Committed:** December 25, 2025 at 22:45 UTC
 - **Status:** ✅ **HEAD of main branch**
 
 ### Railway Deployment
@@ -22,9 +22,29 @@
 
 ---
 
-## ✅ Phase 4.7.0 - What's Live
+## ✅ Phase 4.7.1 - What's Live
 
-### CRITICAL FIXES (Just Deployed)
+### UI STUCK "RUNNING" FIX (Just Deployed)
+**Status:** ✅ **DEPLOYED AND ACTIVE**
+
+**Problem Fixed: UI Stuck in "Running" Forever**
+- User refreshes during job processing
+- Job gets corrupted/deleted (Railway restart)
+- Backend returns "unknown" status
+- UI kept polling and showing "Running..." forever
+- User couldn't upload new CSV
+
+**Solution:**
+- Backend returns explicit "missing" status for unknown jobs
+- Frontend detects "missing" and resets UI to idle
+- User can immediately upload new CSV
+- Graceful recovery without manual intervention
+
+---
+
+## ✅ Phase 4.7.0 - Job Stability
+
+### CRITICAL FIXES (Active)
 **Status:** ✅ **DEPLOYED AND ACTIVE**
 
 **Problem 1: Jobs Never Finish ✅ FIXED**
@@ -300,12 +320,12 @@ ENABLE_GOOGLE_MULTI_STRATEGY=false
 
 **Phase 4.7.0 is LIVE on production**
 
- Atomic writes prevent job corruption
- Safe reads with retry + fallback
- API never returns 500 errors
- Backup system prevents data loss
- All previous Phase 4.6.5 features preserved
- No regressions detected
+✅ Atomic writes prevent job corruption
+✅ Safe reads with retry + fallback
+✅ API never returns 500 errors
+✅ Backup system prevents data loss
+✅ All previous Phase 4.6.5 features preserved
+✅ No regressions detected
 
 **Next action:** Verify Railway deployment and upload test CSV
 

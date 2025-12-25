@@ -1,22 +1,28 @@
 # 📊 QUICK STATUS REFERENCE
 
-**Generated:** December 25, 2025, 22:15 UTC
+**Generated:** December 25, 2025, 22:45 UTC
 
 ---
 
 ## 🎯 CURRENT STATE
 
 ```
- Phase 4.7.0 is DEPLOYED on GitHub main branch
-   Awaiting Railway deployment verification
-   Awaiting production testing with real CSV
+✅ Phase 4.7.1 is DEPLOYED on GitHub main branch
+⏳ Awaiting Railway + Netlify deployment verification
+⏳ Awaiting production testing with real CSV
 ```
 
 ---
 
-## 📦 What's Live (Commit 5783aab)
+## 📦 What's Live (Commit ae5261c)
 
-### Phase 4.7.0: Atomic Writes + Safe Reads (CURRENT)
+### Phase 4.7.1: UI Stuck "Running" Fix (CURRENT)
+- ✅ UI never stuck in "Running" (missing job detection)
+- ✅ Automatic reset to idle on corruption
+- ✅ User can always upload new CSV
+- ✅ Graceful recovery from Railway restarts
+
+### Phase 4.7.0: Atomic Writes + Safe Reads (Active)
 - ✅ Jobs never stuck in "running" (atomic writes)
 - ✅ No 500 errors (graceful error handling)
 - ✅ Zero data loss (backup system)
@@ -146,17 +152,17 @@ git push origin main
 
 **Phase 4.7.0 succeeds if:**
 
- No jobs stuck in "running" status
- No 500 errors from /jobs endpoint
- All jobs reach terminal state (done/error)
- Download button stable and functional
+✅ No jobs stuck in "running" status
+✅ No 500 errors from /jobs endpoint
+✅ All jobs reach terminal state (done/error)
+✅ Download button stable and functional
 
 **Phase 4.6.5 succeeds if:**
 
- Google lookup success ≥ 80%
- Canonical acceptance ≥ 80%
- Phone coverage ≥ 70%
- Email coverage ≥ 65%
+✅ Google lookup success ≥ 80%
+✅ Canonical acceptance ≥ 80%
+✅ Phone coverage ≥ 70%
+✅ Email coverage ≥ 65%
 
 ---
 
