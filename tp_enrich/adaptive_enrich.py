@@ -1,1 +1,1 @@
-$(cat /tmp/updated_adaptive_enrich.py)
+$(cat /tmp/adaptive_enrich.py | base64)
