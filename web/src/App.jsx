@@ -2,8 +2,8 @@ import { useState, useEffect } from 'react'
 import config from './config'
 import './App.css'
 
-// PHASE 4.5.5 DEPLOY - Stop 404 Spam PERMANENTLY (Hardened Polling)
-// BUILD TIMESTAMP: 2025-12-23 04:30 UTC
+// PHASE 4.7.1 DEPLOY - UI Stuck "Running" Fix (Missing Job Reset)
+// BUILD TIMESTAMP: 2025-12-25 22:30 UTC
 
 // PHASE 4.5: Pagination constants
 const PAGE_SIZE = 100
@@ -103,7 +103,7 @@ function App() {
   }
 
   const isTerminal = (status) => {
-    return ["completed", "done", "failed", "error", "cancelled"].includes(
+    return ["completed", "done", "failed", "error", "cancelled", "missing", "unknown"].includes(
       String(status || "").toLowerCase()
     )
   }
@@ -183,6 +183,20 @@ function App() {
           const meta = await res.json();
           const status = String(meta.status || "").toLowerCase();
           const progress = typeof meta.progress === "number" ? meta.progress : null;
+
+          // PHASE 4.7.1: Handle missing/unknown jobs - reset UI to idle
+          if (status === "missing" || status === "unknown" || meta.missing === true) {
+            console.warn("Job is missing/unknown; resetting UI to idle", jobId);
+            clearJobId();
+            setCurrentJobId(null);
+            setJobMeta(null);
+            setStatus("idle");
+            setIsProcessing(false);
+            setError(null);
+            cleanup();
+            resolve(); // Don't show error, just reset
+            return;
+          }
 
           // Update UI state
           setJobMeta(meta);

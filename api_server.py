@@ -299,7 +299,7 @@ async def create_job(
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
     """
-    Get job status (PHASE 4.7.0: Never crashes, always returns valid JSON)
+    Get job status (PHASE 4.7.1: Explicit "missing" status for UI reset)
 
     Args:
         job_id: Job ID from /jobs POST
@@ -311,13 +311,22 @@ def job_status(job_id: str):
         job = durable_jobs.get_job(job_id)
         if not job:
             return JSONResponse({"error": "not_found", "job_id": job_id}, status_code=404)
+
+        # PHASE 4.7.1: If job status is unknown/empty, mark as "missing" so UI can reset
+        status = (job or {}).get("status")
+        if status in ("unknown", "", None):
+            job["status"] = "missing"
+            job["missing"] = True
+            logger.warning(f"Job {job_id} has unknown/empty status, marking as missing")
+
         return JSONResponse(job)
     except Exception as e:
-        # PHASE 4.7.0: NEVER 500 the UI again
+        # PHASE 4.7.1: Return explicit "missing" status for UI reset
         logger.exception(f"Error fetching job {job_id}: {e}")
         return JSONResponse({
             "id": job_id,
-            "status": "unknown",
+            "status": "missing",
+            "missing": True,
             "error": str(e),
         })
 
