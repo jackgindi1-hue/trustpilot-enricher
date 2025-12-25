@@ -128,6 +128,92 @@ def _pick_phone_any(row: dict) -> str:
             return p
     return ""
 
+
+# ============================================================
+# PHASE 4.6.5.6 — BUSINESS NAME PROMOTION + SENTINELS
+# ============================================================
+
+_PROMOTE_BIZ_TOKENS = {
+    "books", "bookstore", "classics", "consulting", "coding", "organics", "beauty",
+    "entertainment", "media", "holdings", "distribution", "tire", "wash", "mobile",
+    "plumbing", "roofing", "fitness", "athletics", "bistro", "cafe", "restaurant",
+    "studio", "studios", "logistics", "transport", "trucking", "construction", "detailing"
+}
+
+def _looks_like_obvious_business(name: str) -> bool:
+    """
+    PHASE 4.6.5.6: Detect obvious business names for promotion.
+    SAFE: Only used to promote person/other -> business.
+    """
+    import re
+    n = (name or "").strip()
+    if not n:
+        return False
+
+    # business punctuation
+    if "&" in n or "," in n:
+        return True
+
+    low = n.lower()
+    tokens = re.findall(r"[a-zA-Z0-9']+", low)
+    if not tokens:
+        return False
+
+    # legal forms
+    legal = {"llc", "inc", "inc.", "co", "co.", "corp", "corp.", "ltd", "ltd.", "pllc", "pc", "lp", "llp"}
+    if any(t in legal for t in tokens):
+        return True
+
+    # known business tokens
+    if any(t in _PROMOTE_BIZ_TOKENS for t in tokens):
+        return True
+
+    # 3+ tokens → usually business
+    if len(tokens) >= 3:
+        return True
+
+    # two-token pattern (Hausfeld Classics, Southampton Books)
+    if len(tokens) == 2 and tokens[1] in _PROMOTE_BIZ_TOKENS:
+        return True
+
+    return False
+
+
+def promote_name_classification_if_needed(row: dict, logger=None) -> dict:
+    """
+    PHASE 4.6.5.6: Promote obvious business names + ensure company_search_name is set.
+    SAFE: Additive only, never downgrades existing business classification.
+    """
+    cls = (row.get("name_classification") or "").strip().lower()
+    raw = (row.get("raw_display_name") or "").strip()
+
+    if not raw:
+        return row
+
+    # Already business → just fix company_search_name if needed
+    if cls == "business":
+        csn = (row.get("company_search_name") or "").strip()
+        if not csn or csn.lower() in {"nan", "none", "null"}:
+            row["company_search_name"] = raw
+        return row
+
+    # Promote obvious businesses only
+    if _looks_like_obvious_business(raw):
+        row["name_classification"] = "business"
+        row["name_classification_reason"] = (
+            row.get("name_classification_reason") or "promote_obvious_business"
+        )
+        row["company_search_name"] = raw  # CRITICAL: Ensure search name is set
+        if logger:
+            logger.info(
+                "NAME_CLASS_PROMOTE: %s -> business (raw_display_name=%s)",
+                cls or "blank",
+                raw
+            )
+
+    return row
+
+
 def google_lookup_allow_name_only(name: str, api_key: str, discovered_phone: str = "", discovered_address: str = ""):
     """
     PHASE 4.6.5 HOTFIX: Google lookup that NEVER requires state/city.
@@ -405,6 +491,8 @@ def enrich_single_business_adaptive(
         "discovered_evidence_source": None,
         "discovery_evidence_json": "[]",
     }
+    # PHASE 4.6.5.6: Promote business names if needed
+    row = promote_name_classification_if_needed(row, logger)
     # ============================================================
     # STEP 0: Start with existing anchors
     # ============================================================
@@ -421,6 +509,10 @@ def enrich_single_business_adaptive(
     google_api_key = local_enrichment.GOOGLE_PLACES_API_KEY or ""
 
     # HOTFIX: Google NEVER skipped, tries multiple query strategies
+    # PHASE 4.6.5.6: Google always run sentinel
+    if logger:
+        logger.info("GOOGLE_ALWAYS_RUN_SENTINEL name=%s", name)
+    
     try:
         google_hit = google_lookup_allow_name_only(
             name=name,
