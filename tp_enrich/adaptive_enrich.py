@@ -405,6 +405,9 @@ def enrich_row_phase46(
         "discovered_evidence_source": None,
         "discovery_evidence_json": "[]",
     }
+
+    # PHASE 4.6.7.3: Initialize CSV-level execution markers
+    row = _phase467_init_markers(row, logger, name)
     # ============================================================
     # STEP 0: Start with existing anchors
     # ============================================================
@@ -421,6 +424,9 @@ def enrich_row_phase46(
     google_api_key = local_enrichment.GOOGLE_PLACES_API_KEY or ""
 
     # HOTFIX: Google NEVER skipped, tries multiple query strategies
+    # PHASE 4.6.7.3: Mark Google always run BEFORE first call
+    row = _mark_google_always(row, logger, name)
+
     try:
         google_hit = google_lookup_allow_name_only(
             name=name,
@@ -464,6 +470,9 @@ def enrich_row_phase46(
         # ============================================================
         # STEP 4: Run anchor discovery
         # ============================================================
+        # PHASE 4.6.7.3: Mark SERP-first before anchor discovery
+        row = _mark_serp_first(row, logger, name)
+
         try:
             # PHASE 4.6.4: Reduced max_urls from 3 to 2 for speed
             discovered = phase46_anchor_discovery(name, vertical=None, max_urls=2, logger=logger)
@@ -525,6 +534,10 @@ def enrich_row_phase46(
                 discovered_domain = row.get("discovered_domain")
                 if logger:
                     logger.info(f"   -> FEEDBACK: Running email providers with discovered domain={discovered_domain}")
+
+                # PHASE 4.6.7.3: Mark email retry
+                row = _mark_email_retry(row, logger)
+
                 try:
                     # Run email waterfall with discovered domain
                     wf = email_waterfall_enrich(
@@ -898,4 +911,81 @@ enrich_single_business = enrich_single_business_adaptive
 
 # ============================================================
 # END PHASE 4.6.7.2
+# ============================================================
+
+
+# ============================================================
+# PHASE 4.6.7.3 — CSV-LEVEL TRIGGER PROOF + WARNING SENTINELS
+# ============================================================
+
+def _flag(row: dict, key: str, val=True):
+    # persist boolean-ish flags into the row for CSV output
+    try:
+        row[key] = bool(val)
+    except Exception:
+        row[key] = val
+    return row
+
+def _append_debug(row: dict, token: str):
+    token = (token or "").strip()
+    if not token:
+        return row
+    cur = (row.get("debug_notes") or "").strip()
+    if token in cur:
+        return row
+    row["debug_notes"] = (cur + ("|" if cur else "") + token).strip("|")
+    return row
+
+def _sentinel(logger, msg: str, **kv):
+    """
+    WARNING-level sentinel so it survives log level changes/truncation.
+    """
+    try:
+        parts = [msg] + [f"{k}={v}" for k, v in kv.items()]
+        logger.warning(" ".join(parts))
+    except Exception:
+        pass
+
+def _phase467_init_markers(row: dict, logger, name: str):
+    row = _flag(row, "phase467_version", "4.6.7.3")
+    row = _flag(row, "google_always_ran", False)
+    row = _flag(row, "serp_first_ran", False)
+    row = _flag(row, "address_retry_ran", bool(row.get("address_retry_ran") is True))
+    row = _flag(row, "domain_retry_ran", bool(row.get("domain_retry_ran") is True))
+    row = _flag(row, "email_retry_ran", bool(row.get("email_retry_ran") is True))
+    _sentinel(logger, "PHASE467_ROW_INIT", row_id=row.get("row_id"), name=name)
+    return row
+
+def _mark_google_always(row: dict, logger, name: str):
+    row = _flag(row, "google_always_ran", True)
+    row = _append_debug(row, "google_always_ran")
+    _sentinel(logger, "GOOGLE_ALWAYS_RUN_SENTINEL", row_id=row.get("row_id"), name=name)
+    return row
+
+def _mark_serp_first(row: dict, logger, name: str):
+    row = _flag(row, "serp_first_ran", True)
+    row = _append_debug(row, "serp_first_ran")
+    _sentinel(logger, "SERP_FIRST_SENTINEL", row_id=row.get("row_id"), name=name)
+    return row
+
+def _mark_address_retry(row: dict, logger):
+    row = _flag(row, "address_retry_ran", True)
+    row = _append_debug(row, "address_retry_ran")
+    _sentinel(logger, "ADDRESS_RETRY_SENTINEL", row_id=row.get("row_id"))
+    return row
+
+def _mark_domain_retry(row: dict, logger):
+    row = _flag(row, "domain_retry_ran", True)
+    row = _append_debug(row, "domain_retry_ran")
+    _sentinel(logger, "DOMAIN_RETRY_SENTINEL", row_id=row.get("row_id"))
+    return row
+
+def _mark_email_retry(row: dict, logger):
+    row = _flag(row, "email_retry_ran", True)
+    row = _append_debug(row, "email_retry_ran")
+    _sentinel(logger, "EMAIL_RETRY_SENTINEL", row_id=row.get("row_id"))
+    return row
+
+# ============================================================
+# END PHASE 4.6.7.3
 # ============================================================
