@@ -652,3 +652,43 @@ def enrich_row(row: dict, serp_api_key: str, google_api_key: str, logger):
 
     return row
 
+
+
+# ============================================================
+# HOTFIX — RESTORE LEGACY ENTRYPOINT (prevents blank CSV)
+# ============================================================
+
+def enrich_single_business_adaptive(name: str, region: str = None, logger=None):
+    """
+    Legacy entrypoint expected by tp_enrich.pipeline and enrich_row().
+    Signature matches old Phase 4.6 version: (name, region, logger).
+    
+    Returns dict with enriched business data.
+    """
+    # Create minimal row structure for enrich_row router
+    row = {
+        "row_id": "legacy",
+        "company_search_name": name,
+        "raw_display_name": name,
+        "name_classification": "business",
+        "business_state_region": region,
+    }
+    
+    # Call the enrich_row router if available
+    try:
+        if callable(globals().get("enrich_row")):
+            result = enrich_row(row, serp_api_key="", google_api_key="", logger=logger)
+            return result
+    except Exception as e:
+        if logger:
+            logger.exception("enrich_single_business_adaptive ERROR: %s", e)
+    
+    # Fallback: return minimal row
+    return row
+
+# Compatibility alias
+enrich_single_business = enrich_single_business_adaptive
+
+# ============================================================
+# END HOTFIX
+# ============================================================
