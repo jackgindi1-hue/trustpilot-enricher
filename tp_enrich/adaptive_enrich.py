@@ -819,94 +819,95 @@ def _business_key(row: dict) -> str:
         or (row.get("company_search_name") or row.get("raw_display_name") or "").strip().lower()
     )
 
-def enrich_single_business_adaptive(name: str, region: str = None, logger=None, *args, **kwargs):
+def enrich_single_business_adaptive(row: dict, *args, **kwargs):
     """
-    PHASE 4.6.7.2: Stable entrypoint with loop guard + key resolution.
-    THIS is what pipeline.py expects: enrich_single_business_adaptive(name, region, logger)
+    CRITICAL HOTFIX: Enrich ANY row with a name (no business gating).
+    
+    RULE: If company_search_name OR raw_display_name exists, enrich it.
     """
-    # Support both old signature (name, region, logger) and new (row, ...)
-    if isinstance(name, dict):
-        # Called as enrich_single_business_adaptive(row, ...)
-        row = name
-        logger = region if region is not None else kwargs.get("logger")
-    else:
-        # Called as enrich_single_business_adaptive(name, region, logger)
-        row = {
-            "row_id": "legacy",
-            "company_search_name": name,
-            "raw_display_name": name,
-            "name_classification": "business",
-            "business_state_region": region,
-        }
+    # -------- extract context safely --------
+    serp_api_key = kwargs.get("serp_api_key")
+    google_api_key = kwargs.get("google_api_key")
+    logger = kwargs.get("logger")
 
-    # Resolve keys and logger
+    if args:
+        if len(args) == 1 and isinstance(args[0], dict):
+            serp_api_key = serp_api_key or args[0].get("serp_api_key")
+            google_api_key = google_api_key or args[0].get("google_api_key")
+            logger = logger or args[0].get("logger")
+        else:
+            if len(args) > 0 and serp_api_key is None:
+                serp_api_key = args[0]
+            if len(args) > 1 and google_api_key is None:
+                google_api_key = args[1]
+            if len(args) > 2 and logger is None:
+                logger = args[2]
+
+    # no-op logger fallback
+    class _Noop:
+        def info(self,*a,**k): pass
+        def warning(self,*a,**k): pass
+        def error(self,*a,**k): pass
+        def exception(self,*a,**k): pass
     if logger is None:
-        logger = _resolve_logger(args, kwargs)
-    serp_api_key, google_api_key = _resolve_keys(args, kwargs)
+        logger = _Noop()
 
-    cls = (row.get("name_classification") or "").strip().lower()
-    name_str = (row.get("company_search_name") or row.get("raw_display_name") or "").strip()
-    bkey = _business_key(row) or "unknown_business"
+    # -------- determine name (THIS IS THE TRUE GATE) --------
+    name = (
+        (row.get("company_search_name") or "").strip()
+        or (row.get("raw_display_name") or "").strip()
+    )
 
-    # Business gating
-    if cls != "business":
+    logger.warning(
+        "ENRICH_ENTRY_SENTINEL row_id=%s name=%s classification=%s",
+        row.get("row_id"),
+        name,
+        row.get("name_classification"),
+    )
+
+    # If we literally have no name, bail
+    if not name:
+        row["enrichment_status"] = "skipped_no_name"
         return row
 
-    # ---- reentry/loop guard ----
-    if bkey in _PHASE467_ACTIVE_KEYS:
-        try:
-            logger.error("ENRICH_REENTRY_GUARD_HIT key=%s name=%s", bkey, name_str)
-        except Exception:
-            pass
-        row["enrichment_status"] = "error"
-        row["debug_notes"] = (row.get("debug_notes") or "") + "|reentry_guard_hit"
-        return row
+    # -------- initialize flags so CSV proves execution --------
+    row.setdefault("google_always_ran", False)
+    row.setdefault("serp_first_ran", False)
+    row.setdefault("address_retry_ran", False)
+    row.setdefault("domain_retry_ran", False)
+    row.setdefault("email_retry_ran", False)
 
-    _PHASE467_ACTIVE_KEYS.add(bkey)
-    t0 = time.time()
+    # -------- ENV key fallback --------
+    import os
+    if not serp_api_key:
+        serp_api_key = os.environ.get("SERP_API_KEY") or os.environ.get("SERPAPI_KEY") or ""
+    if not google_api_key:
+        google_api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_PLACES_API_KEY") or ""
 
+    # -------- ROUTE INTO REAL ENRICHMENT --------
     try:
-        # HARD proof of key availability + start/end markers
-        logger.info(
-            "ENRICH_START_SENTINEL key=%s row_id=%s name=%s serp_key=%s google_key=%s",
-            bkey,
-            row.get("row_id"),
-            name_str,
-            bool(serp_api_key),
-            bool(google_api_key),
-        )
-
-        # GOOGLE ALWAYS RUN marker (per business)
-        logger.info("GOOGLE_ALWAYS_RUN_SENTINEL key=%s name=%s", bkey, name_str)
-
-        # Call the real implementation DIRECTLY (no router indirection)
-        out = enrich_row_phase46(
-            name=name_str if not isinstance(name, dict) else name_str,
-            region=region if not isinstance(name, dict) else row.get("business_state_region"),
+        # Extract region for enrich_row_phase46
+        region = row.get("business_state_region")
+        
+        # Call with name/region/logger signature (current implementation)
+        return enrich_row_phase46(
+            name=name,
+            region=region,
             logger=logger,
         )
-
-        dt = time.time() - t0
-        logger.info("ENRICH_END_SENTINEL key=%s name=%s seconds=%.3f", bkey, name_str, dt)
-        return out
-
     except Exception as e:
-        try:
-            logger.exception("ENRICH_FATAL_ERROR key=%s name=%s err=%s", bkey, name_str, e)
-        except Exception:
-            pass
+        logger.exception(
+            "ENRICH_FATAL_ERROR row_id=%s name=%s err=%s",
+            row.get("row_id"),
+            name,
+            e,
+        )
         row["enrichment_status"] = "error"
-        row["debug_notes"] = (row.get("debug_notes") or "") + f"|fatal:{type(e).__name__}"
+        row["debug_notes"] = f"fatal_enrich_error:{e}"
         return row
 
-    finally:
-        # Always release the key (prevents permanent lock)
-        try:
-            _PHASE467_ACTIVE_KEYS.remove(bkey)
-        except Exception:
-            pass
 
-# Compatibility alias (some codebases import this name)
+# Legacy alias safety
 enrich_single_business = enrich_single_business_adaptive
 
 # ============================================================
