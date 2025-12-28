@@ -25,6 +25,8 @@ from tp_enrich.retry_ratelimit import SimpleRateLimiter
 from tp_enrich.phase0_gating import domain_from_url
 from tp_enrich.email_enrichment import assign_email  # PHASE 4.6.2
 from tp_enrich.retry_ratelimit import timed  # PHASE 4.6.3
+from collections.abc import Mapping
+
 _rate = SimpleRateLimiter(min_interval_s=0.2)
 
 def _pick_email_domain(row: dict) -> str:
@@ -819,12 +821,49 @@ def _business_key(row: dict) -> str:
         or (row.get("company_search_name") or row.get("raw_display_name") or "").strip().lower()
     )
 
-def enrich_single_business_adaptive(row: dict, *args, **kwargs):
+def _coerce_row_obj(obj) -> dict:
     """
-    CRITICAL HOTFIX: Enrich ANY row with a name (no business gating).
-    
-    RULE: If company_search_name OR raw_display_name exists, enrich it.
+    Accepts dict-like, pandas Series, or string business name.
+    Returns a dict row that the rest of the pipeline can handle.
     """
+    if obj is None:
+        return {}
+
+    # dict-like
+    if isinstance(obj, Mapping):
+        return dict(obj)
+
+    # pandas Series or similar
+    if hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+        try:
+            d = obj.to_dict()
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+
+    # plain string (business name)
+    if isinstance(obj, str):
+        name = obj.strip()
+        return {
+            "raw_display_name": name,
+            "company_search_name": name,
+            "name_classification": "business",
+            "enrichment_status": "",
+            "debug_notes": "",
+        }
+
+    # last resort
+    return {"raw_display_name": str(obj), "company_search_name": str(obj), "name_classification": "business"}
+
+def enrich_single_business_adaptive(row, *args, **kwargs):
+    """
+    CRITICAL: Handles row being dict, pandas Series, OR string.
+    Enriches ANY row with a name (no business classification gating).
+    """
+    # Coerce to dict safely (handles string, Series, dict)
+    row = _coerce_row_obj(row)
+
     # -------- extract context safely --------
     serp_api_key = kwargs.get("serp_api_key")
     google_api_key = kwargs.get("google_api_key")
@@ -857,12 +896,14 @@ def enrich_single_business_adaptive(row: dict, *args, **kwargs):
         (row.get("company_search_name") or "").strip()
         or (row.get("raw_display_name") or "").strip()
     )
+    cls = (row.get("name_classification") or "").strip().lower()
 
     logger.warning(
-        "ENRICH_ENTRY_SENTINEL row_id=%s name=%s classification=%s",
+        "ENRICH_ENTRY_SENTINEL row_id=%s class=%s name=%s input_type=%s",
         row.get("row_id"),
+        cls,
         name,
-        row.get("name_classification"),
+        type(row).__name__,
     )
 
     # If we literally have no name, bail
@@ -888,7 +929,7 @@ def enrich_single_business_adaptive(row: dict, *args, **kwargs):
     try:
         # Extract region for enrich_row_phase46
         region = row.get("business_state_region")
-        
+
         # Call with name/region/logger signature (current implementation)
         return enrich_row_phase46(
             name=name,
@@ -903,7 +944,7 @@ def enrich_single_business_adaptive(row: dict, *args, **kwargs):
             e,
         )
         row["enrichment_status"] = "error"
-        row["debug_notes"] = f"fatal_enrich_error:{e}"
+        row["debug_notes"] = (row.get("debug_notes") or "") + f"|fatal:{type(e).__name__}:{e}"
         return row
 
 
