@@ -487,10 +487,23 @@ def enrich_row_phase46(
             row["discovered_evidence_url"] = discovered.get("discovered_evidence_url")
             row["discovered_evidence_source"] = discovered.get("discovered_evidence_source")
             row["discovery_evidence_json"] = discovered.get("discovery_evidence_json")
+
+            # PHASE 4.6.7.4: Resolve official domain if discovery only found directories
+            # This MUST run after discovery but BEFORE we use discovered_domain
+            # Import os for SERP API key fallback
+            import os
+            serp_key = os.environ.get("SERP_API_KEY") or os.environ.get("SERPAPI_KEY") or ""
+            row = _apply_official_domain_if_missing(row, name=name, serp_api_key=serp_key, logger=logger)
+
             # Update flags
             if discovered.get("discovered_domain"):
-                has_domain = True
-                row["business_domain"] = discovered["discovered_domain"]
+                # PHASE 4.6.7.4: Only accept if NOT a directory domain
+                if not _is_directory_domain(discovered.get("discovered_domain")):
+                    has_domain = True
+                    row["business_domain"] = discovered["discovered_domain"]
+                else:
+                    if logger:
+                        logger.info(f"   -> Anchor discovery: Rejected directory domain {discovered.get('discovered_domain')}")
             if discovered.get("discovered_phone"):
                 has_phone = True
                 # PHASE 4.6.4: Don't directly assign - let phone waterfall try first,
@@ -1030,4 +1043,182 @@ def _mark_email_retry(row: dict, logger):
 
 # ============================================================
 # END PHASE 4.6.7.3
+# ============================================================
+
+
+# ============================================================
+# PHASE 4.6.7.4 — SERP-FIRST OFFICIAL WEBSITE RESOLVER
+# ============================================================
+
+import importlib
+
+_DIRECTORY_DOMAINS = {
+    "bbb.org",
+    "yelp.com",
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "chamberofcommerce.com",
+    "thebluebook.com",
+    "opencorporates.com",
+    "bizapedia.com",
+    "yellowpages.com",
+    "mapquest.com",
+    "google.com",
+    "glassdoor.com",
+    "indeed.com",
+    "medicalnewstoday.com",
+    "finduslocal.com",
+    "manta.com",
+    "dnb.com",
+}
+
+def _norm_domain_474(d: str) -> str:
+    d = (d or "").strip()
+    if not d:
+        return ""
+    d = d.replace("http://", "").replace("https://", "").replace("www.", "").split("/")[0].strip().lower()
+    return d
+
+def _is_directory_domain(d: str) -> bool:
+    d = _norm_domain_474(d)
+    if not d:
+        return False
+    if d in _DIRECTORY_DOMAINS:
+        return True
+    # also treat subdomains of directory domains as directories
+    for base in _DIRECTORY_DOMAINS:
+        if d.endswith("." + base):
+            return True
+    return False
+
+def _resolve_callable(mod_names, fn_names):
+    for mn in mod_names:
+        try:
+            m = importlib.import_module(mn)
+        except Exception:
+            continue
+        for fn in fn_names:
+            f = getattr(m, fn, None)
+            if callable(f):
+                return f
+    # also check globals
+    for fn in fn_names:
+        f = globals().get(fn)
+        if callable(f):
+            return f
+    return None
+
+def _serp_pick_official_domain(serp_payload: dict) -> str:
+    """
+    Accepts a SERP payload (SerpAPI style) and returns first non-directory domain.
+    """
+    if not isinstance(serp_payload, dict):
+        return ""
+
+    # knowledge graph website
+    kg = serp_payload.get("knowledge_graph") or {}
+    kg_site = _norm_domain_474(kg.get("website") or "")
+    if kg_site and not _is_directory_domain(kg_site):
+        return kg_site
+
+    # local results
+    lr = serp_payload.get("local_results") or serp_payload.get("places") or serp_payload.get("place_results") or []
+    if isinstance(lr, list):
+        for it in lr:
+            if not isinstance(it, dict):
+                continue
+            cand = _norm_domain_474(it.get("website") or it.get("link") or it.get("url") or "")
+            if cand and not _is_directory_domain(cand):
+                return cand
+
+    # organic results
+    org = serp_payload.get("organic_results") or []
+    if isinstance(org, list):
+        for it in org:
+            if not isinstance(it, dict):
+                continue
+            cand = _norm_domain_474(it.get("link") or it.get("url") or "")
+            if cand and not _is_directory_domain(cand):
+                return cand
+
+    return ""
+
+def _serp_fetch_payload(name: str, discovered_address: str, discovered_phone: str, serp_api_key: str, logger):
+    """
+    Try to fetch SERP payload using whatever function exists in your codebase.
+    """
+    if not serp_api_key:
+        return None
+
+    # Prefer your existing SERP function names if present
+    fn = _resolve_callable(
+        ["tp_enrich.serp_tools", "tp_enrich.serp_enrichment", "tp_enrich.local_enrichment"],
+        ["run_serp_google_kg", "run_serp_search", "run_serpapi_search", "serp_search_google", "serp_fetch_google"],
+    )
+    if not callable(fn):
+        try:
+            logger.info("SERP_OFFICIAL_SITE: no SERP function found")
+        except Exception:
+            pass
+        return None
+
+    q = name
+    if discovered_phone:
+        q = f"{name} {discovered_phone}"
+    elif discovered_address:
+        q = f"{name} {discovered_address}"
+
+    try:
+        logger.info("SERP_FIRST_SENTINEL name=%s q=%s", name, q)
+    except Exception:
+        pass
+
+    try:
+        # handle different signatures
+        try:
+            return fn(name=name, serp_api_key=serp_api_key, query=q)
+        except TypeError:
+            try:
+                return fn(query=q, serp_api_key=serp_api_key)
+            except TypeError:
+                try:
+                    return fn(q, serp_api_key)
+                except TypeError:
+                    return fn(q)
+    except Exception as e:
+        try:
+            logger.warning("SERP_OFFICIAL_SITE_ERROR name=%s err=%s", name, e)
+        except Exception:
+            pass
+        return None
+
+def _apply_official_domain_if_missing(row: dict, name: str, serp_api_key: str, logger):
+    """
+    If discovered_domain is empty OR is a directory domain, attempt to resolve official site via SERP.
+    """
+    cur = _norm_domain_474(row.get("discovered_domain") or row.get("company_domain") or row.get("canonical_domain") or "")
+    if cur and not _is_directory_domain(cur):
+        return row
+
+    serp_payload = _serp_fetch_payload(
+        name=name,
+        discovered_address=(row.get("discovered_address") or "").strip(),
+        discovered_phone=(row.get("discovered_phone") or row.get("primary_phone") or "").strip(),
+        serp_api_key=serp_api_key,
+        logger=logger,
+    )
+
+    dom = _serp_pick_official_domain(serp_payload or {})
+    if dom:
+        row["discovered_domain"] = dom
+        row["discovered_evidence_source"] = "serp_official_site"
+        try:
+            logger.info("SERP_OFFICIAL_SITE_APPLIED name=%s domain=%s", name, dom)
+        except Exception:
+            pass
+    return row
+
+# ============================================================
+# END PHASE 4.6.7.4
 # ============================================================
