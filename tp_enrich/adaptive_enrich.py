@@ -30,8 +30,11 @@ from collections.abc import Mapping
 _rate = SimpleRateLimiter(min_interval_s=0.2)
 
 def _pick_email_domain(row: dict) -> str:
-    """PHASE 4.6.2: Pick best domain for email enrichment."""
-    for k in ["company_domain", "business_domain", "canonical_domain", "discovered_domain"]:
+    """
+    PHASE 4.6.2: Pick best domain for email enrichment.
+    PHASE 4.6.7.5: Prioritize email_candidate_domain (Google website fallback).
+    """
+    for k in ["email_candidate_domain", "company_domain", "business_domain", "canonical_domain", "discovered_domain"]:
         d = (row.get(k) or "").strip()
         if d:
             d = d.replace("http://", "").replace("https://", "").replace("www.", "").split("/")[0]
@@ -56,12 +59,14 @@ def _domain_is_directory(domain: str) -> bool:
 def _should_run_full_email(row: dict) -> bool:
     """
     PHASE 4.6.3: Only run full email waterfall when we have real signal.
+    PHASE 4.6.7.5: Also check email_candidate_domain (Google website fallback).
+
     This prevents slow + empty runs on directory domains or missing anchors.
 
     Returns:
         True if we should run the full waterfall, False to skip
     """
-    domain = (row.get("company_domain") or row.get("discovered_domain") or "").lower()
+    domain = (row.get("email_candidate_domain") or row.get("company_domain") or row.get("discovered_domain") or "").lower()
     phone = (row.get("primary_phone") or row.get("discovered_phone") or "").strip()
     html_flag = row.get("website_has_mailto")  # set earlier if available
 
@@ -679,6 +684,12 @@ def enrich_row_phase46(
                 )
 
     # ============================================================
+    # STEP 6.5: GOOGLE WEBSITE EMAIL FALLBACK (Phase 4.6.7.5)
+    # Apply Google website as email-only domain if no first-party domain exists
+    # ============================================================
+    row = _apply_google_website_email_fallback(row, google_hit=google_hit, logger=logger)
+
+    # ============================================================
     # STEP 7: Full enrichment (phone/email waterfalls)
     # Runs for ALL rows (canonical accepted OR rejected)
     # ============================================================
@@ -1221,4 +1232,103 @@ def _apply_official_domain_if_missing(row: dict, name: str, serp_api_key: str, l
 
 # ============================================================
 # END PHASE 4.6.7.4
+# ============================================================
+
+
+# ============================================================
+# PHASE 4.6.7.5 — FINAL FALLBACK: GOOGLE WEBSITE → EMAIL-ONLY DOMAIN
+# ============================================================
+
+def _pick_first_party_domain_any(row: dict) -> str:
+    """
+    Returns the best already-known first-party domain (if any).
+    Ignores directory domains.
+
+    PHASE 4.6.7.5: Used to detect if we already have a usable domain
+    before applying Google website fallback.
+    """
+    for k in ["company_domain", "canonical_domain", "discovered_domain", "business_domain", "email_candidate_domain"]:
+        d = _norm_domain_474(row.get(k) or "")
+        if d and not _is_directory_domain(d):
+            return d
+    return ""
+
+
+def _google_hit_website_domain(google_hit) -> str:
+    """
+    Extract website domain from a google_hit payload, tolerant of multiple shapes.
+
+    PHASE 4.6.7.5: Handles various Google Places API response formats.
+    """
+    if not google_hit:
+        return ""
+    if isinstance(google_hit, dict):
+        for k in ["website", "site", "url", "canonical_website"]:
+            d = _norm_domain_474(google_hit.get(k) or "")
+            if d:
+                return d
+        # sometimes nested in result object
+        r = google_hit.get("result") or {}
+        if isinstance(r, dict):
+            d = _norm_domain_474(r.get("website") or r.get("url") or "")
+            if d:
+                return d
+    return ""
+
+
+def _apply_google_website_email_fallback(row: dict, google_hit, logger):
+    """
+    PHASE 4.6.7.5: If we lack a first-party domain, use Google website as EMAIL-ONLY domain.
+
+    CRITICAL RULES:
+    - Does NOT touch canonical_* fields (preserves canonical rejection state)
+    - Does NOT overwrite existing first-party domains
+    - Does NOT accept directory domains (bbb.org / yelp.com / etc.)
+    - ONLY sets email_candidate_domain for email waterfall
+
+    USE CASE:
+    - Canonical matching failed (below thresholds)
+    - SERP/discovery only found directory URLs
+    - Google has real website (e.g., mavencomputers.com)
+    → Use Google website for email enrichment only
+
+    Args:
+        row: Business row dict
+        google_hit: Google Places API response
+        logger: Logger instance
+
+    Returns:
+        Updated row with email_candidate_domain if applicable
+    """
+    # Check if we already have a usable domain
+    existing = _pick_first_party_domain_any(row)
+    if existing:
+        return row  # already have a usable domain, don't override
+
+    # Extract Google website domain
+    gdom = _google_hit_website_domain(google_hit)
+    if not gdom:
+        return row  # Google has no website
+
+    # Reject directory domains
+    if _is_directory_domain(gdom):
+        try:
+            logger.info("EMAIL_FALLBACK_SKIP_DIRECTORY_DOMAIN row_id=%s dom=%s", row.get("row_id"), gdom)
+        except Exception:
+            pass
+        return row
+
+    # Set email-only candidate domain (does NOT affect canonical fields)
+    row["email_candidate_domain"] = gdom
+    row["discovered_evidence_source"] = row.get("discovered_evidence_source") or "google_email_fallback"
+
+    try:
+        logger.info("GOOGLE_EMAIL_FALLBACK_APPLIED row_id=%s dom=%s", row.get("row_id"), gdom)
+    except Exception:
+        pass
+
+    return row
+
+# ============================================================
+# END PHASE 4.6.7.5
 # ============================================================
