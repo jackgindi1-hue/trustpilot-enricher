@@ -113,6 +113,18 @@ class ApifyClient:
                 break
             offset += limit
 
+    def run_sync_get_items(self, actor_input: dict, timeout_s=2700):
+        """
+        Use Apify's sync API to run the actor and get items directly.
+        """
+        url = f"{APIFY_BASE}/acts/{ACTOR_ID}/run-sync-get-dataset-items"
+        return _request_json(
+            "POST",
+            url,
+            params={"token": self.token},
+            body=actor_input,
+            timeout=timeout_s,
+        )
 
 def _normalize_item(item: dict, company_url: str) -> dict:
     reviewer = _clean(item.get("reviewerName") or item.get("reviewer") or item.get("author") or item.get("userName"))
@@ -146,29 +158,36 @@ def scrape_trustpilot_company(company_url: str, max_reviews: int = 5000, logger=
 
     client = ApifyClient()
 
+    # PHASE 5 FIX: Use exact Dino actor input format (start_url, not startUrls)
     actor_input = {
-        "startUrls": [{"url": company_url}],
-        "maxReviews": max_reviews,
-        "maxReviewsPerCompany": max_reviews,
-        "reviewsLimit": max_reviews,
+        "start_url": [{"url": company_url}],
     }
 
     if logger:
         logger.info("APIFY_START url=%s max=%s", company_url, max_reviews)
+        logger.info("APIFY_ACTOR_INPUT %s", json.dumps(actor_input, ensure_ascii=False))
 
-    run = client.start_run(actor_input)
-    run_id = run["id"]
-
-    finished = client.wait_for_finish(run_id)
-    if finished.get("status") != "SUCCEEDED":
-        raise ApifyError(f"Run failed: {finished.get('status')}")
-
-    dataset_id = finished.get("defaultDatasetId")
-    if not dataset_id:
-        raise ApifyError("Missing defaultDatasetId")
+    # PHASE 5 FIX: Use sync API to avoid polling issues and get items directly
+    try:
+        items = client.run_sync_get_items(actor_input, timeout_s=2700)
+        if logger:
+            logger.info("APIFY_SYNC_RESPONSE items=%s", len(items) if items else 0)
+    except Exception as e:
+        if logger:
+            logger.error("APIFY_SYNC_FAILED error=%s, falling back to async", str(e))
+        # Fallback to async polling if sync fails
+        run = client.start_run(actor_input)
+        run_id = run["id"]
+        finished = client.wait_for_finish(run_id)
+        if finished.get("status") != "SUCCEEDED":
+            raise ApifyError(f"Run failed: {finished.get('status')}")
+        dataset_id = finished.get("defaultDatasetId")
+        if not dataset_id:
+            raise ApifyError("Missing defaultDatasetId")
+        items = list(client.iter_dataset_items(dataset_id))
 
     rows = []
-    for item in client.iter_dataset_items(dataset_id):
+    for item in (items or []):
         rows.append(_normalize_item(item, company_url))
         if len(rows) >= max_reviews:
             break
