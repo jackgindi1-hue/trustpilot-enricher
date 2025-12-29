@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import config from './config'
 import './App.css'
+import { TrustpilotPhase5Panel } from './components/TrustpilotPhase5Panel'
 
 // PHASE 4.7.1 DEPLOY - UI Stuck "Running" Fix (Missing Job Reset)
 // BUILD TIMESTAMP: 2025-12-25 22:30 UTC
@@ -407,6 +408,9 @@ function App() {
       </header>
 
       <main className="app-main">
+        {/* PHASE 5: Trustpilot URL Scraper */}
+        <TrustpilotPhase5Panel />
+        
         <div className="card">
           <form onSubmit={handleRunEnrichment}>
             <div className="form-group">
