@@ -14,8 +14,7 @@
 import React, { useState } from "react";
 import config from '../config';
 
-// PHASE 5 HOTFIX: Use same API routing pattern as existing CSV upload
-// This ensures Phase 5 calls go to Railway backend, not Netlify
+// PHASE 5 HOTFIX: Force direct Railway backend connection (bypass Netlify proxy)
 const API_BASE =
   (window && window.__API_BASE_URL__) ||
   (typeof import.meta !== "undefined" &&
@@ -36,29 +35,57 @@ export function TrustpilotPhase5Panel() {
   const [maxReviews, setMaxReviews] = useState(5000);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [statusMsg, setStatusMsg] = useState("");
 
   async function run() {
     setErr("");
+    setStatusMsg("");
     const u = (url || "").trim();
     if (!u) {
       setErr("Paste a Trustpilot company URL.");
       return;
     }
+
     setBusy(true);
+
     try {
-      const res = await fetch(apiUrl("/phase5/trustpilot/scrape_and_enrich.csv"), {
+      const endpoint = apiUrl("/phase5/trustpilot/scrape_and_enrich.csv");
+      console.log("[PHASE5] Starting request to:", endpoint);
+      console.log("[PHASE5] Request payload:", { urls: [u], max_reviews_per_company: Number(maxReviews) || 5000 });
+
+      setStatusMsg("Connecting to backend...");
+
+      // PHASE 5 HOTFIX: Add timeout warning (but don't abort - let it complete)
+      const timeoutWarning = setTimeout(() => {
+        console.warn("[PHASE5] Request taking longer than 30s - this is normal for large scrapes");
+        setStatusMsg("Scraping in progress (this may take 2-5 minutes)...");
+      }, 30000);
+
+      const res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({
           urls: [u],
           max_reviews_per_company: Number(maxReviews) || 5000
         })
       });
+
+      clearTimeout(timeoutWarning);
+      console.log("[PHASE5] Response received:", res.status, res.statusText);
+
       if (!res.ok) {
         const j = await res.json().catch(() => null);
-        throw new Error((j && (j.detail || j.error)) || `Request failed: ${res.status}`);
+        const errorMsg = (j && (j.detail || j.error)) || `Request failed: ${res.status}`;
+        console.error("[PHASE5] Error response:", errorMsg);
+        throw new Error(errorMsg);
       }
+
+      setStatusMsg("Downloading CSV...");
       const blob = await res.blob();
+      console.log("[PHASE5] CSV blob received:", blob.size, "bytes");
+
       const a = document.createElement("a");
       const href = window.URL.createObjectURL(blob);
       a.href = href;
@@ -67,9 +94,18 @@ export function TrustpilotPhase5Panel() {
       a.click();
       a.remove();
       window.URL.revokeObjectURL(href);
-      // Success - clear URL
-      setUrl("");
+
+      console.log("[PHASE5] CSV download complete");
+      setStatusMsg("✅ Download complete!");
+
+      // Success - clear URL after delay
+      setTimeout(() => {
+        setUrl("");
+        setStatusMsg("");
+      }, 2000);
+
     } catch (e) {
+      console.error("[PHASE5] Error:", e);
       setErr(e?.message || "Failed.");
     } finally {
       setBusy(false);
@@ -136,6 +172,22 @@ export function TrustpilotPhase5Panel() {
           {busy ? "Running..." : "Run"}
         </button>
       </div>
+
+      {statusMsg ? (
+        <div
+          style={{
+            marginTop: 10,
+            padding: 10,
+            borderRadius: 8,
+            backgroundColor: "rgba(59, 130, 246, 0.1)",
+            color: "#1e40af",
+            fontSize: 13
+          }}
+        >
+          ℹ️ {statusMsg}
+        </div>
+      ) : null}
+
       {err ? (
         <div
           style={{
@@ -151,8 +203,10 @@ export function TrustpilotPhase5Panel() {
           ❌ {err}
         </div>
       ) : null}
+
       <div style={{ marginTop: 8, opacity: 0.7, fontSize: 13 }}>
         ✨ <strong>New:</strong> Scrapes Trustpilot reviews via Apify Dino, enriches with Phase 4, downloads one CSV. Phase 4 logic remains locked.
+        {busy && <div style={{ marginTop: 4, fontSize: 12, fontStyle: "italic" }}>⏱️ Large scrapes take 2-5 minutes. Keep this tab open.</div>}
       </div>
     </div>
   );

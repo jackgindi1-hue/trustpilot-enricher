@@ -84,18 +84,30 @@ def phase5_scrape_csv(req: Phase5RunReq):
 @phase5_router.post("/trustpilot/scrape_and_enrich.csv")
 def phase5_scrape_and_enrich_csv(req: Phase5RunReq):
     """Scrape Trustpilot reviews → Enrich with Phase 4 → CSV download."""
+    # PHASE 5 HOTFIX: Add step-by-step logs to track where requests hang
+    print(f"PHASE5_START urls={req.urls} max={req.max_reviews_per_company}")
+    
     try:
         scraped = scrape_trustpilot_urls(req.urls, req.max_reviews_per_company, logger=None)
+        print(f"PHASE5_SCRAPE_DONE rows={len(scraped)}")
+        
         enriched = call_phase4_enrich_rows(scraped)  # Phase 4 is locked; we only CALL it
+        print(f"PHASE5_ENRICH_DONE rows={len(enriched)}")
+        
         csv_bytes = _rows_to_csv_bytes(enriched)
+        print(f"PHASE5_CSV_READY bytes={len(csv_bytes)}")
+        
         return StreamingResponse(
             iter([csv_bytes]),
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="phase5_trustpilot_enriched.csv"'},
         )
     except Phase5BridgeError as e:
+        print(f"PHASE5_ERROR_BRIDGE {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     except ApifyError as e:
+        print(f"PHASE5_ERROR_APIFY {str(e)}")
         raise HTTPException(status_code=502, detail=f"ApifyError: {str(e)}")
     except Exception as e:
+        print(f"PHASE5_ERROR_UNKNOWN {str(e)}")
         raise HTTPException(status_code=500, detail=f"ServerError: {str(e)}")
