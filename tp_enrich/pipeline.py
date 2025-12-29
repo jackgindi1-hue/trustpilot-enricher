@@ -1054,3 +1054,59 @@ def run_pipeline(
     logger.info(f"  Output file: {output_csv_path}")
     logger.info("="*60)
     return stats
+
+
+def enrich_rows(rows: list) -> list:
+    """
+    PHASE 5 BRIDGE: Enrich in-memory rows (for Apify Trustpilot scraper).
+    
+    This is a thin wrapper that routes Phase 5 rows through the SAME
+    Phase 4 enrichment logic used by CSV uploads, without modifying
+    Phase 4 behavior.
+    
+    Args:
+        rows: List of dicts from Apify scraper (Trustpilot reviews)
+        
+    Returns:
+        List of dicts with enrichment columns added
+    """
+    import tempfile
+    import os
+    
+    logger.info("PHASE5_BRIDGE enrich_rows called with %s rows", len(rows))
+    
+    if not rows:
+        return []
+    
+    # Create temp files for in-memory enrichment
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "phase5_input.csv")
+        output_path = os.path.join(tmpdir, "phase5_output.csv")
+        cache_path = os.path.join(tmpdir, "phase5_cache.json")
+        
+        # Convert rows to DataFrame
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        
+        # Write to temp CSV
+        df.to_csv(input_path, index=False, encoding='utf-8')
+        
+        # Run the SAME Phase 4 pipeline
+        try:
+            stats = run_pipeline(
+                input_csv_path=input_path,
+                output_csv_path=output_path,
+                cache_file=cache_path,
+                config={}
+            )
+            logger.info("PHASE5_BRIDGE enrichment complete: %s", stats)
+        except Exception as e:
+            logger.error("PHASE5_BRIDGE enrichment failed: %s", str(e))
+            raise
+        
+        # Read enriched CSV back to rows
+        enriched_df = pd.read_csv(output_path, encoding='utf-8')
+        enriched_rows = enriched_df.to_dict('records')
+        
+        logger.info("PHASE5_BRIDGE returning %s enriched rows", len(enriched_rows))
+        return enriched_rows
