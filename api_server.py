@@ -23,6 +23,8 @@ from tp_enrich.logging_utils import setup_logger
 # PHASE 4.5.2: Durable job storage imports
 from tp_enrich import durable_jobs
 from tp_enrich.progress import set_job_status, set_job_progress, make_job_logger
+# PHASE 5: Trustpilot Apify scraper router
+from tp_enrich.routes_phase5 import phase5_router
 
 # Load environment variables
 load_dotenv()
@@ -59,6 +61,9 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition", "Content-Type"],
 )
+
+# PHASE 5: Include Trustpilot Apify scraper router
+app.include_router(phase5_router)
 
 
 @app.get("/health")
