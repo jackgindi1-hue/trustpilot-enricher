@@ -49,42 +49,77 @@ export function TrustpilotPhase5Panel() {
     setBusy(true);
 
     try {
-      const endpoint = apiUrl("/phase5/trustpilot/scrape_and_enrich.csv");
-      console.log("[PHASE5] Starting request to:", endpoint);
-      console.log("[PHASE5] Request payload:", { urls: [u], max_reviews_per_company: Number(maxReviews) || 5000 });
+      // PHASE 5 FIX: Async job flow (prevents multiple Apify re-runs)
+      // Step 1: Start job
+      const startEndpoint = apiUrl("/phase5/trustpilot/start");
+      console.log("[PHASE5] Starting job:", startEndpoint);
+      setStatusMsg("Starting job...");
 
-      setStatusMsg("Connecting to backend...");
-
-      // PHASE 5 HOTFIX: Add timeout warning (but don't abort - let it complete)
-      const timeoutWarning = setTimeout(() => {
-        console.warn("[PHASE5] Request taking longer than 30s - this is normal for large scrapes");
-        setStatusMsg("Scraping in progress (this may take 2-5 minutes)...");
-      }, 30000);
-
-      const res = await fetch(endpoint, {
+      const startRes = await fetch(startEndpoint, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           urls: [u],
           max_reviews_per_company: Number(maxReviews) || 5000
         })
       });
 
-      clearTimeout(timeoutWarning);
-      console.log("[PHASE5] Response received:", res.status, res.statusText);
-
-      if (!res.ok) {
-        const j = await res.json().catch(() => null);
-        const errorMsg = (j && (j.detail || j.error)) || `Request failed: ${res.status}`;
-        console.error("[PHASE5] Error response:", errorMsg);
-        throw new Error(errorMsg);
+      if (!startRes.ok) {
+        throw new Error(`Start failed: ${startRes.status}`);
       }
 
+      const { job_id } = await startRes.json();
+      console.log("[PHASE5] Job started:", job_id);
+
+      // Step 2: Poll job status
+      let lastProgress = "";
+      while (true) {
+        await new Promise(r => setTimeout(r, 1500)); // Poll every 1.5s
+
+        const statusEndpoint = apiUrl(`/phase5/trustpilot/status/${job_id}`);
+        const stRes = await fetch(statusEndpoint);
+
+        if (!stRes.ok) {
+          throw new Error(`Status check failed: ${stRes.status}`);
+        }
+
+        const st = await stRes.json();
+        console.log("[PHASE5] Job status:", st);
+
+        // Update status message based on progress
+        if (st.progress !== lastProgress) {
+          lastProgress = st.progress;
+          if (st.progress === "scraping") {
+            setStatusMsg("Scraping Trustpilot reviews...");
+          } else if (st.progress === "enriching") {
+            setStatusMsg(`Enriching ${st.row_count_scraped} reviews with business data...`);
+          } else if (st.progress === "csv") {
+            setStatusMsg("Preparing CSV download...");
+          }
+        }
+
+        // Check for completion or error
+        if (st.status === "error") {
+          throw new Error(st.error || "Job failed");
+        }
+
+        if (st.status === "done") {
+          console.log("[PHASE5] Job complete!");
+          break;
+        }
+      }
+
+      // Step 3: Download CSV
       setStatusMsg("Downloading CSV...");
-      const blob = await res.blob();
-      console.log("[PHASE5] CSV blob received:", blob.size, "bytes");
+      const downloadEndpoint = apiUrl(`/phase5/trustpilot/download/${job_id}`);
+      const dlRes = await fetch(downloadEndpoint);
+
+      if (!dlRes.ok) {
+        throw new Error(`Download failed: ${dlRes.status}`);
+      }
+
+      const blob = await dlRes.blob();
+      console.log("[PHASE5] CSV downloaded:", blob.size, "bytes");
 
       const a = document.createElement("a");
       const href = window.URL.createObjectURL(blob);
@@ -95,7 +130,6 @@ export function TrustpilotPhase5Panel() {
       a.remove();
       window.URL.revokeObjectURL(href);
 
-      console.log("[PHASE5] CSV download complete");
       setStatusMsg("✅ Download complete!");
 
       // Success - clear URL after delay

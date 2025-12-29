@@ -2,10 +2,16 @@
 PHASE 5 API ROUTES
 
 FastAPI routes for Trustpilot scraping + Phase 4 enrichment.
-Three endpoints:
+
+SYNC endpoints (legacy - may timeout on large scrapes):
 1. /phase5/trustpilot/scrape - Scrape only (JSON)
 2. /phase5/trustpilot/scrape.csv - Scrape only (CSV download)
 3. /phase5/trustpilot/scrape_and_enrich.csv - Scrape → Enrich → CSV download
+
+ASYNC endpoints (recommended - prevents multiple Apify re-runs):
+4. POST /phase5/trustpilot/start - Start job, returns job_id
+5. GET /phase5/trustpilot/status/{job_id} - Poll job status
+6. GET /phase5/trustpilot/download/{job_id} - Download CSV when ready
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -16,6 +22,7 @@ import csv
 
 from tp_enrich.apify_trustpilot import scrape_trustpilot_urls, ApifyError
 from tp_enrich.phase5_bridge import call_phase4_enrich_rows, Phase5BridgeError
+from tp_enrich.phase5_jobs import create_job, get_job
 
 phase5_router = APIRouter(prefix="/phase5", tags=["phase5"])
 
@@ -86,17 +93,17 @@ def phase5_scrape_and_enrich_csv(req: Phase5RunReq):
     """Scrape Trustpilot reviews → Enrich with Phase 4 → CSV download."""
     # PHASE 5 HOTFIX: Add step-by-step logs to track where requests hang
     print(f"PHASE5_START urls={req.urls} max={req.max_reviews_per_company}")
-    
+
     try:
         scraped = scrape_trustpilot_urls(req.urls, req.max_reviews_per_company, logger=None)
         print(f"PHASE5_SCRAPE_DONE rows={len(scraped)}")
-        
+
         enriched = call_phase4_enrich_rows(scraped)  # Phase 4 is locked; we only CALL it
         print(f"PHASE5_ENRICH_DONE rows={len(enriched)}")
-        
+
         csv_bytes = _rows_to_csv_bytes(enriched)
         print(f"PHASE5_CSV_READY bytes={len(csv_bytes)}")
-        
+
         return StreamingResponse(
             iter([csv_bytes]),
             media_type="text/csv",
@@ -111,3 +118,77 @@ def phase5_scrape_and_enrich_csv(req: Phase5RunReq):
     except Exception as e:
         print(f"PHASE5_ERROR_UNKNOWN {str(e)}")
         raise HTTPException(status_code=500, detail=f"ServerError: {str(e)}")
+
+
+# ============================================================================
+# ASYNC JOB ENDPOINTS (PREVENTS MULTIPLE APIFY RE-RUNS)
+# ============================================================================
+
+class Phase5StartReq(BaseModel):
+    """Request to start an async Phase 5 job."""
+    urls: List[str] = Field(..., description="Trustpilot company review URLs")
+    max_reviews_per_company: int = Field(5000, ge=1, le=5000)
+
+
+@phase5_router.post("/trustpilot/start")
+def phase5_start(req: Phase5StartReq):
+    """
+    Start a Phase 5 job and return job_id immediately.
+    Use this to avoid long-running POST requests that trigger multiple Apify runs.
+
+    Returns:
+        {"job_id": "abc123..."}
+    """
+    job_id = create_job(req.urls, req.max_reviews_per_company)
+    return JSONResponse({"job_id": job_id, "status": "queued"})
+
+
+@phase5_router.get("/trustpilot/status/{job_id}")
+def phase5_status(job_id: str):
+    """
+    Get job status (poll this endpoint until status="done").
+
+    Returns:
+        {
+            "status": "queued|running|done|error",
+            "progress": "scraping|enriching|csv|done|error",
+            "row_count_scraped": int,
+            "row_count_enriched": int,
+            "error": str (if status="error")
+        }
+    """
+    j = get_job(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Don't include csv_bytes in status response (too large)
+    j_copy = dict(j)
+    j_copy.pop("csv_bytes", None)
+
+    return JSONResponse(j_copy)
+
+
+@phase5_router.get("/trustpilot/download/{job_id}")
+def phase5_download(job_id: str):
+    """
+    Download the enriched CSV (only works when status="done").
+
+    Returns:
+        CSV file download
+    """
+    j = get_job(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if j.get("status") == "error":
+        raise HTTPException(status_code=500, detail=j.get("error") or "Job failed")
+
+    if j.get("status") != "done" or not j.get("csv_bytes"):
+        raise HTTPException(status_code=409, detail=f"Job not ready (status={j.get('status')})")
+
+    csv_bytes = j["csv_bytes"]
+    return StreamingResponse(
+        iter([csv_bytes]),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="phase5_trustpilot_enriched.csv"'},
+    )
