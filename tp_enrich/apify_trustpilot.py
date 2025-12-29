@@ -158,9 +158,10 @@ def scrape_trustpilot_company(company_url: str, max_reviews: int = 5000, logger=
 
     client = ApifyClient()
 
-    # PHASE 5 FIX: Use exact Dino actor input format (start_url, not startUrls)
+    # PHASE 5 FIXPACK: Use exact Dino actor input format + num limit
     actor_input = {
         "start_url": [{"url": company_url}],
+        "num": int(max_reviews),
     }
 
     if logger:
