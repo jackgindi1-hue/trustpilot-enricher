@@ -12,6 +12,24 @@
  * <TrustpilotPhase5Panel />
  */
 import React, { useState } from "react";
+import config from '../config';
+
+// PHASE 5 HOTFIX: Use same API routing pattern as existing CSV upload
+// This ensures Phase 5 calls go to Railway backend, not Netlify
+const API_BASE =
+  (window && window.__API_BASE_URL__) ||
+  (typeof import.meta !== "undefined" &&
+    import.meta.env &&
+    import.meta.env.VITE_API_BASE_URL) ||
+  (typeof process !== "undefined" &&
+    process.env &&
+    (process.env.REACT_APP_API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL)) ||
+  config.API_BASE_URL || "";
+
+function apiUrl(path) {
+  if (!API_BASE) return path;
+  return `${API_BASE.replace(/\/+$/, "")}/${String(path).replace(/^\/+/, "")}`;
+}
 
 export function TrustpilotPhase5Panel() {
   const [url, setUrl] = useState("");
@@ -28,7 +46,7 @@ export function TrustpilotPhase5Panel() {
     }
     setBusy(true);
     try {
-      const res = await fetch(`/phase5/trustpilot/scrape_and_enrich.csv`, {
+      const res = await fetch(apiUrl("/phase5/trustpilot/scrape_and_enrich.csv"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
