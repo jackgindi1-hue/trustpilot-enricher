@@ -14,6 +14,8 @@
 # 6. Always merge results with source tags and evidence URLs
 # ============================================================
 from typing import Dict, Any, Optional
+import json  # PHASE 4.6.7.6
+import importlib  # PHASE 4.6.7.6
 from tp_enrich.anchor_discovery import phase46_anchor_discovery
 from tp_enrich.canonical import choose_canonical_business, apply_canonical_to_row, should_run_opencorporates
 from tp_enrich.candidates import build_google_candidate, build_yelp_candidate, apply_candidate_anchors_to_row
@@ -33,8 +35,9 @@ def _pick_email_domain(row: dict) -> str:
     """
     PHASE 4.6.2: Pick best domain for email enrichment.
     PHASE 4.6.7.5: Prioritize email_candidate_domain (Google website fallback).
+    PHASE 4.6.7.6: Also check google_website_domain (persisted early).
     """
-    for k in ["email_candidate_domain", "company_domain", "business_domain", "canonical_domain", "discovered_domain"]:
+    for k in ["email_candidate_domain", "company_domain", "business_domain", "canonical_domain", "discovered_domain", "google_website_domain"]:
         d = (row.get(k) or "").strip()
         if d:
             d = d.replace("http://", "").replace("https://", "").replace("www.", "").split("/")[0]
@@ -60,13 +63,14 @@ def _should_run_full_email(row: dict) -> bool:
     """
     PHASE 4.6.3: Only run full email waterfall when we have real signal.
     PHASE 4.6.7.5: Also check email_candidate_domain (Google website fallback).
+    PHASE 4.6.7.6: Also check google_website_domain (persisted early).
 
     This prevents slow + empty runs on directory domains or missing anchors.
 
     Returns:
         True if we should run the full waterfall, False to skip
     """
-    domain = (row.get("email_candidate_domain") or row.get("company_domain") or row.get("discovered_domain") or "").lower()
+    domain = (row.get("email_candidate_domain") or row.get("company_domain") or row.get("discovered_domain") or row.get("google_website_domain") or "").lower()
     phone = (row.get("primary_phone") or row.get("discovered_phone") or "").strip()
     html_flag = row.get("website_has_mailto")  # set earlier if available
 
@@ -379,15 +383,18 @@ def enrich_row_phase46(
     PHASE 4.6 ADAPTIVE ENRICHMENT
     Adaptive waterfall that discovers anchors when canonical matching fails.
     Returns MAX contact data even for "rejected" rows.
+
     Args:
         name: Business name
         region: Optional region/state
         logger: Optional logger
+
     Returns:
         Enriched business dict with canonical + discovered fields
     """
     if logger:
         logger.info(f"Enriching business (adaptive): {name}")
+
     row = {
         "business_name": name,
         "primary_phone": None,
@@ -402,6 +409,7 @@ def enrich_row_phase46(
         "canonical_source": None,
         "canonical_match_score": 0.0,
         "debug_notes": "",
+
         # PHASE 4.6: Discovered anchors
         "discovered_domain": None,
         "discovered_phone": None,
@@ -415,18 +423,21 @@ def enrich_row_phase46(
 
     # PHASE 4.6.7.3: Initialize CSV-level execution markers
     row = _phase467_init_markers(row, logger, name)
+
     # ============================================================
     # STEP 0: Start with existing anchors
     # ============================================================
     has_state = bool(region)
     has_domain = False
     has_phone = False
+
     # ============================================================
     # STEP 1: Try Google Places (ALWAYS - name-only allowed)
     # PHASE 4.6.5 HOTFIX: Use google_lookup_allow_name_only
     # ============================================================
     google_hit = None
     yelp_hit = None
+
     # Get API key from environment
     google_api_key = local_enrichment.GOOGLE_PLACES_API_KEY or ""
 
@@ -443,13 +454,20 @@ def enrich_row_phase46(
         )
         if logger and google_hit:
             logger.info(f"   -> Google Places: name={google_hit.get('name')} state={google_hit.get('state_region')}")
+
+        # PHASE 4.6.7.6: Persist Google website domain early
+        if google_hit:
+            row = _persist_google_website_domain(row, google_hit, logger)
+
     except Exception as e:
         if logger:
             logger.warning(f"   -> Google Places failed: {e}")
+
     # ============================================================
     # STEP 2: Try Yelp (same logic)
     # ============================================================
     # Yelp integration optional - skip for now
+
     # ============================================================
     # STEP 3: Check if we have weak candidates or missing anchors
     # ============================================================
@@ -474,15 +492,18 @@ def enrich_row_phase46(
                     f"   -> Weak anchors (domain={not missing_domain}, phone={not missing_phone}, "
                     f"state={not missing_state}), triggering anchor discovery"
                 )
+
         # ============================================================
         # STEP 4: Run anchor discovery
         # ============================================================
+
         # PHASE 4.6.7.3: Mark SERP-first before anchor discovery
         row = _mark_serp_first(row, logger, name)
 
         try:
             # PHASE 4.6.4: Reduced max_urls from 3 to 2 for speed
             discovered = phase46_anchor_discovery(name, vertical=None, max_urls=2, logger=logger)
+
             # Merge discovered anchors into row
             row["discovered_domain"] = discovered.get("discovered_domain")
             row["discovered_phone"] = discovered.get("discovered_phone")
@@ -509,29 +530,36 @@ def enrich_row_phase46(
                 else:
                     if logger:
                         logger.info(f"   -> Anchor discovery: Rejected directory domain {discovered.get('discovered_domain')}")
+
             if discovered.get("discovered_phone"):
                 has_phone = True
                 # PHASE 4.6.4: Don't directly assign - let phone waterfall try first,
                 # then _promote_discovered_phone() will use it if waterfall fails
+
             if discovered.get("discovered_state_region"):
                 has_state = True
                 # PHASE 4.6.5: CRITICAL - NEVER overwrite business_state_region
                 # discovered_state_region stays separate and is only used as query fallback
                 # Overwriting caused state poisoning (VA -> ID) which killed canonical matching
+
             if discovered.get("discovered_address"):
                 # PHASE 4.6.5: Only set address if currently missing (don't overwrite)
                 if not row.get("business_address"):
                     row["business_address"] = discovered["discovered_address"]
+
             if discovered.get("discovered_email"):
                 assign_email(row, discovered["discovered_email"], source="anchor_discovery")
+
             if logger:
                 logger.info(
                     f"   -> Anchor discovery complete: domain={bool(has_domain)}, "
                     f"phone={bool(has_phone)}, state={bool(has_state)}"
                 )
+
             # ============================================================
             # STEP 5: FEEDBACK LOOP - Retry providers with discovered anchors
             # ============================================================
+
             # 5A. Retry Google Places with discovered anchors
             # PHASE 4.6.5 HOTFIX: Use google_lookup_allow_name_only for retry
             if not google_hit:
@@ -549,6 +577,7 @@ def enrich_row_phase46(
                 except Exception as e:
                     if logger:
                         logger.warning(f"   -> FEEDBACK: Google Places retry failed: {e}")
+
             # 5B. Run Hunter/Apollo/Snov immediately with discovered domain
             if has_domain and not row.get("primary_email"):
                 discovered_domain = row.get("discovered_domain")
@@ -566,11 +595,13 @@ def enrich_row_phase46(
                         person_name=None,
                         logger=logger
                     )
+
                     if wf.get("primary_email"):
                         assign_email(row, wf["primary_email"], source=wf.get("email_source") or "feedback_waterfall")
                         row["primary_email_confidence"] = wf.get("email_confidence")
                         row["email_type"] = wf.get("email_type")
                         row["email_providers_attempted"] = wf.get("email_tried") or ""
+
                         if logger:
                             logger.info(
                                 f"   -> FEEDBACK: Email waterfall SUCCESS - "
@@ -579,17 +610,21 @@ def enrich_row_phase46(
                 except Exception as e:
                     if logger:
                         logger.warning(f"   -> FEEDBACK: Email waterfall with discovered domain failed: {e}")
+
             # 5C. Update candidates flag after retry (feeds into canonical matching)
             has_candidates = bool(google_hit or yelp_hit)
+
             if logger:
                 logger.info(
                     f"   -> FEEDBACK: After retry, has_candidates={has_candidates} "
                     f"(google_hit={bool(google_hit)}, yelp_hit={bool(yelp_hit)})"
                 )
+
         except Exception as e:
             if logger:
                 logger.exception(f"   -> Anchor discovery failed: {e}")
             row["debug_notes"] += f"|anchor_discovery_error_{repr(e)[:50]}"
+
     # ============================================================
     # STEP 6: Canonical matching (≥80%)
     # ============================================================
@@ -642,12 +677,14 @@ def enrich_row_phase46(
     else:
         # PHASE 4.6.5: Pass normalized candidates (not raw hits) to matcher
         canonical, match_meta = choose_canonical_business(row, google_candidate, yelp_candidate)
+
         if canonical:
             if logger:
                 msg = f"   -> CANONICAL: {canonical['source']} (score={match_meta['best_score']:.2f}, reason={match_meta.get('reason', 'unknown')})"
                 if "soft_threshold" in match_meta.get("reason", ""):
                     msg += f" [SOFT: domain={match_meta.get('domain_match_exact')}, phone={match_meta.get('phone_match_exact')}]"
                 logger.info(msg)
+
             _apply_canonical_compat(row, canonical, match_meta or {}, logger)
 
             # ✅ Ensure canonical_source never becomes "unknown"
@@ -664,15 +701,18 @@ def enrich_row_phase46(
                 logger.info(
                     f"   -> CANONICAL: Rejected (reason={match_meta.get('reason')})"
                 )
+
             row["canonical_source"] = ""
             row["canonical_match_score"] = float(match_meta.get("best_score") or 0.0)  # PHASE 4.6: Keep REAL best score for analysis
             row["canonical_match_reason"] = (match_meta.get("reason") if isinstance(match_meta, dict) else None) or "below_threshold"
             row["debug_notes"] += "|entity_match_below_80"
+
             # PHASE 4.6: Keep component scores for threshold tuning
             row["canonical_score_name"] = float(match_meta.get("score_name") or 0.0)
             row["canonical_score_state"] = float(match_meta.get("score_state") or 0.0)
             row["canonical_score_domain"] = float(match_meta.get("score_domain") or 0.0)
             row["canonical_score_phone"] = float(match_meta.get("score_phone") or 0.0)
+
             # IMPORTANT: Keep discovered_* fields even if canonical failed
             # This ensures "rejected" rows still have useful data
             if logger:
@@ -703,17 +743,20 @@ def enrich_row_phase46(
             google_hit=google_hit or {},
             domain=domain
         )
+
         row["primary_phone"] = phone_layer.get("primary_phone")
         row["primary_phone_source"] = phone_layer.get("primary_phone_source")
         row["primary_phone_confidence"] = phone_layer.get("primary_phone_confidence")
         row["all_phones_json"] = phone_layer.get("all_phones_json")
 
     # PHASE 4.6.2: Email enrichment MOVED to after canonical block (runs even if canonical fails)
+
     # OpenCorporates (if state known)
     if should_run_opencorporates(row):
         state = row["business_state_region"]
         if logger:
             logger.info(f"   -> OpenCorporates lookup: {name} in {state}")
+
         try:
             google_payload = {
                 "lat": google_hit.get("lat") if google_hit else None,
@@ -724,14 +767,18 @@ def enrich_row_phase46(
                 "postal_code": row.get("business_postal_code"),
                 "website": website,
             }
+
             p2_data = phase2_enrich(company=name, google_payload=google_payload, logger=logger)
             row.update(p2_data)
+
             if logger:
                 logger.info(f"   -> Phase 2 complete")
+
         except Exception as e:
             if logger:
                 logger.exception(f"   -> Phase 2 failed: {e}")
             row["debug_notes"] += f"|phase2_error_{repr(e)[:50]}"
+
     else:
         if logger:
             logger.info(f"   -> OpenCorporates SKIPPED (no state)")
@@ -748,6 +795,7 @@ def enrich_row_phase46(
     # ALWAYS run when ANY domain exists (canonical OR discovered)
     # ============================================================
     row = _run_email_step(name, row, logger=logger)
+
     # Website micro-scan fallback (if still no email)
     if not row.get("primary_email"):
         website = row.get("business_website") or row.get("canonical_website") or row.get("discovered_website")
@@ -756,27 +804,38 @@ def enrich_row_phase46(
                 _rate.wait("website_email_scan")
                 if logger:
                     logger.info(f"   -> Website scan for email: {website}")
+
                 e2 = micro_scan_for_email(website, logger=logger)
                 if e2:
                     assign_email(row, e2, source="website_scan")
                     row["email_type"] = "generic"
                     row["primary_email_confidence"] = "low"
+
                     if logger:
                         logger.info(f"   -> Website scan found: {e2}")
             except Exception as e:
                 if logger:
                     logger.warning(f"   -> Website scan failed: {e}")
-        # ============================================================
+
+    # ============================================================
+    # STEP 7.7: PHASE2 DIRECTORY FEED (Phase 4.6.7.6)
+    # Feed BBB/YP URLs from discovery_evidence_json to Phase2 scrapes
+    # ============================================================
+    row = _phase2_directory_feed(row, logger=logger)
+
+    # ============================================================
     # STEP 8: Compute confidence
     # ============================================================
     has_phone = bool(row.get("primary_phone") or row.get("discovered_phone"))
     has_email = bool(row.get("primary_email") or row.get("discovered_email"))
+
     if has_phone and has_email:
         row["overall_lead_confidence"] = "high"
     elif has_phone or has_email:
         row["overall_lead_confidence"] = "medium"
     else:
         row["overall_lead_confidence"] = "failed"
+
     return row
 
 
@@ -822,10 +881,12 @@ def _resolve_keys(args, kwargs):
 
 def _resolve_logger(args, kwargs):
     logger = kwargs.get("logger", None)
+
     if logger is None and args:
         # positional (row, serp, google, logger)
         if len(args) >= 3 and not (len(args) == 1 and isinstance(args[0], dict)):
             logger = args[2]
+
         # context dict
         if len(args) == 1 and isinstance(args[0], dict):
             logger = args[0].get("logger", None)
@@ -836,6 +897,7 @@ def _resolve_logger(args, kwargs):
         def warning(self, *a, **k): pass
         def error(self, *a, **k): pass
         def exception(self, *a, **k): pass
+
     return logger or _NoopLogger()
 
 def _business_key(row: dict) -> str:
@@ -912,6 +974,7 @@ def enrich_single_business_adaptive(row, *args, **kwargs):
         def warning(self,*a,**k): pass
         def error(self,*a,**k): pass
         def exception(self,*a,**k): pass
+
     if logger is None:
         logger = _Noop()
 
@@ -996,9 +1059,11 @@ def _append_debug(row: dict, token: str):
     token = (token or "").strip()
     if not token:
         return row
+
     cur = (row.get("debug_notes") or "").strip()
     if token in cur:
         return row
+
     row["debug_notes"] = (cur + ("|" if cur else "") + token).strip("|")
     return row
 
@@ -1013,12 +1078,13 @@ def _sentinel(logger, msg: str, **kv):
         pass
 
 def _phase467_init_markers(row: dict, logger, name: str):
-    row = _flag(row, "phase467_version", "4.6.7.3")
+    row = _flag(row, "phase467_version", "4.6.7.6")
     row = _flag(row, "google_always_ran", False)
     row = _flag(row, "serp_first_ran", False)
     row = _flag(row, "address_retry_ran", bool(row.get("address_retry_ran") is True))
     row = _flag(row, "domain_retry_ran", bool(row.get("domain_retry_ran") is True))
     row = _flag(row, "email_retry_ran", bool(row.get("email_retry_ran") is True))
+
     _sentinel(logger, "PHASE467_ROW_INIT", row_id=row.get("row_id"), name=name)
     return row
 
@@ -1113,11 +1179,13 @@ def _resolve_callable(mod_names, fn_names):
             f = getattr(m, fn, None)
             if callable(f):
                 return f
+
     # also check globals
     for fn in fn_names:
         f = globals().get(fn)
         if callable(f):
             return f
+
     return None
 
 def _serp_pick_official_domain(serp_payload: dict) -> str:
@@ -1167,6 +1235,7 @@ def _serp_fetch_payload(name: str, discovered_address: str, discovered_phone: st
         ["tp_enrich.serp_tools", "tp_enrich.serp_enrichment", "tp_enrich.local_enrichment"],
         ["run_serp_google_kg", "run_serp_search", "run_serpapi_search", "serp_search_google", "serp_fetch_google"],
     )
+
     if not callable(fn):
         try:
             logger.info("SERP_OFFICIAL_SITE: no SERP function found")
@@ -1228,6 +1297,7 @@ def _apply_official_domain_if_missing(row: dict, name: str, serp_api_key: str, l
             logger.info("SERP_OFFICIAL_SITE_APPLIED name=%s domain=%s", name, dom)
         except Exception:
             pass
+
     return row
 
 # ============================================================
@@ -1262,17 +1332,20 @@ def _google_hit_website_domain(google_hit) -> str:
     """
     if not google_hit:
         return ""
+
     if isinstance(google_hit, dict):
         for k in ["website", "site", "url", "canonical_website"]:
             d = _norm_domain_474(google_hit.get(k) or "")
             if d:
                 return d
+
         # sometimes nested in result object
         r = google_hit.get("result") or {}
         if isinstance(r, dict):
             d = _norm_domain_474(r.get("website") or r.get("url") or "")
             if d:
                 return d
+
     return ""
 
 
@@ -1331,4 +1404,139 @@ def _apply_google_website_email_fallback(row: dict, google_hit, logger):
 
 # ============================================================
 # END PHASE 4.6.7.5
+# ============================================================
+
+
+# ============================================================
+# PHASE 4.6.7.6 — GOOGLE WEBSITE PERSISTENCE + PHASE2 DIRECTORY FEED
+# ============================================================
+
+def _persist_google_website_domain(row: dict, google_hit: dict, logger):
+    """
+    PHASE 4.6.7.6: Persist Google website domain early (immediately after google_hit).
+
+    This ensures Google website is never lost, even if canonical matching fails.
+    The persisted domain is used ONLY for email enrichment fallback.
+
+    Args:
+        row: Business row dict
+        google_hit: Google Places API response
+        logger: Logger instance
+
+    Returns:
+        Updated row with google_website_domain if found
+    """
+    if not google_hit or not isinstance(google_hit, dict):
+        return row
+
+    gdom = _google_hit_website_domain(google_hit)
+    if not gdom:
+        return row
+
+    # Reject directory domains
+    if _is_directory_domain(gdom):
+        return row
+
+    # Persist early
+    row["google_website_domain"] = gdom
+
+    try:
+        logger.info("GOOGLE_WEBSITE_PERSIST row_id=%s dom=%s", row.get("row_id"), gdom)
+    except Exception:
+        pass
+
+    return row
+
+
+def _phase2_directory_feed(row: dict, logger=None):
+    """
+    PHASE 4.6.7.6: Extract BBB/YP URLs from discovery_evidence_json and feed to Phase2.
+
+    This FIXES the problem where Phase2 BBB/YP scrapes fail because they lack target URLs,
+    even though anchor discovery found those URLs (but rejected them as directory domains).
+
+    CRITICAL RULES:
+    - Does NOT pollute discovered_domain or business_domain
+    - Does NOT run if discovery_evidence_json is empty/missing
+    - Extracts ONLY BBB/YP URLs for targeted Phase2 retry
+    - Runs AFTER main enrichment (fills phase2_bbb_* / phase2_yp_* fields)
+
+    Args:
+        row: Business row dict
+        logger: Optional logger
+
+    Returns:
+        Updated row with phase2_bbb_*/phase2_yp_* fields if URLs found
+    """
+    evidence_json = (row.get("discovery_evidence_json") or "[]").strip()
+    if not evidence_json or evidence_json == "[]":
+        return row
+
+    try:
+        evidence = json.loads(evidence_json)
+    except Exception:
+        return row
+
+    if not isinstance(evidence, list):
+        return row
+
+    # Extract BBB/YP URLs
+    bbb_urls = []
+    yp_urls = []
+
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+
+        url = (item.get("url") or "").strip().lower()
+        if not url:
+            continue
+
+        if "bbb.org" in url:
+            bbb_urls.append(url)
+        elif "yellowpages.com" in url:
+            yp_urls.append(url)
+
+    # Feed to Phase2 BBB scrape (if no existing BBB data)
+    if bbb_urls and not row.get("phase2_bbb_url"):
+        try:
+            logger.info("PHASE2_BBB_FEED_SENTINEL row_id=%s url=%s", row.get("row_id"), bbb_urls[0])
+        except Exception:
+            pass
+
+        # Import Phase2 BBB module
+        try:
+            from tp_enrich.phase2_final import _run_bbb_scrape
+            bbb_data = _run_bbb_scrape(bbb_urls[0], logger=logger)
+            if isinstance(bbb_data, dict):
+                row.update(bbb_data)
+        except Exception as e:
+            try:
+                logger.warning("PHASE2_BBB_FEED_ERROR row_id=%s err=%s", row.get("row_id"), e)
+            except Exception:
+                pass
+
+    # Feed to Phase2 YP scrape (if no existing YP data)
+    if yp_urls and not row.get("phase2_yp_url"):
+        try:
+            logger.info("PHASE2_YP_FEED_SENTINEL row_id=%s url=%s", row.get("row_id"), yp_urls[0])
+        except Exception:
+            pass
+
+        # Import Phase2 YP module
+        try:
+            from tp_enrich.phase2_final import _run_yp_scrape
+            yp_data = _run_yp_scrape(yp_urls[0], logger=logger)
+            if isinstance(yp_data, dict):
+                row.update(yp_data)
+        except Exception as e:
+            try:
+                logger.warning("PHASE2_YP_FEED_ERROR row_id=%s err=%s", row.get("row_id"), e)
+            except Exception:
+                pass
+
+    return row
+
+# ============================================================
+# END PHASE 4.6.7.6
 # ============================================================
