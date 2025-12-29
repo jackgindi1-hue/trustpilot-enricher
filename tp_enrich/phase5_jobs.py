@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional, List
 
 from tp_enrich.apify_trustpilot import scrape_trustpilot_urls
 from tp_enrich.phase5_bridge import call_phase4_enrich_rows
-from tp_enrich.routes_phase5 import _rows_to_csv_bytes
+from tp_enrich.csv_utils import rows_to_csv_bytes
 
 # In-memory job storage (use Redis/DB for production scale)
 _JOBS: Dict[str, Dict[str, Any]] = {}
@@ -84,7 +84,7 @@ def _run_job(job_id: str):
         # Step 3: Prepare CSV
         _set(job_id, row_count_enriched=len(enriched), progress="csv")
         print(f"PHASE5_JOB_CSV job_id={job_id}")
-        csv_bytes = _rows_to_csv_bytes(enriched)
+        csv_bytes = rows_to_csv_bytes(enriched)
         print(f"PHASE5_JOB_DONE job_id={job_id} bytes={len(csv_bytes)}")
 
         # Mark complete

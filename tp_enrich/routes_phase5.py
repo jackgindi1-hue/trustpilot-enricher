@@ -23,6 +23,7 @@ import csv
 from tp_enrich.apify_trustpilot import scrape_trustpilot_urls, ApifyError
 from tp_enrich.phase5_bridge import call_phase4_enrich_rows, Phase5BridgeError
 from tp_enrich.phase5_jobs import create_job, get_job
+from tp_enrich.csv_utils import rows_to_csv_bytes
 
 phase5_router = APIRouter(prefix="/phase5", tags=["phase5"])
 
@@ -30,33 +31,6 @@ phase5_router = APIRouter(prefix="/phase5", tags=["phase5"])
 class Phase5RunReq(BaseModel):
     urls: List[str] = Field(..., description="Trustpilot company review URLs")
     max_reviews_per_company: int = Field(5000, ge=1, le=5000)
-
-
-def _rows_to_csv_bytes(rows: List[dict]) -> bytes:
-    """Convert rows to CSV bytes with stable column ordering."""
-    # Don't assume Phase 4 columns; write union of keys with stable ordering preference first
-    preferred = [
-        "source_platform",
-        "company_url",
-        "consumer.displayname",
-        "raw_display_name",
-        "review_date",
-        "review_rating",
-        "review_text",
-        "review_id",
-    ]
-    keys = set()
-    for r in rows:
-        keys.update((r or {}).keys())
-    extra = [k for k in sorted(keys) if k not in preferred]
-    fieldnames = preferred + extra
-
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
-    w.writeheader()
-    for r in rows:
-        w.writerow({k: ("" if (r or {}).get(k) is None else (r or {}).get(k)) for k in fieldnames})
-    return buf.getvalue().encode("utf-8")
 
 
 @phase5_router.post("/trustpilot/scrape")
@@ -76,7 +50,7 @@ def phase5_scrape_csv(req: Phase5RunReq):
     """Scrape Trustpilot reviews (CSV download)."""
     try:
         rows = scrape_trustpilot_urls(req.urls, req.max_reviews_per_company, logger=None)
-        csv_bytes = _rows_to_csv_bytes(rows)
+        csv_bytes = rows_to_csv_bytes(rows)
         return StreamingResponse(
             iter([csv_bytes]),
             media_type="text/csv",
@@ -101,7 +75,7 @@ def phase5_scrape_and_enrich_csv(req: Phase5RunReq):
         enriched = call_phase4_enrich_rows(scraped)  # Phase 4 is locked; we only CALL it
         print(f"PHASE5_ENRICH_DONE rows={len(enriched)}")
 
-        csv_bytes = _rows_to_csv_bytes(enriched)
+        csv_bytes = rows_to_csv_bytes(enriched)
         print(f"PHASE5_CSV_READY bytes={len(csv_bytes)}")
 
         return StreamingResponse(
