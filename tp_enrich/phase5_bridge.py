@@ -14,104 +14,59 @@ class Phase5BridgeError(RuntimeError):
 
 
 # ============================================================================
-# PHASE 5 SCHEMA FIX: Force exact CSV-upload schema at handoff
+# PHASE 5 SCHEMA FIX: Kill <NA> names + stop garbage domains
 # ============================================================================
 
-def _clean_blank(v):
-    """Convert blank/NA values to empty string."""
+def _is_blank(v) -> bool:
+    """Check if value is blank/NA/null."""
     if v is None:
-        return ""
+        return True
     s = str(v).strip()
+    if s == "":
+        return True
     if s.lower() in {"<na>", "na", "nan", "none", "null"}:
-        return ""
-    return s
-
-
-def _pick_name(rr: dict) -> str:
-    """Try ALL possible places Apify might store reviewer name."""
-    candidates = [
-        rr.get("consumer.displayname"),
-        rr.get("raw_display_name"),
-        rr.get("company_search_name"),
-        rr.get("name"),
-        rr.get("reviewerName"),
-        rr.get("reviewer"),
-        rr.get("author"),
-        rr.get("userName"),
-    ]
-
-    # Some actors store nested consumer objects
-    consumer = rr.get("consumer")
-    if isinstance(consumer, dict):
-        candidates.insert(0, consumer.get("displayname"))
-        candidates.insert(0, consumer.get("displayName"))
-
-    for c in candidates:
-        s = _clean_blank(c)
-        if s:
-            return s
-    return ""
+        return True
+    return False
 
 
 def _stable_row_id(rr: dict) -> str:
-    """Generate deterministic ID if review_id is missing."""
+    """Generate deterministic fallback ID if review_id/row_id missing."""
     base = "|".join([
-        _clean_blank(rr.get("reviewed_company_url") or rr.get("company_url")),
-        _clean_blank(rr.get("review_date") or rr.get("date")),
-        _clean_blank(rr.get("review_rating")),
-        _clean_blank((rr.get("review_text") or ""))[:200],
-        _pick_name(rr),
+        str(rr.get("reviewed_company_url") or rr.get("company_url") or ""),
+        str(rr.get("review_date") or rr.get("date") or ""),
+        str(rr.get("review_rating") or ""),
+        str((rr.get("review_text") or "")[:200]),
+        str(rr.get("raw_display_name") or rr.get("consumer.displayname") or rr.get("company_search_name") or ""),
     ])
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:24]
 
 
-def _phase5_force_csv_schema(rows):
+def _phase5_force_csv_schema(rows: List[dict]) -> List[dict]:
     """
-    Convert Phase 5 scraped rows into the SAME input schema as the working CSV upload.
-    IMPORTANT: Do NOT drop everything. Only skip rows that truly have no reviewer name.
-    """
-    fixed = []
-    rows = rows or []
+    DO NOT DROP ROWS HERE.
+    Phase 4 already knows how to skip person rows.
+    Dropping here caused 0-row enrichment and blank CSVs.
 
-    # DEBUG: show what keys actually exist on first row
+    The normalization is now done in apify_trustpilot._normalize_item()
+    which sets all required fields: name, raw_display_name, consumer.displayname,
+    company_search_name, date, row_id, run_id.
+    """
+    rows = rows or []
     if rows:
         try:
             first = dict(rows[0] or {})
-            print("PHASE5_DEBUG_FIRST_ROW_KEYS", sorted(list(first.keys()))[:80])
+            print("PHASE5_DEBUG_FIRST_ROW_KEYS", sorted(first.keys()))
+            print(
+                "PHASE5_DEBUG_FIRST_ROW_NAME",
+                first.get("name"),
+                first.get("consumer.displayname"),
+                first.get("raw_display_name"),
+            )
         except Exception:
             pass
 
-    for r in rows:
-        rr = dict(r or {})
-
-        reviewer = _pick_name(rr)
-        if not reviewer:
-            # Skip only truly nameless rows
-            continue
-
-        # IMPORTANT: This is the exact schema your CSV upload flow uses
-        rr["consumer.displayname"] = reviewer
-        rr["raw_display_name"] = reviewer
-
-        # company_search_name exists in your working enriched CSV; seed it to reviewer initially
-        rr["company_search_name"] = reviewer
-
-        # date column is present in your working CSV upload (separate from review_date)
-        rr["date"] = _clean_blank(rr.get("date")) or _clean_blank(rr.get("review_date"))
-
-        # stable identifiers required by pipeline
-        rid = _clean_blank(rr.get("row_id")) or _clean_blank(rr.get("review_id")) or _clean_blank(rr.get("id"))
-        rr["row_id"] = rid if rid else _stable_row_id(rr)
-
-        rr["run_id"] = _clean_blank(rr.get("run_id")) or "phase5_apify"
-
-        fixed.append(rr)
-
-    print("PHASE5_DEBUG_ROWS_IN_OUT", {"in": len(rows), "out": len(fixed)})
-    if fixed:
-        print("PHASE5_DEBUG_SAMPLE_NAME", fixed[0].get("consumer.displayname"), "row_id=", fixed[0].get("row_id"))
-
-    return fixed
+    print("PHASE5_DEBUG_ROWS_PASSTHROUGH", {"count": len(rows)})
+    return rows
 
 
 def _try_import(path: str):
@@ -170,6 +125,7 @@ def call_phase4_enrich_rows(rows: List[dict]) -> List[dict]:
         )
 
     # PHASE 5 SCHEMA FIX: Force Apify rows to match CSV-upload schema before calling Phase 4
+    # This also DROPS rows with blank names to prevent wasted credits + garbage domains
     rows = _phase5_force_csv_schema(rows)
 
     # Compatibility wrapper: some functions accept (rows, logger) or (rows, options)

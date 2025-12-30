@@ -127,7 +127,15 @@ class ApifyClient:
         )
 
 def _normalize_item(item: dict, company_url: str) -> dict:
-    reviewer = _clean(item.get("reviewerName") or item.get("reviewer") or item.get("author") or item.get("userName"))
+    reviewer = _clean(
+        item.get("reviewerName")
+        or item.get("reviewer")
+        or item.get("author")
+        or item.get("userName")
+        or (item.get("consumer") or {}).get("displayname")
+        or (item.get("consumer") or {}).get("displayName")
+    )
+
     rating = _clean(item.get("rating") or item.get("stars") or item.get("score"))
     date = _clean(item.get("date") or item.get("reviewDate") or item.get("publishedDate"))
     text = _clean(item.get("text") or item.get("reviewText") or item.get("content"))
@@ -142,23 +150,25 @@ def _normalize_item(item: dict, company_url: str) -> dict:
     if not review_id:
         review_id = _stable_review_id(company_url, reviewer, date, rating, text)
 
-    # PHASE 5 SCHEMA ALIGNMENT FIX:
-    # - These fields MUST match the working CSV schema exactly
-    # - raw_display_name, consumer.displayname, AND company_search_name all set to reviewer
-    # - This ensures Phase 4 classification + enrichment works identically to CSV upload
+    # PHASE 5 FINAL FIX:
+    # These fields EXACTLY mirror the CSV-upload schema Phase 4 already works with
     return {
         "source_platform": "trustpilot",
 
-        # reviewed company (reference only)
-        "reviewed_company_url": company_url,
-        "reviewed_company_name": reviewed_company_name,
-
-        # IMPORTANT: these must match the working CSV schema
+        # Phase 4 INPUT FIELDS (DO NOT RENAME)
+        "name": reviewer,
         "raw_display_name": reviewer,
         "consumer.displayname": reviewer,
         "company_search_name": reviewer,
+        "date": date,
+        "row_id": review_id,
+        "run_id": "phase5_apify",
 
-        # review fields
+        # Reviewed company (reference only)
+        "reviewed_company_url": company_url,
+        "reviewed_company_name": reviewed_company_name,
+
+        # Review fields
         "review_date": date,
         "review_rating": rating,
         "review_text": text,
