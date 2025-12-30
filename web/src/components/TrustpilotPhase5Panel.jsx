@@ -109,28 +109,15 @@ export function TrustpilotPhase5Panel() {
         }
       }
 
-      // Step 3: Download CSV
+      // Step 3: Download CSV (direct download - more reliable than blob)
       setStatusMsg("Downloading CSV...");
-      const downloadEndpoint = apiUrl(`/phase5/trustpilot/download/${job_id}`);
-      const dlRes = await fetch(downloadEndpoint);
+      console.log("[PHASE5] Initiating download for job:", job_id);
 
-      if (!dlRes.ok) {
-        throw new Error(`Download failed: ${dlRes.status}`);
-      }
+      // PHASE 5 FIX: Use direct URL navigation instead of blob (more reliable)
+      const downloadUrl = apiUrl(`/phase5/trustpilot/download/${job_id}`);
+      window.location.href = downloadUrl;
 
-      const blob = await dlRes.blob();
-      console.log("[PHASE5] CSV downloaded:", blob.size, "bytes");
-
-      const a = document.createElement("a");
-      const href = window.URL.createObjectURL(blob);
-      a.href = href;
-      a.download = "phase5_trustpilot_enriched.csv";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(href);
-
-      setStatusMsg("✅ Download complete!");
+      setStatusMsg("✅ Download started!");
 
       // Success - clear URL after delay
       setTimeout(() => {

@@ -1,4 +1,4 @@
-"""
+""" 
 PHASE 5 — Apify Trustpilot Scraper
 
 Scrapes Trustpilot company reviews using Apify Dino actor.
@@ -132,18 +132,32 @@ def _normalize_item(item: dict, company_url: str) -> dict:
     date = _clean(item.get("date") or item.get("reviewDate") or item.get("publishedDate"))
     text = _clean(item.get("text") or item.get("reviewText") or item.get("content"))
 
-    company_name = _clean(item.get("companyName") or item.get("businessName") or item.get("company"))
+    reviewed_company_name = _clean(
+        item.get("companyName")
+        or item.get("businessName")
+        or item.get("company")
+    )
 
     review_id = _clean(item.get("reviewId") or item.get("id"))
     if not review_id:
         review_id = _stable_review_id(company_url, reviewer, date, rating, text)
 
-    # This row shape is intentionally Phase-4-friendly (same column conventions as your pipeline)
+    # PHASE 5 FIX:
+    # - raw_display_name MUST be the entity we want Phase 1/2 to classify (person vs business)
+    # - For Trustpilot reviews, that's the REVIEWER name (could be a person or a company account)
+    # - Keep reviewed-company info separate (reference only)
     return {
         "source_platform": "trustpilot",
-        "company_url": company_url,
+
+        # reviewed company (reference only)
+        "reviewed_company_url": company_url,
+        "reviewed_company_name": reviewed_company_name,
+
+        # reviewer identity (THIS is what Phase 4 should classify/enrich)
+        "raw_display_name": reviewer,
         "consumer.displayname": reviewer,
-        "raw_display_name": company_name,
+
+        # review fields
         "review_date": date,
         "review_rating": rating,
         "review_text": text,
