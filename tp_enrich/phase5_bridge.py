@@ -6,6 +6,7 @@ Auto-detects the Phase 4 enrich function from common module locations.
 """
 from typing import Callable, Dict, Any, List, Optional
 import importlib
+import hashlib
 
 
 class Phase5BridgeError(RuntimeError):
@@ -13,37 +14,73 @@ class Phase5BridgeError(RuntimeError):
 
 
 # ============================================================================
-# PHASE 5 SCHEMA FIX: Force Apify rows to match CSV-upload schema
+# PHASE 5 SCHEMA FIX: Kill <NA> names + stop garbage domains
 # ============================================================================
+
+def _is_blank(v) -> bool:
+    """Check if value is blank/NA/null."""
+    if v is None:
+        return True
+    s = str(v).strip()
+    if s == "":
+        return True
+    if s.lower() in {"<na>", "na", "nan", "none", "null"}:
+        return True
+    return False
+
+
+def _stable_row_id(rr: dict) -> str:
+    """Generate deterministic fallback ID if review_id/row_id missing."""
+    base = "|".join([
+        str(rr.get("reviewed_company_url") or rr.get("company_url") or ""),
+        str(rr.get("review_date") or rr.get("date") or ""),
+        str(rr.get("review_rating") or ""),
+        str((rr.get("review_text") or "")[:200]),
+        str(rr.get("raw_display_name") or rr.get("consumer.displayname") or rr.get("company_search_name") or ""),
+    ])
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:24]
+
+
 def _phase5_force_csv_schema(rows: List[dict]) -> List[dict]:
     """
-    Force Phase 5 (Apify) rows to match the CSV-upload schema that Phase 4 expects.
-    This fixes logs showing name=<NA> and row_id=None, which breaks person-vs-business
-    classification and causes garbage anchor discovery (e.g., 411.com).
+    Force Phase 5 rows to match CSV-upload expectations AND drop junk rows.
+    Critical: convert '<NA>'/nan/etc to empty BEFORE Phase 4 sees it.
+    Drops rows with blank names to prevent wasted credits + garbage domains.
     """
     fixed = []
     for r in rows or []:
         rr = dict(r or {})
 
-        # Phase 4 classification expects a stable "name" like CSV uploads provide.
-        candidate = (
-            rr.get("name")
-            or rr.get("raw_display_name")
-            or rr.get("consumer.displayname")
-            or rr.get("company_search_name")
-            or ""
-        )
-        candidate = str(candidate).strip()
+        # candidate name sources (match whatever we might have)
+        candidates = [
+            rr.get("name"),
+            rr.get("raw_display_name"),
+            rr.get("consumer.displayname"),
+            rr.get("company_search_name"),
+        ]
+        name_val = None
+        for c in candidates:
+            if not _is_blank(c):
+                name_val = str(c).strip()
+                break
 
-        # Phase 4 expects a stable row_id (CSV uploads provide it).
-        rid = rr.get("row_id") or rr.get("review_id") or rr.get("id") or ""
-        rid = str(rid).strip() or None
+        # If still blank => DROP ROW (prevents wasted credits + garbage domains)
+        if _is_blank(name_val):
+            continue
 
-        rr["name"] = candidate if candidate else None
+        # stable row_id
+        rid = rr.get("row_id") or rr.get("review_id") or rr.get("id")
+        if _is_blank(rid):
+            rid = _stable_row_id(rr)
+        else:
+            rid = str(rid).strip()
+
+        rr["name"] = name_val
         rr["row_id"] = rid
         rr["run_id"] = rr.get("run_id") or "phase5_apify"
 
         fixed.append(rr)
+
     return fixed
 
 
@@ -103,6 +140,7 @@ def call_phase4_enrich_rows(rows: List[dict]) -> List[dict]:
         )
 
     # PHASE 5 SCHEMA FIX: Force Apify rows to match CSV-upload schema before calling Phase 4
+    # This also DROPS rows with blank names to prevent wasted credits + garbage domains
     rows = _phase5_force_csv_schema(rows)
 
     # Compatibility wrapper: some functions accept (rows, logger) or (rows, options)
