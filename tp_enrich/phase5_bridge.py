@@ -12,6 +12,41 @@ class Phase5BridgeError(RuntimeError):
     pass
 
 
+# ============================================================================
+# PHASE 5 SCHEMA FIX: Force Apify rows to match CSV-upload schema
+# ============================================================================
+def _phase5_force_csv_schema(rows: List[dict]) -> List[dict]:
+    """
+    Force Phase 5 (Apify) rows to match the CSV-upload schema that Phase 4 expects.
+    This fixes logs showing name=<NA> and row_id=None, which breaks person-vs-business
+    classification and causes garbage anchor discovery (e.g., 411.com).
+    """
+    fixed = []
+    for r in rows or []:
+        rr = dict(r or {})
+
+        # Phase 4 classification expects a stable "name" like CSV uploads provide.
+        candidate = (
+            rr.get("name")
+            or rr.get("raw_display_name")
+            or rr.get("consumer.displayname")
+            or rr.get("company_search_name")
+            or ""
+        )
+        candidate = str(candidate).strip()
+
+        # Phase 4 expects a stable row_id (CSV uploads provide it).
+        rid = rr.get("row_id") or rr.get("review_id") or rr.get("id") or ""
+        rid = str(rid).strip() or None
+
+        rr["name"] = candidate if candidate else None
+        rr["row_id"] = rid
+        rr["run_id"] = rr.get("run_id") or "phase5_apify"
+
+        fixed.append(rr)
+    return fixed
+
+
 def _try_import(path: str):
     try:
         return importlib.import_module(path)
@@ -66,6 +101,9 @@ def call_phase4_enrich_rows(rows: List[dict]) -> List[dict]:
             "   Example: tp_enrich/pipeline.py with def enrich_rows(rows): ...\n"
             "3) Or add its module/function to the candidates list in tp_enrich/phase5_bridge.py.\n"
         )
+
+    # PHASE 5 SCHEMA FIX: Force Apify rows to match CSV-upload schema before calling Phase 4
+    rows = _phase5_force_csv_schema(rows)
 
     # Compatibility wrapper: some functions accept (rows, logger) or (rows, options)
     try:
