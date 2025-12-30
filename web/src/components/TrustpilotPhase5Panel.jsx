@@ -13,7 +13,6 @@
  */
 import React, { useState } from "react";
 import config from '../config';
-
 // PHASE 5 HOTFIX: Force direct Railway backend connection (bypass Netlify proxy)
 const API_BASE =
   (window && window.__API_BASE_URL__) ||
@@ -24,20 +23,19 @@ const API_BASE =
     process.env &&
     (process.env.REACT_APP_API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL)) ||
   config.API_BASE_URL || "";
-
 function apiUrl(path) {
   if (!API_BASE) return path;
   return `${API_BASE.replace(/\/+$/, "")}/${String(path).replace(/^\/+/, "")}`;
 }
-
 export function TrustpilotPhase5Panel() {
   const [url, setUrl] = useState("");
   const [maxReviews, setMaxReviews] = useState(5000);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [statusMsg, setStatusMsg] = useState("");
-
+  const [activeJobId, setActiveJobId] = useState(null);
   async function run() {
+    if (busy) return; // CRITICAL: Prevent double-fire
     setErr("");
     setStatusMsg("");
     const u = (url || "").trim();
@@ -45,16 +43,13 @@ export function TrustpilotPhase5Panel() {
       setErr("Paste a Trustpilot company URL.");
       return;
     }
-
     setBusy(true);
-
     try {
       // PHASE 5 FIX: Async job flow (prevents multiple Apify re-runs)
       // Step 1: Start job
       const startEndpoint = apiUrl("/phase5/trustpilot/start");
       console.log("[PHASE5] Starting job:", startEndpoint);
       setStatusMsg("Starting job...");
-
       const startRes = await fetch(startEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -63,29 +58,23 @@ export function TrustpilotPhase5Panel() {
           max_reviews_per_company: Number(maxReviews) || 5000
         })
       });
-
       if (!startRes.ok) {
         throw new Error(`Start failed: ${startRes.status}`);
       }
-
       const { job_id } = await startRes.json();
+      setActiveJobId(job_id); // Store to prevent re-start
       console.log("[PHASE5] Job started:", job_id);
-
       // Step 2: Poll job status
       let lastProgress = "";
       while (true) {
         await new Promise(r => setTimeout(r, 1500)); // Poll every 1.5s
-
         const statusEndpoint = apiUrl(`/phase5/trustpilot/status/${job_id}`);
         const stRes = await fetch(statusEndpoint);
-
         if (!stRes.ok) {
           throw new Error(`Status check failed: ${stRes.status}`);
         }
-
         const st = await stRes.json();
         console.log("[PHASE5] Job status:", st);
-
         // Update status message based on progress
         if (st.progress !== lastProgress) {
           lastProgress = st.progress;
@@ -97,42 +86,36 @@ export function TrustpilotPhase5Panel() {
             setStatusMsg("Preparing CSV download...");
           }
         }
-
         // Check for completion or error
         if (st.status === "error") {
           throw new Error(st.error || "Job failed");
         }
-
         if (st.status === "done") {
           console.log("[PHASE5] Job complete!");
           break;
         }
       }
-
       // Step 3: Download CSV (direct download - more reliable than blob)
       setStatusMsg("Downloading CSV...");
       console.log("[PHASE5] Initiating download for job:", job_id);
-
       // PHASE 5 FIX: Use direct URL navigation instead of blob (more reliable)
       const downloadUrl = apiUrl(`/phase5/trustpilot/download/${job_id}`);
       window.location.href = downloadUrl;
-
       setStatusMsg("✅ Download started!");
-
+      setActiveJobId(null); // Clear on success
       // Success - clear URL after delay
       setTimeout(() => {
         setUrl("");
         setStatusMsg("");
       }, 2000);
-
     } catch (e) {
       console.error("[PHASE5] Error:", e);
       setErr(e?.message || "Failed.");
+      setActiveJobId(null); // Clear on error too
     } finally {
       setBusy(false);
     }
   }
-
   return (
     <div
       style={{
@@ -193,7 +176,6 @@ export function TrustpilotPhase5Panel() {
           {busy ? "Running..." : "Run"}
         </button>
       </div>
-
       {statusMsg ? (
         <div
           style={{
@@ -208,7 +190,6 @@ export function TrustpilotPhase5Panel() {
           ℹ️ {statusMsg}
         </div>
       ) : null}
-
       {err ? (
         <div
           style={{
@@ -224,7 +205,6 @@ export function TrustpilotPhase5Panel() {
           ❌ {err}
         </div>
       ) : null}
-
       <div style={{ marginTop: 8, opacity: 0.7, fontSize: 13 }}>
         ✨ <strong>New:</strong> Scrapes Trustpilot reviews via Apify Dino, enriches with Phase 4, downloads one CSV. Phase 4 logic remains locked.
         {busy && <div style={{ marginTop: 4, fontSize: 12, fontStyle: "italic" }}>⏱️ Large scrapes take 2-5 minutes. Keep this tab open.</div>}
