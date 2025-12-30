@@ -1,4 +1,4 @@
-""" 
+"""
 PHASE 5 — Apify Trustpilot Scraper
 
 Scrapes Trustpilot company reviews using Apify Dino actor.
@@ -142,10 +142,10 @@ def _normalize_item(item: dict, company_url: str) -> dict:
     if not review_id:
         review_id = _stable_review_id(company_url, reviewer, date, rating, text)
 
-    # PHASE 5 FIX:
-    # - raw_display_name MUST be the entity we want Phase 1/2 to classify (person vs business)
-    # - For Trustpilot reviews, that's the REVIEWER name (could be a person or a company account)
-    # - Keep reviewed-company info separate (reference only)
+    # PHASE 5 SCHEMA ALIGNMENT FIX:
+    # - These fields MUST match the working CSV schema exactly
+    # - raw_display_name, consumer.displayname, AND company_search_name all set to reviewer
+    # - This ensures Phase 4 classification + enrichment works identically to CSV upload
     return {
         "source_platform": "trustpilot",
 
@@ -153,9 +153,10 @@ def _normalize_item(item: dict, company_url: str) -> dict:
         "reviewed_company_url": company_url,
         "reviewed_company_name": reviewed_company_name,
 
-        # reviewer identity (THIS is what Phase 4 should classify/enrich)
+        # IMPORTANT: these must match the working CSV schema
         "raw_display_name": reviewer,
         "consumer.displayname": reviewer,
+        "company_search_name": reviewer,
 
         # review fields
         "review_date": date,
