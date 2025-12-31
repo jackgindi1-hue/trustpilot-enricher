@@ -87,15 +87,15 @@ def phase5_start(req: Phase5StartReq):
     job_id, job = store.get_or_create_job(url)
 
     # If already running/done, do NOT start another Apify run
-    if job["status"] in {"RUNNING", "DONE"}:
-        print("PHASE5_START_IDEMPOTENT", {"job_id": job_id, "status": job["status"]})
+    if job["status"] == "RUNNING":  # CRITICAL FIX: Do NOT reuse DONE jobs
+        print("PHASE5_START_IDEMPOTENT_INFLIGHT", {"job_id": job_id, "status": job["status"]})
         return JSONResponse({"job_id": job_id, "status": job["status"]})
 
     # Only one instance should pass this point
     with _start_lock:
         # Re-read after lock
         job2 = store.get_by_job_id(job_id) or job
-        if job2["status"] in {"RUNNING", "DONE"}:
+        if job2["status"] == "RUNNING":  # CRITICAL FIX: Do NOT reuse DONE jobs
             print("PHASE5_START_IDEMPOTENT_AFTER_LOCK", {"job_id": job_id, "status": job2["status"]})
             return JSONResponse({"job_id": job_id, "status": job2["status"]})
 
@@ -358,10 +358,12 @@ def phase5_reset(payload: dict):
     job_id, job = store.get_or_create_job(url)
 
     # If it's stuck RUNNING, force clear it
-    if (job.get("status") or "") == "RUNNING":
-        store.set_error(job_id, "manual_reset_from_ui")
-        print("PHASE5_RESET", {"job_id": job_id, "prev_status": "RUNNING", "new_status": "ERROR"})
-        return JSONResponse({"ok": True, "job_id": job_id, "prev_status": "RUNNING", "new_status": "ERROR"})
+    # CRITICAL: Delete job regardless of status to force new Apify run
+    prev_status = job.get("status") or "UNKNOWN"
+    if prev_status in {"RUNNING", "DONE", "ERROR", "CREATED"}:
+        store.delete_by_url(url)  # CRITICAL: Actually DELETE so /start cannot reuse
+        print("PHASE5_RESET", {"job_id": job_id, "prev_status": prev_status, "new_status": "DELETED"})
+        return JSONResponse({"ok": True, "job_id": job_id, "prev_status": prev_status, "new_status": "DELETED"})
 
     return JSONResponse({"ok": True, "job_id": job_id, "status": job.get("status"), "message": "Job not stuck"})
 

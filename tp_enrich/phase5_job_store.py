@@ -40,7 +40,7 @@ class Phase5JobStore:
                 "Add DATABASE_URL variable from your Postgres plugin."
             )
         try:
-            import psycopg2  # type: ignore
+            import psycopg2
         except Exception as e:
             raise RuntimeError(
                 "psycopg2-binary missing. Add psycopg2-binary==2.9.9 to requirements.txt"
@@ -139,7 +139,6 @@ class Phase5JobStore:
         now = _now()
         meta = dict(meta or {})
 
-        # Handle csv_content specially - convert bytes to string for JSON storage
         if "csv_content" in meta:
             csv_val = meta["csv_content"]
             if isinstance(csv_val, bytes):
@@ -174,7 +173,6 @@ class Phase5JobStore:
 
         meta = job.get("meta") or {}
 
-        # Handle csv_content specially - convert bytes to string for JSON storage
         if "csv_content" in updates:
             csv_val = updates.pop("csv_content")
             if isinstance(csv_val, bytes):
@@ -190,3 +188,28 @@ class Phase5JobStore:
                     (now, json.dumps(meta), job_id),
                 )
             conn.commit()
+
+    def delete_job(self, job_id: str) -> bool:
+        """
+        CRITICAL: Actually DELETE the job record so /start cannot reuse it.
+        This is required for Reset to force a new Apify run.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM phase5_jobs WHERE job_id=%s", (job_id,))
+                deleted = cur.rowcount > 0
+            conn.commit()
+        return deleted
+
+    def delete_by_url(self, url: str) -> bool:
+        """
+        CRITICAL: Delete job record by URL (uses idem_key).
+        This ensures Reset clears any cached DONE job for this URL.
+        """
+        idem = _idem_key(url)
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM phase5_jobs WHERE idem_key=%s", (idem,))
+                deleted = cur.rowcount > 0
+            conn.commit()
+        return deleted
