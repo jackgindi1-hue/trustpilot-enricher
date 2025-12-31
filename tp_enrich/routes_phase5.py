@@ -393,10 +393,17 @@ def phase5_scrape_and_enrich_csv(payload: dict):
         # STEP A) Log before calling Phase 4
         # =====================================================================
         print("PHASE5_BEFORE_PHASE4", {"rows": len(rows)})
-        
-        # DEBUG: Check name field population before Phase 4
-        print("PHASE5_NAME_SAMPLE", [r.get("consumer.displayName") for r in rows[:15]])
-        print("PHASE5_NAME_BLANKS", sum(1 for r in rows if not (r.get("consumer.displayName") or "").strip()), "of", len(rows))
+
+        # =====================================================================
+        # DEFENSIVE DEDUPE: Prevent duplicate column names (e.g., consumer.displayName)
+        # This fixes: 'DataFrame' object has no attribute 'str' crash
+        # =====================================================================
+        import pandas as pd
+        df_tmp = pd.DataFrame(rows)
+        df_tmp.columns = [str(c).strip() for c in df_tmp.columns]
+        df_tmp = df_tmp.loc[:, ~df_tmp.columns.duplicated()]
+        rows = df_tmp.to_dict(orient="records")
+        print("PHASE5_DEDUPE_DONE", {"rows": len(rows), "cols": list(df_tmp.columns)[:15]})
 
         # =====================================================================
         # STEP C) Call run_phase4_exact — the EXACT SAME function as CSV upload

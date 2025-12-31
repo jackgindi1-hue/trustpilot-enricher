@@ -217,8 +217,7 @@ def _normalize_item(item: dict, company_url: str) -> dict:
         # Phase 4 expects candidate name here
         "name": reviewer,
         "raw_display_name": reviewer,
-        "consumer.displayName": reviewer,  # CRITICAL: Phase 4 uses capital N
-        "consumer.displayname": reviewer,
+        "consumer.displayName": reviewer,  # CANONICAL - Phase 4 expects capital N
         "company_search_name": reviewer,
 
         # CSV flow expects "date"
