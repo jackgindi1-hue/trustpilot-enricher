@@ -136,9 +136,15 @@ def phase5_status(job_id: str):
     job = store.get_by_job_id(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    # Include csv_ready flag for frontend polling
+    csv_ready = job["status"] == "DONE"
+
     return JSONResponse({
         "job_id": job_id,
         "status": job["status"],
+        "csv_ready": csv_ready,
+        "download_url": f"/phase5/trustpilot/download/{job_id}" if csv_ready else None,
         "apify_run_id": job.get("apify_run_id"),
         "error": job.get("error"),
         "meta": job.get("meta", {}),
@@ -204,7 +210,6 @@ def phase5_finish_and_enrich(payload: dict):
 
         print("PHASE5_CALLING_PHASE4", {"rows": len(rows)})
         enriched = run_phase4_exact(rows) or []
-
         print("PHASE5_PHASE4_RETURNED", {
             "rows": len(enriched),
             "keys": list(enriched[0].keys()) if enriched else []
@@ -213,8 +218,6 @@ def phase5_finish_and_enrich(payload: dict):
         # Convert to CSV
         from tp_enrich.csv_utils import rows_to_csv_bytes
         csv_bytes = rows_to_csv_bytes(enriched or [])
-
-        print("PHASE5_EXPORTING_ENRICHED_CSV", {"rows": len(enriched), "bytes": len(csv_bytes)})
 
         store.set_done(job_id, {"rows_scraped": len(rows), "rows_out": len(enriched or [])})
         print("PHASE5_DONE", {"job_id": job_id, "scraped": len(rows), "out": len(enriched or []), "bytes": len(csv_bytes)})
@@ -348,7 +351,11 @@ def phase5_scrape_and_enrich_csv(payload: dict):
 
     # If a job is already running, do NOT start a second Apify run
     if job.get("status") == "RUNNING":
-        raise HTTPException(status_code=409, detail=f"Phase5 job already RUNNING for this URL: {job_id}")
+        # Return JSON with job_id so frontend can poll instead of failing
+        return JSONResponse(
+            status_code=409,
+            content={"job_id": job_id, "status": "RUNNING", "detail": "Job already running; poll status endpoint."}
+        )
 
     try:
         from tp_enrich.apify_trustpilot import ApifyClient, ApifyError, _normalize_item
@@ -394,7 +401,6 @@ def phase5_scrape_and_enrich_csv(payload: dict):
 
         print("PHASE5_CALLING_PHASE4", {"rows": len(rows)})
         enriched_rows = run_phase4_exact(rows) or []
-
         print("PHASE5_PHASE4_RETURNED", {
             "rows": len(enriched_rows),
             "keys": list(enriched_rows[0].keys()) if enriched_rows else []
@@ -410,12 +416,10 @@ def phase5_scrape_and_enrich_csv(payload: dict):
             r for r in enriched_rows
             if str((r or {}).get("name_classification") or "").strip().lower() == "business"
         ]
-
         print("PHASE5_BUSINESS_FILTER", {"total": len(enriched_rows), "business": len(business_only)})
 
         df = pd.DataFrame(business_only)
         csv_bytes = df.to_csv(index=False).encode("utf-8")
-
         print("PHASE5_EXPORTING_ENRICHED_CSV", {"rows": len(business_only), "bytes": len(csv_bytes)})
 
         store.set_done(job_id, {

@@ -24,7 +24,23 @@ def _env(name: str) -> str:
 
 
 def _clean(v) -> str:
+    """Clean and extract string value from various input types."""
     if v is None:
+        return ""
+    # If actor returns objects/dicts, try common name fields
+    if isinstance(v, dict):
+        for k in ("displayName", "name", "fullName", "text", "value"):
+            if v.get(k):
+                v = v.get(k)
+                break
+        else:
+            return ""
+    # If actor returns a list, take first non-empty
+    if isinstance(v, list):
+        for it in v:
+            vv = _clean(it)
+            if vv:
+                return vv
         return ""
     s = str(v).strip()
     if s.lower() in {"nan", "none", "null"}:
