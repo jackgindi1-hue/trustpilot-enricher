@@ -1,9 +1,8 @@
 /**
- * PHASE 5 — Trustpilot URL Scraper UI Component (ONE-SHOT)
+ * PHASE 5 — Trustpilot URL Scraper UI Component
  *
- * Calls single endpoint: POST /phase5/trustpilot/scrape_and_enrich.csv
- * Returns CSV directly (no polling needed).
- * Includes Reset button to clear stuck jobs.
+ * Flow: Start job → Poll status → Download CSV when ready
+ * Fixes 409 not_ready by always polling before download.
  */
 import React, { useState } from "react";
 import config from '../config';
@@ -66,97 +65,91 @@ export function TrustpilotPhase5Panel() {
     }
 
     setBusy(true);
-    setStatusMsg("Starting Apify scrape... (this may take 2-5 minutes)");
+    const API = API_BASE.replace(/\/+$/, "");
 
     try {
-      const endpoint = `${API_BASE.replace(/\/+$/, "")}/phase5/trustpilot/scrape_and_enrich.csv`;
-      console.log("[PHASE5] Calling one-shot endpoint:", endpoint);
+      // =====================================================================
+      // STEP 1: START JOB
+      // =====================================================================
+      setStatusMsg("Starting job...");
+      console.log("[PHASE5] Starting job for:", u);
 
-      const res = await fetch(endpoint, {
+      const startRes = await fetch(`${API}/phase5/trustpilot/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: u, max_reviews: Number(maxReviews) || 5000 }),
       });
 
-      // Handle 409 (job already running) - poll status until ready
-      if (res.status === 409) {
-        const j = await res.json().catch(() => ({}));
-        const jobId = j.job_id;
+      const startData = await startRes.json().catch(() => ({}));
+      const jobId = startData.job_id;
 
-        if (!jobId) {
-          setErr(`Job already running but no job_id returned. Click "Reset" to clear it.`);
-          setBusy(false);
-          return;
-        }
+      if (!jobId) {
+        throw new Error(`Failed to start job: ${JSON.stringify(startData)}`);
+      }
 
-        console.log("[PHASE5] Got 409, polling job:", jobId);
-        setStatusMsg(`Job already running (${jobId}). Waiting for completion...`);
+      console.log("[PHASE5] Job started:", jobId, "status:", startData.status);
+      setStatusMsg(`Job started (${jobId}). Waiting for Apify scrape...`);
 
-        // Poll status endpoint until CSV ready
-        for (let i = 0; i < 300; i++) {
-          await new Promise(r => setTimeout(r, 2000));
+      // =====================================================================
+      // STEP 2: POLL STATUS UNTIL DONE
+      // =====================================================================
+      let status = startData.status || "RUNNING";
+      let pollCount = 0;
+      const maxPolls = 300; // 10 minutes at 2s intervals
 
-          try {
-            const statusEndpoint = `${API_BASE.replace(/\/+$/, "")}/phase5/trustpilot/status/${jobId}`;
-            const st = await fetch(statusEndpoint);
-            const sj = await st.json();
+      while (status === "RUNNING" || status === "CREATED") {
+        await new Promise(r => setTimeout(r, 2000));
+        pollCount++;
 
-            console.log("[PHASE5] Poll status:", sj);
+        try {
+          const statusRes = await fetch(`${API}/phase5/trustpilot/status/${jobId}`);
+          const statusData = await statusRes.json();
 
-            if (sj.status === "ERROR") {
-              throw new Error(`Phase5 failed: ${sj.error || "unknown error"}`);
-            }
+          status = statusData.status;
+          console.log("[PHASE5] Poll", pollCount, "status:", status);
 
-            if (sj.status === "DONE" && sj.csv_ready) {
-              // Download from finish endpoint
-              setStatusMsg("Job complete! Downloading CSV...");
-              const downloadEndpoint = `${API_BASE.replace(/\/+$/, "")}/phase5/trustpilot/finish_and_enrich.csv`;
-              const csvRes = await fetch(downloadEndpoint, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ job_id: jobId }),
-              });
-
-              if (!csvRes.ok) {
-                throw new Error(`Download failed: ${csvRes.status}`);
-              }
-
-              const blob = await csvRes.blob();
-              const fname = `phase5_trustpilot_enriched_${Date.now()}.csv`;
-              const a = document.createElement("a");
-              a.href = URL.createObjectURL(blob);
-              a.download = fname;
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
-              setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-
-              setStatusMsg("✅ Download complete!");
-              setBusy(false);
-              return;
-            }
-
-            setStatusMsg(`Job ${sj.status}... (poll ${i + 1}/300)`);
-          } catch (pollErr) {
-            console.error("[PHASE5] Poll error:", pollErr);
-            // Continue polling on transient errors
+          if (status === "ERROR") {
+            throw new Error(`Job failed: ${statusData.error || "unknown error"}`);
           }
+
+          if (status === "DONE") {
+            setStatusMsg("Scrape complete! Downloading enriched CSV...");
+            break;
+          }
+
+          setStatusMsg(`Scraping... (${pollCount}/${maxPolls}) Status: ${status}`);
+
+          if (pollCount >= maxPolls) {
+            throw new Error("Timed out waiting for job to complete (10 minutes)");
+          }
+        } catch (pollErr) {
+          console.error("[PHASE5] Poll error:", pollErr);
+          if (pollErr.message.includes("failed") || pollErr.message.includes("Timed out")) {
+            throw pollErr;
+          }
+          // Continue polling on transient network errors
         }
-
-        throw new Error("Timed out waiting for Phase5 CSV (10 minutes)");
       }
 
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(`Phase5 failed (${res.status}): ${text || res.statusText}`);
-      }
-
-      // Immediate CSV response (200)
+      // =====================================================================
+      // STEP 3: DOWNLOAD CSV (ONLY AFTER DONE)
+      // =====================================================================
       setStatusMsg("Downloading CSV...");
-      const blob = await res.blob();
 
-      // Download the CSV
+      const downloadRes = await fetch(`${API}/phase5/trustpilot/finish_and_enrich.csv`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: jobId }),
+      });
+
+      if (!downloadRes.ok) {
+        const text = await downloadRes.text().catch(() => "");
+        throw new Error(`Download failed (${downloadRes.status}): ${text}`);
+      }
+
+      const blob = await downloadRes.blob();
       const fname = `phase5_trustpilot_enriched_${Date.now()}.csv`;
+
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
       a.download = fname;
@@ -292,7 +285,7 @@ export function TrustpilotPhase5Panel() {
       )}
 
       <div style={{ marginTop: 8, opacity: 0.7, fontSize: 13 }}>
-        <strong>One-shot flow:</strong> Scrapes Trustpilot → Enriches with Phase 4 → Downloads businesses-only CSV.
+        <strong>Flow:</strong> Start job → Poll status → Download enriched CSV when ready.
         {busy && <div style={{ marginTop: 4, fontSize: 12, fontStyle: "italic" }}>⏱️ Large scrapes take 2-5 minutes. Keep this tab open.</div>}
         <div style={{ marginTop: 4, fontSize: 11 }}>
           <strong>Reset:</strong> Clears stuck jobs if you see "already RUNNING" error.
