@@ -144,40 +144,52 @@ class ApifyClient:
 
 def _normalize_item(item: dict, company_url: str) -> dict:
     """
-    MINIMAL NORMALIZATION - Pass through Dino actor's consumer.displayName exactly.
-    Phase 4 expects this exact field name (case-sensitive).
+    Read Dino actor FLAT keys directly (dot-keys like consumer.displayName).
+    Phase 4 expects the exact schema from CSV upload.
     """
-    # Extract reviewer from consumer.displayName (Dino actor's format)
-    consumer = item.get("consumer") or {}
+    # Dino actor output is FLAT (dot keys)
     reviewer = _clean(
-        (consumer.get("displayName") if isinstance(consumer, dict) else None)
-        or item.get("consumer.displayName")
+        item.get("consumer.displayName")
+        or item.get("consumerDisplayName")
+        or item.get("reviewerName")
+        or item.get("name")
     )
 
     # DEBUG: Log what we extracted
-    print(f"APIFY_NORMALIZE_DEBUG name={reviewer} consumer_type={type(consumer).__name__}")
+    print(f"APIFY_NORMALIZE_DEBUG name={reviewer} keys={list(item.keys())[:8]}")
 
-    # Keep other review fields as-is
+    # Dino actor date fields are also FLAT under dates.*
+    date = _clean(
+        item.get("dates.publishedDate")
+        or item.get("dates.submittedDate")
+        or item.get("dates.experiencedDate")
+        or item.get("dates.updatedDate")
+        or item.get("publishedDate")
+        or item.get("date")
+    )
+
     rating = _clean(item.get("rating") or item.get("stars") or item.get("score"))
-    date = _clean(item.get("date") or item.get("reviewDate") or item.get("publishedDate"))
     text = _clean(item.get("text") or item.get("reviewText") or item.get("content"))
 
+    review_id = _clean(item.get("id") or item.get("reviewId"))
+    if not review_id:
+        review_id = _stable_review_id(company_url, reviewer, date, rating, text)
+
     reviewed_company_name = _clean(
-        item.get("companyName")
+        item.get("basicBusinessInfo.displayName")
+        or item.get("basicBusinessInfoDisplayName")
+        or item.get("companyName")
         or item.get("businessName")
         or item.get("company")
     )
 
-    review_id = _clean(item.get("reviewId") or item.get("id"))
-    if not review_id:
-        review_id = _stable_review_id(company_url, reviewer, date, rating, text)
-
-    # Return row with EXACT field Phase 4 expects (case-sensitive)
-    # DO NOT set consumer.displayname (lowercase n) anywhere
+    # IMPORTANT:
+    # - Keep EXACT casing "consumer.displayName" (Phase 4 CSV-upload schema)
+    # - Do NOT create "consumer.displayname" (lowercase n) anywhere
     return {
         "source_platform": "trustpilot",
 
-        # ✅ EXACT FIELD PHASE 4 EXPECTS (case-sensitive)
+        # Phase 4 expects this exact header (case-sensitive)
         "consumer.displayName": reviewer,
 
         # safe aliases
@@ -185,9 +197,11 @@ def _normalize_item(item: dict, company_url: str) -> dict:
         "company_search_name": reviewer,
         "name": reviewer,
 
-        # review context
+        # context
         "reviewed_company_url": company_url,
         "reviewed_company_name": reviewed_company_name,
+
+        # review fields
         "review_date": date,
         "review_rating": rating,
         "review_text": text,
