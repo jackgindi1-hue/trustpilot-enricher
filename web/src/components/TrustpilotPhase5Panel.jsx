@@ -1,41 +1,26 @@
 /**
- * PHASE 5 — Trustpilot URL Scraper UI Component
+ * PHASE 5 — Trustpilot URL Scraper UI Component (ONE-SHOT)
  *
- * Provides a simple input panel for:
- * - Trustpilot company URL
- * - Max reviews to scrape
- * - One-click: Scrape → Enrich → Download CSV
- *
- * Usage:
- * import { TrustpilotPhase5Panel } from './components/TrustpilotPhase5Panel';
- *
- * <TrustpilotPhase5Panel />
+ * Calls single endpoint: POST /phase5/trustpilot/scrape_and_enrich.csv
+ * Returns CSV directly (no polling needed).
  */
 import React, { useState } from "react";
 import config from '../config';
-// PHASE 5 HOTFIX: Force direct Railway backend connection (bypass Netlify proxy)
+
+// API base URL (same as CSV upload flow)
 const API_BASE =
-  (window && window.__API_BASE_URL__) ||
-  (typeof import.meta !== "undefined" &&
-    import.meta.env &&
-    import.meta.env.VITE_API_BASE_URL) ||
-  (typeof process !== "undefined" &&
-    process.env &&
-    (process.env.REACT_APP_API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL)) ||
+  (typeof window !== "undefined" && window.__API_BASE__) ||
+  (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_BASE_URL) ||
   config.API_BASE_URL || "";
-function apiUrl(path) {
-  if (!API_BASE) return path;
-  return `${API_BASE.replace(/\/+$/, "")}/${String(path).replace(/^\/+/, "")}`;
-}
+
 export function TrustpilotPhase5Panel() {
   const [url, setUrl] = useState("");
   const [maxReviews, setMaxReviews] = useState(5000);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [statusMsg, setStatusMsg] = useState("");
-  const [activeJobId, setActiveJobId] = useState(null);
+
   async function run() {
-    if (busy) return; // CRITICAL: Prevent double-fire
     setErr("");
     setStatusMsg("");
     const u = (url || "").trim();
@@ -43,79 +28,55 @@ export function TrustpilotPhase5Panel() {
       setErr("Paste a Trustpilot company URL.");
       return;
     }
+
     setBusy(true);
+    setStatusMsg("Starting Apify scrape... (this may take 2-5 minutes)");
+
     try {
-      // PHASE 5 FIX: Async job flow (prevents multiple Apify re-runs)
-      // Step 1: Start job
-      const startEndpoint = apiUrl("/phase5/trustpilot/start");
-      console.log("[PHASE5] Starting job:", startEndpoint);
-      setStatusMsg("Starting job...");
-      const startRes = await fetch(startEndpoint, {
+      const endpoint = `${API_BASE.replace(/\/+$/, "")}/phase5/trustpilot/scrape_and_enrich.csv`;
+      console.log("[PHASE5] Calling one-shot endpoint:", endpoint);
+
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          urls: [u],
-          max_reviews_per_company: Number(maxReviews) || 5000
-        })
+        body: JSON.stringify({ url: u, max_reviews: Number(maxReviews) || 5000 }),
       });
-      if (!startRes.ok) {
-        throw new Error(`Start failed: ${startRes.status}`);
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`Phase5 failed (${res.status}): ${text || res.statusText}`);
       }
-      const { job_id } = await startRes.json();
-      setActiveJobId(job_id); // Store to prevent re-start
-      console.log("[PHASE5] Job started:", job_id);
-      // Step 2: Poll job status
-      let lastProgress = "";
-      while (true) {
-        await new Promise(r => setTimeout(r, 1500)); // Poll every 1.5s
-        const statusEndpoint = apiUrl(`/phase5/trustpilot/status/${job_id}`);
-        const stRes = await fetch(statusEndpoint);
-        if (!stRes.ok) {
-          throw new Error(`Status check failed: ${stRes.status}`);
-        }
-        const st = await stRes.json();
-        console.log("[PHASE5] Job status:", st);
-        // Update status message based on progress
-        if (st.progress !== lastProgress) {
-          lastProgress = st.progress;
-          if (st.progress === "scraping") {
-            setStatusMsg("Scraping Trustpilot reviews...");
-          } else if (st.progress === "enriching") {
-            setStatusMsg(`Enriching ${st.row_count_scraped} reviews with business data...`);
-          } else if (st.progress === "csv") {
-            setStatusMsg("Preparing CSV download...");
-          }
-        }
-        // Check for completion or error
-        if (st.status === "error") {
-          throw new Error(st.error || "Job failed");
-        }
-        if (st.status === "done") {
-          console.log("[PHASE5] Job complete!");
-          break;
-        }
-      }
-      // Step 3: Download CSV (direct download - more reliable than blob)
+
       setStatusMsg("Downloading CSV...");
-      console.log("[PHASE5] Initiating download for job:", job_id);
-      // PHASE 5 FIX: Use direct URL navigation instead of blob (more reliable)
-      const downloadUrl = apiUrl(`/phase5/trustpilot/download/${job_id}`);
-      window.location.href = downloadUrl;
-      setStatusMsg("✅ Download started!");
-      setActiveJobId(null); // Clear on success
-      // Success - clear URL after delay
+      const blob = await res.blob();
+
+      // Download the CSV
+      const fname = `phase5_trustpilot_enriched_${Date.now()}.csv`;
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+
+      setStatusMsg("✅ Download complete!");
+      console.log("[PHASE5] CSV downloaded:", fname);
+
+      // Clear form after success
       setTimeout(() => {
         setUrl("");
         setStatusMsg("");
-      }, 2000);
+      }, 3000);
+
     } catch (e) {
       console.error("[PHASE5] Error:", e);
       setErr(e?.message || "Failed.");
-      setActiveJobId(null); // Clear on error too
     } finally {
       setBusy(false);
     }
   }
+
   return (
     <div
       style={{
@@ -127,7 +88,7 @@ export function TrustpilotPhase5Panel() {
       }}
     >
       <div style={{ fontWeight: 700, marginBottom: 8, fontSize: 16 }}>
-        📊 Phase 5 — Trustpilot URL → Scrape → Enrich → CSV
+        Phase 5 — Trustpilot URL → Scrape → Enrich → CSV
       </div>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
         <input
@@ -176,21 +137,23 @@ export function TrustpilotPhase5Panel() {
           {busy ? "Running..." : "Run"}
         </button>
       </div>
-      {statusMsg ? (
+
+      {statusMsg && (
         <div
           style={{
             marginTop: 10,
             padding: 10,
             borderRadius: 8,
-            backgroundColor: "rgba(59, 130, 246, 0.1)",
-            color: "#1e40af",
+            backgroundColor: statusMsg.includes("✅") ? "rgba(34, 197, 94, 0.1)" : "rgba(59, 130, 246, 0.1)",
+            color: statusMsg.includes("✅") ? "#166534" : "#1e40af",
             fontSize: 13
           }}
         >
-          ℹ️ {statusMsg}
+          {statusMsg}
         </div>
-      ) : null}
-      {err ? (
+      )}
+
+      {err && (
         <div
           style={{
             marginTop: 10,
@@ -202,11 +165,12 @@ export function TrustpilotPhase5Panel() {
             fontSize: 13
           }}
         >
-          ❌ {err}
+          {err}
         </div>
-      ) : null}
+      )}
+
       <div style={{ marginTop: 8, opacity: 0.7, fontSize: 13 }}>
-        ✨ <strong>New:</strong> Scrapes Trustpilot reviews via Apify Dino, enriches with Phase 4, downloads one CSV. Phase 4 logic remains locked.
+        <strong>One-shot flow:</strong> Scrapes Trustpilot → Enriches with Phase 4 → Downloads businesses-only CSV.
         {busy && <div style={{ marginTop: 4, fontSize: 12, fontStyle: "italic" }}>⏱️ Large scrapes take 2-5 minutes. Keep this tab open.</div>}
       </div>
     </div>
