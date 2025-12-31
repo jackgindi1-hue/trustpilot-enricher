@@ -66,7 +66,7 @@ async function safeDownloadCsv(url, filename, maxRetries = 10) {
       const txt = await res.text().catch(() => "");
       console.log(`[Download] 409 not_ready (attempt ${attempt}/${maxRetries}):`, txt);
       if (attempt < maxRetries) {
-        await new Promise(r => setTimeout(r, 1500)); // Wait 1.5s before retry
+        await new Promise(r => setTimeout(r, 1500));
         continue;
       }
       throw new Error(`Download not ready after ${maxRetries} attempts: ${txt.slice(0, 200)}`);
@@ -76,18 +76,16 @@ async function safeDownloadCsv(url, filename, maxRetries = 10) {
       const txt = await res.text().catch(() => "");
       throw new Error(`Download failed: ${res.status} ${txt.slice(0, 200)}`);
     }
-    
     // refuse JSON downloads
     if (ct.includes("application/json")) {
       const txt = await res.text().catch(() => "");
       throw new Error(`Refusing JSON as CSV: ${txt.slice(0, 200)}`);
     }
-    
     const buf = await res.arrayBuffer();
     const head = new TextDecoder("utf-8").decode(buf.slice(0, 64)).trim();
     if (looksLikeJsonText(head)) throw new Error(`Refusing JSON-looking content: ${head}`);
     await downloadArrayBufferAsCsv(buf, filename);
-    return; // Success
+    return;
   }
 }
 
