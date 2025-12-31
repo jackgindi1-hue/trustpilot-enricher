@@ -195,9 +195,12 @@ def phase5_finish_and_enrich(payload: dict):
 
         print("PHASE5_SCRAPED", {"job_id": job_id, "rows": len(rows)})
 
-        # Hand to Phase4 pipeline via bridge
-        from tp_enrich.phase5_bridge import call_phase4_enrich_rows
-        enriched = call_phase4_enrich_rows(rows)
+        # =====================================================================
+        # CRITICAL: Call the EXACT SAME function as CSV upload
+        # This is run_pipeline() via phase4_entrypoint.py
+        # =====================================================================
+        from tp_enrich.phase4_entrypoint import run_phase4_exact
+        enriched = run_phase4_exact(rows) or []
 
         print("PHASE5_ENRICHED", {"job_id": job_id, "rows": len(enriched or [])})
 
@@ -371,16 +374,23 @@ def phase5_scrape_and_enrich_csv(payload: dict):
 
         print("PHASE5_APIFY_DONE", {"job_id": job_id, "rows": len(rows)})
 
-        # Call the SAME Phase 4 pipeline wrapper
-        from tp_enrich.pipeline import enrich_rows
-        enriched = enrich_rows(rows) or []
+        # =====================================================================
+        # CRITICAL: Call the EXACT SAME function as CSV upload
+        # This is run_pipeline() via phase4_entrypoint.py
+        # NO NEW LOGIC. NO FILTERING. SAME FUNCTION. SAME BEHAVIOR.
+        # =====================================================================
+        from tp_enrich.phase4_entrypoint import run_phase4_exact
+        enriched = run_phase4_exact(rows) or []
 
         print("PHASE5_ENRICH_DONE", {"job_id": job_id, "enriched": len(enriched)})
 
-        # BUSINESS ONLY FILTER
+        # =====================================================================
+        # BUSINESS ONLY FILTER — same logic as CSV upload would use
+        # Filters by name_classification field set by run_pipeline()
+        # =====================================================================
         business_only = [
             r for r in enriched
-            if str((r or {}).get("name_classification") or "").lower() == "business"
+            if str((r or {}).get("name_classification") or "").strip().lower() == "business"
         ]
 
         print("PHASE5_BUSINESS_FILTER", {"job_id": job_id, "total": len(enriched), "business": len(business_only)})
