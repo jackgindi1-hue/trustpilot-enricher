@@ -239,6 +239,35 @@ def phase5_download(job_id: str):
 
 
 # ============================================================================
+# RESET ENDPOINT (clear stuck RUNNING jobs)
+# ============================================================================
+
+@phase5_router.post("/trustpilot/reset")
+def phase5_reset(payload: dict):
+    """
+    Reset a stuck RUNNING job so a new run can proceed.
+
+    payload: { "url": "https://www.trustpilot.com/review/wayflyer.com" }
+
+    Marks any stuck RUNNING job for that URL as ERROR.
+    """
+    url = ((payload or {}).get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url missing")
+
+    store = _require_phase5_db()
+    job_id, job = store.get_or_create_job(url)
+
+    # If it's stuck RUNNING, force clear it
+    if (job.get("status") or "") == "RUNNING":
+        store.set_error(job_id, "manual_reset_from_ui")
+        print("PHASE5_RESET", {"job_id": job_id, "prev_status": "RUNNING", "new_status": "ERROR"})
+        return JSONResponse({"ok": True, "job_id": job_id, "prev_status": "RUNNING", "new_status": "ERROR"})
+
+    return JSONResponse({"ok": True, "job_id": job_id, "status": job.get("status"), "message": "Job not stuck"})
+
+
+# ============================================================================
 # SYNC ENDPOINTS (legacy - may timeout on large scrapes)
 # ============================================================================
 
