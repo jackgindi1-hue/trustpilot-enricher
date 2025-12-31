@@ -3,6 +3,7 @@
  *
  * Calls single endpoint: POST /phase5/trustpilot/scrape_and_enrich.csv
  * Returns CSV directly (no polling needed).
+ * Includes Reset button to clear stuck jobs.
  */
 import React, { useState } from "react";
 import config from '../config';
@@ -17,8 +18,43 @@ export function TrustpilotPhase5Panel() {
   const [url, setUrl] = useState("");
   const [maxReviews, setMaxReviews] = useState(5000);
   const [busy, setBusy] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [err, setErr] = useState("");
   const [statusMsg, setStatusMsg] = useState("");
+
+  // Reset stuck job
+  async function resetJob() {
+    const u = (url || "").trim();
+    if (!u) {
+      setErr("Paste a Trustpilot URL first.");
+      return;
+    }
+
+    setResetting(true);
+    setErr("");
+    setStatusMsg("Resetting stuck job...");
+
+    try {
+      const endpoint = `${API_BASE.replace(/\/+$/, "")}/phase5/trustpilot/reset`;
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: u }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (data.prev_status === "RUNNING") {
+        setStatusMsg("✅ Stuck job cleared! You can now click Run.");
+      } else {
+        setStatusMsg(`Job status: ${data.status || "unknown"}. Try clicking Run.`);
+      }
+    } catch (e) {
+      setErr("Reset failed: " + (e?.message || "Unknown error"));
+    } finally {
+      setResetting(false);
+    }
+  }
 
   async function run() {
     setErr("");
@@ -41,6 +77,14 @@ export function TrustpilotPhase5Panel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: u, max_reviews: Number(maxReviews) || 5000 }),
       });
+
+      // Handle 409 (job already running) - offer to reset
+      if (res.status === 409) {
+        const text = await res.text().catch(() => "");
+        setErr(`Job stuck as RUNNING. Click "Reset" to clear it, then try again.\n\nDetails: ${text}`);
+        setBusy(false);
+        return;
+      }
 
       if (!res.ok) {
         const text = await res.text().catch(() => "");
@@ -102,7 +146,7 @@ export function TrustpilotPhase5Panel() {
             border: "1px solid rgba(0,0,0,0.15)",
             fontSize: 14
           }}
-          disabled={busy}
+          disabled={busy || resetting}
         />
         <input
           value={maxReviews}
@@ -111,30 +155,47 @@ export function TrustpilotPhase5Panel() {
           min={1}
           max={5000}
           style={{
-            width: 140,
+            width: 100,
             padding: 10,
             borderRadius: 10,
             border: "1px solid rgba(0,0,0,0.15)",
             fontSize: 14
           }}
-          disabled={busy}
+          disabled={busy || resetting}
           title="Max reviews (cap 5000)"
         />
         <button
           onClick={run}
-          disabled={busy}
+          disabled={busy || resetting}
           style={{
             padding: "10px 20px",
             borderRadius: 10,
             border: "none",
-            cursor: busy ? "not-allowed" : "pointer",
-            backgroundColor: busy ? "#ccc" : "#007bff",
+            cursor: (busy || resetting) ? "not-allowed" : "pointer",
+            backgroundColor: (busy || resetting) ? "#ccc" : "#007bff",
             color: "white",
             fontWeight: 600,
             fontSize: 14
           }}
         >
           {busy ? "Running..." : "Run"}
+        </button>
+        <button
+          onClick={resetJob}
+          disabled={busy || resetting}
+          style={{
+            padding: "10px 16px",
+            borderRadius: 10,
+            border: "1px solid #dc3545",
+            cursor: (busy || resetting) ? "not-allowed" : "pointer",
+            backgroundColor: resetting ? "#ccc" : "white",
+            color: "#dc3545",
+            fontWeight: 600,
+            fontSize: 14
+          }}
+          title="Clear stuck job for this URL"
+        >
+          {resetting ? "Resetting..." : "Reset"}
         </button>
       </div>
 
@@ -172,6 +233,9 @@ export function TrustpilotPhase5Panel() {
       <div style={{ marginTop: 8, opacity: 0.7, fontSize: 13 }}>
         <strong>One-shot flow:</strong> Scrapes Trustpilot → Enriches with Phase 4 → Downloads businesses-only CSV.
         {busy && <div style={{ marginTop: 4, fontSize: 12, fontStyle: "italic" }}>⏱️ Large scrapes take 2-5 minutes. Keep this tab open.</div>}
+        <div style={{ marginTop: 4, fontSize: 11 }}>
+          <strong>Reset:</strong> Clears stuck jobs if you see "already RUNNING" error.
+        </div>
       </div>
     </div>
   );
