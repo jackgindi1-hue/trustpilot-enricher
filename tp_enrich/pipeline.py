@@ -1055,42 +1055,130 @@ def run_pipeline(
     logger.info("="*60)
     return stats
 
+# ============================================================================
+# PHASE 5 CRITICAL FIX: Sanitize rows before passing to Phase 4
+# ============================================================================
+
+def _p5_blank(v) -> bool:
+    """Check if value is blank/NA/null."""
+    if v is None:
+        return True
+    try:
+        s = str(v).strip()
+    except Exception:
+        return True
+    if s == "":
+        return True
+    if s.lower() in {"<na>", "na", "nan", "none", "null"}:
+        return True
+    return False
+
+
+def _p5_pick_name(r: dict) -> str:
+    """Pick name from row, checking all possible sources."""
+    candidates = [
+        r.get("name"),
+        r.get("company_search_name"),
+        r.get("raw_display_name"),
+        r.get("consumer.displayname"),
+        r.get("reviewerName"),
+        r.get("reviewer"),
+        r.get("author"),
+        r.get("userName"),
+    ]
+    consumer = r.get("consumer")
+    if isinstance(consumer, dict):
+        candidates.insert(0, consumer.get("displayname"))
+        candidates.insert(0, consumer.get("displayName"))
+    for c in candidates:
+        if not _p5_blank(c):
+            return str(c).strip()
+    return ""
+
+
+def _p5_pick_row_id(r: dict) -> str:
+    """Pick row_id from row, with deterministic fallback."""
+    import hashlib as _hs
+    for k in ("row_id", "review_id", "reviewId", "id"):
+        v = r.get(k)
+        if not _p5_blank(v):
+            return str(v).strip()
+    # deterministic fallback (prevents None)
+    base = "|".join([
+        str(r.get("reviewed_company_url") or r.get("company_url") or "").strip(),
+        str(r.get("review_date") or r.get("date") or "").strip(),
+        str(r.get("review_rating") or "").strip(),
+        str((r.get("review_text") or "")[:200]),
+    ])
+    return _hs.sha256(base.encode("utf-8")).hexdigest()[:24]
+
 
 def enrich_rows(rows: list) -> list:
     """
     PHASE 5 BRIDGE: Enrich in-memory rows (for Apify Trustpilot scraper).
-    
-    This is a thin wrapper that routes Phase 5 rows through the SAME
-    Phase 4 enrichment logic used by CSV uploads, without modifying
-    Phase 4 behavior.
-    
+
+    CRITICAL: Sanitizes input rows so Phase 4 NEVER receives name=<NA>/row_id=None.
+    This fixes the garbage anchor discovery (whitepages/411) and blank CSV issues.
+
     Args:
         rows: List of dicts from Apify scraper (Trustpilot reviews)
-        
+
     Returns:
         List of dicts with enrichment columns added
     """
     import tempfile
     import os
-    
+
     logger.info("PHASE5_BRIDGE enrich_rows called with %s rows", len(rows))
-    
+
     if not rows:
         return []
-    
+
+    # PHASE 5 CRITICAL FIX: Sanitize rows before passing to Phase 4
+    cleaned = []
+    for r in (rows or []):
+        rr = dict(r or {})
+
+        name = _p5_pick_name(rr)
+        if _p5_blank(name):
+            # Drop truly nameless rows (prevents garbage anchor discovery)
+            continue
+
+        rr["name"] = name
+        rr["raw_display_name"] = rr.get("raw_display_name") if not _p5_blank(rr.get("raw_display_name")) else name
+        rr["consumer.displayname"] = rr.get("consumer.displayname") if not _p5_blank(rr.get("consumer.displayname")) else name
+        rr["company_search_name"] = rr.get("company_search_name") if not _p5_blank(rr.get("company_search_name")) else name
+
+        # CSV upload has "date" column; ensure it exists
+        if _p5_blank(rr.get("date")) and not _p5_blank(rr.get("review_date")):
+            rr["date"] = str(rr.get("review_date")).strip()
+
+        rr["row_id"] = _p5_pick_row_id(rr)
+        rr["run_id"] = rr.get("run_id") if not _p5_blank(rr.get("run_id")) else "phase5_apify"
+
+        cleaned.append(rr)
+
+    logger.info("PIPELINE_DEBUG_IN_OUT in=%s out=%s", len(rows or []), len(cleaned))
+    if cleaned:
+        logger.info("PIPELINE_DEBUG_FIRST name=%s row_id=%s", cleaned[0].get("name"), cleaned[0].get("row_id"))
+
+    if not cleaned:
+        logger.warning("PHASE5_BRIDGE: All rows had blank names, returning empty")
+        return []
+
     # Create temp files for in-memory enrichment
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "phase5_input.csv")
         output_path = os.path.join(tmpdir, "phase5_output.csv")
         cache_path = os.path.join(tmpdir, "phase5_cache.json")
-        
-        # Convert rows to DataFrame
+
+        # Convert CLEANED rows to DataFrame
         import pandas as pd
-        df = pd.DataFrame(rows)
-        
+        df = pd.DataFrame(cleaned)
+
         # Write to temp CSV
         df.to_csv(input_path, index=False, encoding='utf-8')
-        
+
         # Run the SAME Phase 4 pipeline
         try:
             stats = run_pipeline(
@@ -1103,10 +1191,10 @@ def enrich_rows(rows: list) -> list:
         except Exception as e:
             logger.error("PHASE5_BRIDGE enrichment failed: %s", str(e))
             raise
-        
+
         # Read enriched CSV back to rows
         enriched_df = pd.read_csv(output_path, encoding='utf-8')
         enriched_rows = enriched_df.to_dict('records')
-        
+
         logger.info("PHASE5_BRIDGE returning %s enriched rows", len(enriched_rows))
         return enriched_rows

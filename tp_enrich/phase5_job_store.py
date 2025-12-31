@@ -15,9 +15,10 @@ from typing import Optional, Dict, Any, Tuple
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
 
-def _idem_key(url: str, max_reviews: int) -> str:
-    """Generate idempotency key from URL and max_reviews."""
-    base = f"{url.strip()}|{int(max_reviews)}"
+def _idem_key(url: str, max_reviews: int = 0) -> str:
+    """Generate idempotency key from URL ONLY (ignore max_reviews for stability)."""
+    # URL ONLY -> stable across UI retries / missing fields / different max_reviews
+    base = f"{(url or '').strip()}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:24]
 
 
