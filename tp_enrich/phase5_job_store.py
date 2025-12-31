@@ -1,10 +1,10 @@
 """
-PHASE 5 JOB STORE (Postgres-backed)
+PHASE 5 JOB STORE (Postgres-backed, NO FALLBACK)
 
-Ensures ONLY ONE Apify run is started per (trustpilot_url, max_reviews) request,
-even across multiple instances. Stores job + apify_run_id in Postgres.
+Ensures ONLY ONE Apify run is started per URL, even across multiple instances.
+If DATABASE_URL/psycopg2 missing, Phase 5 must not run (prevents duplicate Apify runs).
 
-REQUIREMENT: DATABASE_URL environment variable must be set in Railway.
+REQUIREMENT: DATABASE_URL environment variable must be set on Trustpilot-Enricher service.
 """
 import os
 import json
@@ -15,10 +15,9 @@ from typing import Optional, Dict, Any, Tuple
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
 
-def _idem_key(url: str, max_reviews: int = 0) -> str:
-    """Generate idempotency key from URL ONLY (ignore max_reviews for stability)."""
-    # URL ONLY -> stable across UI retries / missing fields / different max_reviews
-    base = f"{(url or '').strip()}"
+def _idem_key(url: str) -> str:
+    """URL-only idempotency so retries/max_reviews changes don't create new jobs."""
+    base = (url or "").strip()
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:24]
 
 
@@ -29,17 +28,23 @@ def _now() -> float:
 
 class Phase5JobStore:
     """
-    Minimal Postgres-backed job store using psycopg2.
-    This MUST be shared across instances to prevent double Apify runs.
+    Postgres-backed shared job store. NO FALLBACK.
+    If DATABASE_URL/psycopg2 missing, Phase 5 must not run (prevents duplicate Apify runs).
     """
 
     def __init__(self):
         if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL missing (Phase5 requires shared Postgres for idempotency)")
+            raise RuntimeError(
+                "DATABASE_URL missing on Trustpilot-Enricher service "
+                "(Phase5 requires Postgres; no fallback). "
+                "Add DATABASE_URL variable from your Postgres plugin."
+            )
         try:
             import psycopg2  # type: ignore
         except Exception as e:
-            raise RuntimeError("psycopg2 is required for Phase5 idempotency. Add it to requirements.txt") from e
+            raise RuntimeError(
+                "psycopg2-binary missing. Add psycopg2-binary==2.9.9 to requirements.txt"
+            ) from e
         self.psycopg2 = psycopg2
 
     def _conn(self):
@@ -52,7 +57,6 @@ class Phase5JobStore:
             job_id TEXT PRIMARY KEY,
             idem_key TEXT UNIQUE NOT NULL,
             url TEXT NOT NULL,
-            max_reviews INTEGER NOT NULL,
             status TEXT NOT NULL,
             apify_run_id TEXT,
             created_at DOUBLE PRECISION NOT NULL,
@@ -70,7 +74,7 @@ class Phase5JobStore:
     def get_by_job_id(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Load job by job_id."""
         q = """
-        SELECT job_id, idem_key, url, max_reviews, status, apify_run_id,
+        SELECT job_id, idem_key, url, status, apify_run_id,
                created_at, updated_at, error, meta_json
         FROM phase5_jobs WHERE job_id=%s
         """
@@ -84,55 +88,40 @@ class Phase5JobStore:
             "job_id": row[0],
             "idem_key": row[1],
             "url": row[2],
-            "max_reviews": row[3],
-            "status": row[4],
-            "apify_run_id": row[5],
-            "created_at": row[6],
-            "updated_at": row[7],
-            "error": row[8],
-            "meta": json.loads(row[9]) if row[9] else {},
+            "status": row[3],
+            "apify_run_id": row[4],
+            "created_at": row[5],
+            "updated_at": row[6],
+            "error": row[7],
+            "meta": json.loads(row[8]) if row[8] else {},
         }
 
-    def get_or_create_job(self, url: str, max_reviews: int) -> Tuple[str, Dict[str, Any]]:
+    def get_or_create_job(self, url: str) -> Tuple[str, Dict[str, Any]]:
         """
-        Idempotent: if a job already exists for same (url,max_reviews) return it.
+        Idempotent: if a job already exists for same URL, return it.
         Otherwise create a new job row with status=CREATED.
         """
-        url = url.strip()
-        max_reviews = int(max_reviews)
-        idem = _idem_key(url, max_reviews)
+        url = (url or "").strip()
+        idem = _idem_key(url)
         now = _now()
-
-        # deterministic job_id derived from idem_key (so it's stable even if request retries)
         job_id = f"p5_{idem}"
 
         with self._conn() as conn:
             with conn.cursor() as cur:
-                # Try insert; on conflict return existing
                 cur.execute(
                     """
-                    INSERT INTO phase5_jobs(job_id, idem_key, url, max_reviews, status, created_at, updated_at, meta_json)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                    INSERT INTO phase5_jobs(job_id, idem_key, url, status, created_at, updated_at, meta_json)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (idem_key) DO NOTHING
                     """,
-                    (job_id, idem, url, max_reviews, "CREATED", now, now, json.dumps({})),
+                    (job_id, idem, url, "CREATED", now, now, json.dumps({})),
                 )
-                conn.commit()
+            conn.commit()
 
-        existing = self.get_by_job_id(job_id)
-        if not existing:
-            # Fallback: load by idem_key if job_id differs for some reason
-            with self._conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT job_id FROM phase5_jobs WHERE idem_key=%s", (idem,))
-                    r = cur.fetchone()
-            if r:
-                existing = self.get_by_job_id(r[0])
-
-        if not existing:
-            raise RuntimeError("Failed to create or load Phase5 job row")
-
-        return existing["job_id"], existing
+        job = self.get_by_job_id(job_id)
+        if not job:
+            raise RuntimeError("Phase5 job create/load failed")
+        return job_id, job
 
     def set_running(self, job_id: str, apify_run_id: str) -> None:
         """Mark job as running with Apify run ID."""

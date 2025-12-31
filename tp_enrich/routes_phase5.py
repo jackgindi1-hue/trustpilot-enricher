@@ -25,39 +25,29 @@ _start_lock = threading.Lock()
 
 
 # ============================================================================
-# POSTGRES JOB STORE INITIALIZATION
+# POSTGRES JOB STORE INITIALIZATION (NO FALLBACK)
 # ============================================================================
 
 def _get_store():
-    """Get job store (with graceful fallback to in-memory if no DATABASE_URL)."""
-    import os
-    if os.getenv("DATABASE_URL"):
-        from tp_enrich.phase5_job_store import Phase5JobStore
-        return Phase5JobStore()
-    else:
-        # Fallback to in-memory store (less reliable but works for single instance)
-        return None
+    """
+    Get Postgres job store. NO FALLBACK.
+    Phase 5 requires Postgres for idempotency - prevents duplicate Apify runs.
+    """
+    from tp_enrich.phase5_job_store import Phase5JobStore
+    return Phase5JobStore()
 
 
 @phase5_router.on_event("startup")
 def _phase5_startup():
-    """Initialize Postgres schema on startup."""
+    """Initialize Postgres schema on startup. HARD FAIL if not available."""
     try:
         store = _get_store()
-        if store:
-            store.ensure_schema()
-            print("PHASE5_JOBSTORE_READY (Postgres)")
-        else:
-            print("PHASE5_JOBSTORE_FALLBACK (in-memory, set DATABASE_URL for multi-instance)")
+        store.ensure_schema()
+        print("PHASE5_JOBSTORE_READY (Postgres)")
     except Exception as e:
+        # HARD FAIL - Phase 5 cannot work without Postgres
         print("PHASE5_JOBSTORE_ERROR", str(e))
-
-
-# ============================================================================
-# IN-MEMORY FALLBACK (for single instance without Postgres)
-# ============================================================================
-
-from tp_enrich.phase5_jobs import create_job as mem_create_job, get_job as mem_get_job
+        print("PHASE5_DISABLED - Add DATABASE_URL to Trustpilot-Enricher service")
 
 
 # ============================================================================
@@ -94,57 +84,52 @@ def phase5_start(req: Phase5StartReq):
     if not url:
         raise HTTPException(status_code=400, detail="url is required")
 
-    store = _get_store()
+    # ========== POSTGRES ONLY (NO FALLBACK) ==========
+    try:
+        store = _get_store()
+        store.ensure_schema()
+    except Exception as e:
+        print("PHASE5_START_ERROR", str(e))
+        raise HTTPException(
+            status_code=503,
+            detail=f"Phase5 requires Postgres. Add DATABASE_URL to Trustpilot-Enricher service. Error: {e}"
 
-    # ========== POSTGRES PATH (multi-instance safe) ==========
-    if store:
+    # Create or load existing job (idempotent - URL only)
+    job_id, job = store.get_or_create_job(url)
+
+    # If already running/done, do NOT start another Apify run
+    if job["status"] in {"RUNNING", "DONE"}:
+        print("PHASE5_START_IDEMPOTENT", {"job_id": job_id, "status": job["status"], "apify_run_id": job.get("apify_run_id")})
+        return JSONResponse({"job_id": job_id, "status": job["status"]})
+
+    # Only one instance should pass this point
+    with _start_lock:
+        # Re-read after lock
+        job2 = store.get_by_job_id(job_id) or job
+        if job2["status"] in {"RUNNING", "DONE"}:
+            print("PHASE5_START_IDEMPOTENT_AFTER_LOCK", {"job_id": job_id, "status": job2["status"]})
+            return JSONResponse({"job_id": job_id, "status": job2["status"]})
+
+        # Start Apify run ONCE
         try:
-            store.ensure_schema()
+            from tp_enrich.apify_trustpilot import ApifyClient
+            client = ApifyClient()
+
+            actor_input = {
+                "start_url": [{"url": url}],
+                "num": int(max_reviews),
+            }
+
+            run = client.start_run(actor_input)
+            apify_run_id = run["id"]
+            store.set_running(job_id, apify_run_id)
+
+            print("PHASE5_APIFY_STARTED", {"job_id": job_id, "apify_run_id": apify_run_id, "url": url, "max_reviews": max_reviews})
+            return JSONResponse({"job_id": job_id, "status": "RUNNING"})
+
         except Exception as e:
-            print("PHASE5_SCHEMA_ERROR", str(e))
-
-        # Create or load existing job (idempotent)
-        job_id, job = store.get_or_create_job(url, max_reviews)
-
-        # If already running/done, do NOT start another Apify run
-        if job["status"] in {"RUNNING", "DONE"}:
-            print("PHASE5_START_IDEMPOTENT", {"job_id": job_id, "status": job["status"], "apify_run_id": job.get("apify_run_id")})
-            return JSONResponse({"job_id": job_id, "status": job["status"]})
-
-        # Only one instance should pass this point
-        with _start_lock:
-            # Re-read after lock
-            job2 = store.get_by_job_id(job_id) or job
-            if job2["status"] in {"RUNNING", "DONE"}:
-                print("PHASE5_START_IDEMPOTENT_AFTER_LOCK", {"job_id": job_id, "status": job2["status"]})
-                return JSONResponse({"job_id": job_id, "status": job2["status"]})
-
-            # Start Apify run ONCE
-            try:
-                from tp_enrich.apify_trustpilot import ApifyClient
-                client = ApifyClient()
-
-                actor_input = {
-                    "start_url": [{"url": url}],
-                    "num": int(max_reviews),
-                }
-
-                run = client.start_run(actor_input)
-                apify_run_id = run["id"]
-                store.set_running(job_id, apify_run_id)
-
-                print("PHASE5_APIFY_STARTED", {"job_id": job_id, "apify_run_id": apify_run_id, "url": url, "max_reviews": max_reviews})
-                return JSONResponse({"job_id": job_id, "status": "RUNNING"})
-
-            except Exception as e:
-                store.set_error(job_id, f"start_failed: {e}")
-                raise HTTPException(status_code=500, detail=f"Phase5 start failed: {e}")
-
-    # ========== IN-MEMORY FALLBACK (single instance only) ==========
-    else:
-        job_id = mem_create_job([url], max_reviews)
-        print("PHASE5_START_MEMORY", {"job_id": job_id, "url": url, "max_reviews": max_reviews})
-        return JSONResponse({"job_id": job_id, "status": "queued"})
+            store.set_error(job_id, f"start_failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Phase5 start failed: {e}")
 
 
 # ============================================================================
@@ -161,42 +146,21 @@ def phase5_status(job_id: str):
     Returns:
         {"job_id": "...", "status": "CREATED|RUNNING|DONE|ERROR", "apify_run_id": "...", "error": "..."}
     """
-    store = _get_store()
+    try:
+        store = _get_store()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Phase5 requires Postgres: {e}")
 
-    if store:
-        job = store.get_by_job_id(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Unknown job_id")
-        return JSONResponse({
-            "job_id": job_id,
-            "status": job["status"],
-            "apify_run_id": job.get("apify_run_id"),
-            "error": job.get("error"),
-            "meta": job.get("meta", {}),
-        })
-    else:
-        # In-memory fallback
-        job = mem_get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Unknown job_id")
-        # Map in-memory status to Postgres status format
-        status = job.get("status", "").upper()
-        if status == "QUEUED":
-            status = "CREATED"
-        elif status == "RUNNING":
-            status = "RUNNING"
-        elif status == "DONE":
-            status = "DONE"
-        elif status == "ERROR":
-            status = "ERROR"
-        return JSONResponse({
-            "job_id": job_id,
-            "status": status,
-            "progress": job.get("progress"),
-            "row_count_scraped": job.get("row_count_scraped"),
-            "row_count_enriched": job.get("row_count_enriched"),
-            "error": job.get("error"),
-        })
+    job = store.get_by_job_id(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    return JSONResponse({
+        "job_id": job_id,
+        "status": job["status"],
+        "apify_run_id": job.get("apify_run_id"),
+        "error": job.get("error"),
+        "meta": job.get("meta", {}),
+    })
 
 
 # ============================================================================
@@ -216,9 +180,10 @@ def phase5_finish_and_enrich(payload: dict):
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id missing")
 
-    store = _get_store()
-    if not store:
-        raise HTTPException(status_code=501, detail="Postgres required for this endpoint. Use /download/{job_id} instead.")
+    try:
+        store = _get_store()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Phase5 requires Postgres: {e}")
 
     job = store.get_by_job_id(job_id)
     if not job:
@@ -273,7 +238,6 @@ def phase5_finish_and_enrich(payload: dict):
             content=csv_bytes,
             media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="phase5_{job_id}.csv"'}
-        )
 
     except HTTPException:
         raise
@@ -289,40 +253,22 @@ def phase5_finish_and_enrich(payload: dict):
 @phase5_router.get("/trustpilot/download/{job_id}")
 def phase5_download(job_id: str):
     """
-    Download the enriched CSV (legacy endpoint for in-memory jobs).
+    Download the enriched CSV (Postgres-backed).
 
-    Returns: CSV file download
+    Returns: Redirect to /finish_and_enrich.csv endpoint
     """
-    store = _get_store()
+    try:
+        store = _get_store()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Phase5 requires Postgres: {e}")
 
-    if store:
-        # Postgres path - redirect to finish_and_enrich
-        job = store.get_by_job_id(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Unknown job_id")
-        if job["status"] != "DONE":
-            raise HTTPException(status_code=409, detail=f"Job not ready (status={job['status']}). Use /finish_and_enrich.csv")
-        # For now, return a message. In production, you'd cache the CSV.
-        return Response(content="Use /finish_and_enrich.csv to get CSV", media_type="text/plain")
-
-    else:
-        # In-memory fallback
-        job = mem_get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-
-        if job.get("status") == "error":
-            raise HTTPException(status_code=500, detail=job.get("error") or "Job failed")
-
-        if job.get("status") != "done" or not job.get("csv_bytes"):
-            raise HTTPException(status_code=409, detail=f"Job not ready (status={job.get('status')})")
-
-        csv_bytes = job["csv_bytes"]
-        return StreamingResponse(
-            iter([csv_bytes]),
-            media_type="text/csv",
-            headers={"Content-Disposition": f'attachment; filename="phase5_{job_id}.csv"'},
-        )
+    job = store.get_by_job_id(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    if job["status"] != "DONE":
+        raise HTTPException(status_code=409, detail=f"Job not ready (status={job['status']}). Use /finish_and_enrich.csv")
+    # Redirect to finish_and_enrich endpoint
+    return Response(content="Use POST /phase5/trustpilot/finish_and_enrich.csv with {job_id} to get CSV", media_type="text/plain")
 
 
 # ============================================================================
@@ -359,7 +305,6 @@ def phase5_scrape_csv(req: Phase5ScrapeReq):
             iter([csv_bytes]),
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="phase5_trustpilot_reviews.csv"'},
-        )
     except ApifyError as e:
         raise HTTPException(status_code=502, detail=f"ApifyError: {str(e)}")
     except Exception as e:
@@ -389,7 +334,6 @@ def phase5_scrape_and_enrich_csv(req: Phase5ScrapeReq):
             iter([csv_bytes]),
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="phase5_trustpilot_enriched.csv"'},
-        )
     except Phase5BridgeError as e:
         print(f"PHASE5_ERROR_BRIDGE {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
