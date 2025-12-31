@@ -2,7 +2,7 @@
 PHASE 5 API ROUTES (Postgres-backed Idempotency)
 
 FastAPI routes for Trustpilot scraping + Phase 4 enrichment.
-Uses Postgres to ensure ONLY ONE Apify run per (url, max_reviews) even across multiple instances.
+Uses Postgres to ensure ONLY ONE Apify run per URL even across multiple instances.
 
 ENDPOINTS:
 - POST /phase5/trustpilot/start - Start job (idempotent), returns job_id
@@ -15,8 +15,6 @@ from fastapi.responses import Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import threading
-import io
-import csv
 
 phase5_router = APIRouter(prefix="/phase5", tags=["phase5"])
 
@@ -25,29 +23,33 @@ _start_lock = threading.Lock()
 
 
 # ============================================================================
-# POSTGRES JOB STORE INITIALIZATION (NO FALLBACK)
+# POSTGRES JOB STORE (NO FALLBACK)
 # ============================================================================
-
-def _get_store():
-    """
-    Get Postgres job store. NO FALLBACK.
-    Phase 5 requires Postgres for idempotency - prevents duplicate Apify runs.
-    """
-    from tp_enrich.phase5_job_store import Phase5JobStore
-    return Phase5JobStore()
-
 
 @phase5_router.on_event("startup")
 def _phase5_startup():
-    """Initialize Postgres schema on startup. HARD FAIL if not available."""
+    """Initialize Postgres schema on startup."""
     try:
-        store = _get_store()
-        store.ensure_schema()
-        print("PHASE5_JOBSTORE_READY (Postgres)")
+        from tp_enrich.phase5_job_store import Phase5JobStore
+        Phase5JobStore().ensure_schema()
+        print("PHASE5_JOBSTORE_READY")
     except Exception as e:
-        # HARD FAIL - Phase 5 cannot work without Postgres
-        print("PHASE5_JOBSTORE_ERROR", str(e))
-        print("PHASE5_DISABLED - Add DATABASE_URL to Trustpilot-Enricher service")
+        # Don't crash server, but Phase5 endpoints will return 503
+        print("PHASE5_JOBSTORE_NOT_READY", str(e))
+
+
+def _require_phase5_db():
+    """Get Postgres job store or raise 503."""
+    try:
+        from tp_enrich.phase5_job_store import Phase5JobStore
+        store = Phase5JobStore()
+        store.ensure_schema()
+        return store
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Phase5 requires Postgres. Add DATABASE_URL to Trustpilot-Enricher service. Error: {e}",
+        )
 
 
 # ============================================================================
@@ -63,43 +65,30 @@ class Phase5StartReq(BaseModel):
 
 
 # ============================================================================
-# IDEMPOTENT START ENDPOINT (Postgres-backed)
+# IDEMPOTENT START ENDPOINT
 # ============================================================================
 
 @phase5_router.post("/trustpilot/start")
 def phase5_start(req: Phase5StartReq):
     """
     Start a Phase 5 job (IDEMPOTENT).
-
-    If a job already exists for same (url, max_reviews), returns existing job_id.
+    If a job already exists for same URL, returns existing job_id.
     Only the first request actually starts Apify.
-
-    Returns:
-        {"job_id": "p5_xxx", "status": "CREATED|RUNNING|DONE"}
     """
-    # Normalize inputs
     url = (req.url or (req.urls[0] if req.urls else "")).strip()
     max_reviews = req.max_reviews or req.max_reviews_per_company or 5000
 
     if not url:
         raise HTTPException(status_code=400, detail="url is required")
 
-    # ========== POSTGRES ONLY (NO FALLBACK) ==========
-    try:
-        store = _get_store()
-        store.ensure_schema()
-    except Exception as e:
-        print("PHASE5_START_ERROR", str(e))
-        raise HTTPException(
-            status_code=503,
-            detail=f"Phase5 requires Postgres. Add DATABASE_URL to Trustpilot-Enricher service. Error: {e}"
+    store = _require_phase5_db()
 
     # Create or load existing job (idempotent - URL only)
     job_id, job = store.get_or_create_job(url)
 
     # If already running/done, do NOT start another Apify run
     if job["status"] in {"RUNNING", "DONE"}:
-        print("PHASE5_START_IDEMPOTENT", {"job_id": job_id, "status": job["status"], "apify_run_id": job.get("apify_run_id")})
+        print("PHASE5_START_IDEMPOTENT", {"job_id": job_id, "status": job["status"]})
         return JSONResponse({"job_id": job_id, "status": job["status"]})
 
     # Only one instance should pass this point
@@ -124,7 +113,7 @@ def phase5_start(req: Phase5StartReq):
             apify_run_id = run["id"]
             store.set_running(job_id, apify_run_id)
 
-            print("PHASE5_APIFY_STARTED", {"job_id": job_id, "apify_run_id": apify_run_id, "url": url, "max_reviews": max_reviews})
+            print("PHASE5_APIFY_STARTED", {"job_id": job_id, "apify_run_id": apify_run_id, "url": url})
             return JSONResponse({"job_id": job_id, "status": "RUNNING"})
 
         except Exception as e:
@@ -140,16 +129,9 @@ def phase5_start(req: Phase5StartReq):
 def phase5_status(job_id: str):
     """
     Get job status (poll this until status="DONE").
-
     CRITICAL: Status NEVER starts Apify runs. It only reports.
-
-    Returns:
-        {"job_id": "...", "status": "CREATED|RUNNING|DONE|ERROR", "apify_run_id": "...", "error": "..."}
     """
-    try:
-        store = _get_store()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Phase5 requires Postgres: {e}")
+    store = _require_phase5_db()
 
     job = store.get_by_job_id(job_id)
     if not job:
@@ -164,33 +146,26 @@ def phase5_status(job_id: str):
 
 
 # ============================================================================
-# FINISH AND ENRICH ENDPOINT (Postgres path)
+# FINISH AND ENRICH ENDPOINT
 # ============================================================================
 
 @phase5_router.post("/trustpilot/finish_and_enrich.csv")
 def phase5_finish_and_enrich(payload: dict):
     """
     Wait for Apify run to finish, fetch items, enrich via Phase 4, return CSV.
-
     payload: {"job_id": "p5_xxx"}
-
-    Returns: CSV bytes
     """
     job_id = (payload or {}).get("job_id") or ""
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id missing")
 
-    try:
-        store = _get_store()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Phase5 requires Postgres: {e}")
+    store = _require_phase5_db()
 
     job = store.get_by_job_id(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Unknown job_id")
 
     if job["status"] == "DONE":
-        # Already done - return cached result if available
         return Response(content="already_done", media_type="text/plain")
 
     apify_run_id = job.get("apify_run_id")
@@ -201,7 +176,6 @@ def phase5_finish_and_enrich(payload: dict):
         from tp_enrich.apify_trustpilot import ApifyClient, _normalize_item
         client = ApifyClient()
 
-        # Wait for Apify run to finish
         print("PHASE5_WAITING_FOR_APIFY", {"job_id": job_id, "apify_run_id": apify_run_id})
         finished = client.wait_for_finish(apify_run_id, timeout_s=3600)
 
@@ -237,7 +211,8 @@ def phase5_finish_and_enrich(payload: dict):
         return Response(
             content=csv_bytes,
             media_type="text/csv",
-            headers={"Content-Disposition": f'attachment; filename="phase5_{job_id}.csv"'}
+            headers={"Content-Disposition": f'attachment; filename="phase5_{job_id}.csv"'},
+        )
 
     except HTTPException:
         raise
@@ -247,27 +222,19 @@ def phase5_finish_and_enrich(payload: dict):
 
 
 # ============================================================================
-# LEGACY ENDPOINTS (for backwards compatibility)
+# LEGACY DOWNLOAD ENDPOINT
 # ============================================================================
 
 @phase5_router.get("/trustpilot/download/{job_id}")
 def phase5_download(job_id: str):
-    """
-    Download the enriched CSV (Postgres-backed).
-
-    Returns: Redirect to /finish_and_enrich.csv endpoint
-    """
-    try:
-        store = _get_store()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Phase5 requires Postgres: {e}")
+    """Download the enriched CSV (Postgres-backed)."""
+    store = _require_phase5_db()
 
     job = store.get_by_job_id(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Unknown job_id")
     if job["status"] != "DONE":
         raise HTTPException(status_code=409, detail=f"Job not ready (status={job['status']}). Use /finish_and_enrich.csv")
-    # Redirect to finish_and_enrich endpoint
     return Response(content="Use POST /phase5/trustpilot/finish_and_enrich.csv with {job_id} to get CSV", media_type="text/plain")
 
 
@@ -305,6 +272,7 @@ def phase5_scrape_csv(req: Phase5ScrapeReq):
             iter([csv_bytes]),
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="phase5_trustpilot_reviews.csv"'},
+        )
     except ApifyError as e:
         raise HTTPException(status_code=502, detail=f"ApifyError: {str(e)}")
     except Exception as e:
@@ -313,7 +281,7 @@ def phase5_scrape_csv(req: Phase5ScrapeReq):
 
 @phase5_router.post("/trustpilot/scrape_and_enrich.csv")
 def phase5_scrape_and_enrich_csv(req: Phase5ScrapeReq):
-    """Scrape → Enrich → CSV (LEGACY SYNC - may timeout)."""
+    """Scrape -> Enrich -> CSV (LEGACY SYNC - may timeout)."""
     from tp_enrich.apify_trustpilot import scrape_trustpilot_urls, ApifyError
     from tp_enrich.phase5_bridge import call_phase4_enrich_rows, Phase5BridgeError
     from tp_enrich.csv_utils import rows_to_csv_bytes
@@ -334,6 +302,7 @@ def phase5_scrape_and_enrich_csv(req: Phase5ScrapeReq):
             iter([csv_bytes]),
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="phase5_trustpilot_enriched.csv"'},
+        )
     except Phase5BridgeError as e:
         print(f"PHASE5_ERROR_BRIDGE {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
