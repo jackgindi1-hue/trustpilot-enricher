@@ -48,37 +48,6 @@ def _clean(v) -> str:
     return s
 
 
-def _extract_reviewer(item: dict) -> str:
-    """
-    Extract reviewer/business name from nested structures.
-    Many Trustpilot datasets store the reviewer under nested objects.
-    """
-    # Try nested consumer/reviewer/author objects first
-    consumer = item.get("consumer") or item.get("reviewer") or item.get("author") or {}
-    if isinstance(consumer, dict):
-        v = consumer.get("displayName") or consumer.get("displayname") or consumer.get("name") or consumer.get("fullName")
-        vv = _clean(v)
-        if vv:
-            return vv
-
-    # Try nested user object
-    user = item.get("user") or {}
-    if isinstance(user, dict):
-        v = user.get("displayName") or user.get("name")
-        vv = _clean(v)
-        if vv:
-            return vv
-
-    # Flat fields (varies by actor build)
-    for k in ("name", "reviewerName", "reviewer_name", "reviewer", "author", "userName",
-              "username", "displayName", "display_name", "consumerName", "consumerDisplayName"):
-        vv = _clean(item.get(k))
-        if vv:
-            return vv
-
-    return ""
-
-
 def _stable_review_id(company_url: str, reviewer: str, date: str, rating: str, text: str) -> str:
     base = f"{company_url}|{reviewer}|{date}|{rating}|{text[:200]}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:24]
@@ -174,68 +143,55 @@ class ApifyClient:
         )
 
 def _normalize_item(item: dict, company_url: str) -> dict:
-    # helper: safe dict-get for nested
-    def _get(d, *keys):
-        cur = d
-        for k in keys:
-            if not isinstance(cur, dict):
-                return None
-            cur = cur.get(k)
-        return cur
+    """
+    MINIMAL NORMALIZATION - Pass through Dino actor's consumer.displayName exactly.
+    Phase 4 expects this exact field name (case-sensitive).
+    """
+    # Extract reviewer from consumer.displayName (Dino actor's format)
+    consumer = item.get("consumer") or {}
+    reviewer = _clean(
+        (consumer.get("displayName") if isinstance(consumer, dict) else None)
+        or item.get("consumer.displayName")
+    )
 
-    # Extract reviewer/business name from nested structures using robust helper
-    reviewer = _extract_reviewer(item)
+    # DEBUG: Log what we extracted
+    print(f"APIFY_NORMALIZE_DEBUG name={reviewer} consumer_type={type(consumer).__name__}")
 
-    # DEBUG: Log the extracted name
-    print(f"APIFY_NORMALIZE_DEBUG name={reviewer} from item.keys={list(item.keys())[:10]}")
-
+    # Keep other review fields as-is
     rating = _clean(item.get("rating") or item.get("stars") or item.get("score"))
-    date = _clean(item.get("date") or item.get("reviewDate") or item.get("publishedDate") or item.get("published_at"))
-    text = _clean(item.get("text") or item.get("reviewText") or item.get("content") or item.get("body"))
+    date = _clean(item.get("date") or item.get("reviewDate") or item.get("publishedDate"))
+    text = _clean(item.get("text") or item.get("reviewText") or item.get("content"))
 
     reviewed_company_name = _clean(
         item.get("companyName")
         or item.get("businessName")
         or item.get("company")
-        or item.get("reviewedCompany")
-        or item.get("domain")
     )
 
     review_id = _clean(item.get("reviewId") or item.get("id"))
     if not review_id:
         review_id = _stable_review_id(company_url, reviewer, date, rating, text)
 
-    # CRITICAL: NEVER allow blank reviewer name into Phase 4
-    # If reviewer is missing, use a safe placeholder that Phase 4 will classify as PERSON and skip.
-    if not reviewer:
-        reviewer = "Anonymous"
-
-    # Output schema that matches CSV-upload expectations
+    # Return row with EXACT field Phase 4 expects (case-sensitive)
+    # DO NOT set consumer.displayname (lowercase n) anywhere
     return {
         "source_platform": "trustpilot",
 
-        # Phase 4 expects candidate name here
-        "name": reviewer,
+        # ✅ EXACT FIELD PHASE 4 EXPECTS (case-sensitive)
+        "consumer.displayName": reviewer,
+
+        # safe aliases
         "raw_display_name": reviewer,
-        "consumer.displayName": reviewer,  # CANONICAL - Phase 4 expects capital N
         "company_search_name": reviewer,
+        "name": reviewer,
 
-        # CSV flow expects "date"
-        "date": date,
-        "review_date": date,
-
-        # stable identifiers
-        "row_id": review_id,
-        "review_id": review_id,
-        "run_id": "phase5_apify",
-
-        # reference only
+        # review context
         "reviewed_company_url": company_url,
         "reviewed_company_name": reviewed_company_name,
-
-        # review fields
+        "review_date": date,
         "review_rating": rating,
         "review_text": text,
+        "review_id": review_id,
     }
 
 
