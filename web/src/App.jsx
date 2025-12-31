@@ -4,7 +4,7 @@ import './App.css'
 import { TrustpilotPhase5Panel } from './components/TrustpilotPhase5Panel'
 
 // PHASE 4.7.1 DEPLOY - UI Stuck "Running" Fix (Missing Job Reset)
-// BUILD TIMESTAMP: 2025-12-25 22:30 UTC
+// BUILD TIMESTAMP: 2025-12-31 - Papaya.ui Matrix Theme
 
 // PHASE 4.5: Pagination constants
 const PAGE_SIZE = 100
@@ -102,6 +102,7 @@ function App() {
   const [progress, setProgress] = useState(0)
   const [rowsPreview, setRowsPreview] = useState([])
   const [jobMeta, setJobMeta] = useState(null) // PHASE 4.5.4: Track job metadata
+  const [runHistory, setRunHistory] = useState([]) // Run history for UI
 
   // PHASE 4.5: Helper functions
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n))
@@ -306,6 +307,12 @@ function App() {
       await safeDownloadCsv(apiUrl(`/jobs/${id}/download`), `enriched-${id}.csv`);
 
       setStatus("done");
+      // Add to run history
+      setRunHistory(prev => [{
+        name: file?.name || "CSV Upload",
+        time: new Date().toLocaleTimeString(),
+        status: "success"
+      }, ...prev.slice(0, 9)]);
       clearJobId(); // PHASE 4.5.5: Use clearJobId helper
       setIsProcessing(false);
 
@@ -325,6 +332,12 @@ function App() {
       console.error('❌ Enrichment error:', err);
       setError(err.message || 'Enrichment failed. Please try again.');
       setStatus('error');
+      // Add to run history
+      setRunHistory(prev => [{
+        name: file?.name || "CSV Upload",
+        time: new Date().toLocaleTimeString(),
+        status: "error"
+      }, ...prev.slice(0, 9)]);
       setIsProcessing(false);
 
       // Show partial download button if we have a jobId
@@ -362,6 +375,12 @@ function App() {
         setStatus('downloading');
         await safeDownloadCsv(apiUrl(`/jobs/${saved}/download`), `enriched-${saved}.csv`);
         setStatus("done");
+      // Add to run history
+      setRunHistory(prev => [{
+        name: file?.name || "CSV Upload",
+        time: new Date().toLocaleTimeString(),
+        status: "success"
+      }, ...prev.slice(0, 9)]);
         localStorage.removeItem("tp_active_job_id");
         setIsProcessing(false);
 
@@ -415,8 +434,8 @@ function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Trustpilot Review Enrichment</h1>
-        <p className="subtitle">Upload your Trustpilot CSV to enrich it with business contact information</p>
+        <h1>Papaya.ui</h1>
+        
       </header>
 
       <main className="app-main">
@@ -427,7 +446,7 @@ function App() {
           <form onSubmit={handleRunEnrichment}>
             <div className="form-group">
               <label htmlFor="csvFile">
-                Select Trustpilot CSV File *
+                option 2, upload csv (column A must have "consumer.displayName")
               </label>
               <input
                 type="file"
@@ -632,53 +651,27 @@ function App() {
           )}
         </div>
 
-        <div className="info-section">
-          <h3>How it works</h3>
-          <ol>
-            <li>Upload your Trustpilot review CSV</li>
-            <li>Click <strong>Run Enrichment</strong></li>
-            <li>We create an async job and show live progress</li>
-            <li>When the job finishes, your enriched CSV downloads automatically</li>
-            <li>If there's a temporary network glitch, the UI will keep retrying polling</li>
-          </ol>
-          <p className="help-text">
-            ℹ️ Runs as a background job for reliability (supports large files and live progress).
-          </p>
-
-          <h3>Data sources (what we try)</h3>
-          <ul>
-            <li><strong>🗺️ Google Places</strong>: phone, address, website (best source when matched)</li>
-            <li><strong>🎯 Entity Matching</strong>: 80% confidence matching with Google verification when state is known</li>
-            <li><strong>⭐ Yelp</strong>: backup phone + business verification when Google misses</li>
-            <li><strong>📧 Hunter</strong> + website scan: email discovery (generic + sometimes person emails)</li>
-            <li><strong>🔎 Phase 2 discovery</strong> (select cases): BBB / YellowPages / OpenCorporates lookups
-              <br /><small style={{ color: '#6b7280', fontSize: '0.875rem' }}>→ Only kept when values look valid (we filter out obvious junk like BBB's own emails / tracking domains)</small></li>
-          </ul>
-
-          <h3>Output</h3>
-          <p>Your CSV keeps your original columns and adds enrichment fields:</p>
-          <ul>
-            <li><strong>Primary phone + source + confidence</strong></li>
-            <li><strong>Primary email + type + source</strong></li>
-            <li><strong>Address fields</strong> (when available)</li>
-            <li><strong>All discovered phones/emails</strong> (JSON columns)</li>
-            <li><strong>overall_lead_confidence</strong></li>
-            <li><strong>debug_notes</strong> (only populated when something failed, was missing, or was sanitized)</li>
-          </ul>
+        {/* Run History Section */}
+        <div className="history-section">
+          <h3>Run History</h3>
+          {runHistory.length === 0 ? (
+            <div className="empty-state">No runs yet</div>
+          ) : (
+            <ul className="history-list">
+              {runHistory.map((run, idx) => (
+                <li key={idx} className={`history-item ${run.status}`}>
+                  <div>
+                    <div>{run.name}</div>
+                    <div className="time">{run.time}</div>
+                  </div>
+                  <span className={`status-badge ${run.status}`}>{run.status}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       </main>
 
-      <footer className="app-footer">
-        <p>
-          API: <code>{config.API_BASE_URL}</code>
-        </p>
-        <p>
-          Powered by multi-source business data enrichment
-        </p>
-        <div style={{ opacity: 0.6, fontSize: 12, marginTop: 12, borderTop: '1px solid rgba(255,255,255,0.2)', paddingTop: 8 }}>
-          🔧 UI Build: <strong>🔴 PHASE-4.5.5-2025-12-23-04:30-UTC 🔴</strong> | Stop 404 Spam PERMANENTLY ✅
-        </div>
-      </footer>
     </div>
   )
 }

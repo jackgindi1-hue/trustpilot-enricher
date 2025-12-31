@@ -178,15 +178,15 @@ export function TrustpilotPhase5Panel() {
   return (
     <div
       style={{
-        border: "1px solid rgba(0,0,0,0.1)",
+        border: "1px solid #333",
         borderRadius: 12,
         padding: 16,
         marginBottom: 16,
-        backgroundColor: "rgba(255,255,255,0.5)"
+        backgroundColor: "#1a1a1a"
       }}
     >
-      <div style={{ fontWeight: 700, marginBottom: 8, fontSize: 16 }}>
-        Phase 5 — Trustpilot URL → Scrape → Enrich → CSV
+      <div style={{ fontWeight: 700, marginBottom: 12, fontSize: 14, color: "#ff6b00", textTransform: "uppercase", letterSpacing: 1 }}>
+        option 1, enter URL
       </div>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
         <input
@@ -197,7 +197,7 @@ export function TrustpilotPhase5Panel() {
             flex: "1 1 420px",
             padding: 10,
             borderRadius: 10,
-            border: "1px solid rgba(0,0,0,0.15)",
+            border: "1px solid #333", background: "#2a2a2a", color: "#e0e0e0",
             fontSize: 14
           }}
           disabled={busy || resetting}
@@ -212,7 +212,7 @@ export function TrustpilotPhase5Panel() {
             width: 100,
             padding: 10,
             borderRadius: 10,
-            border: "1px solid rgba(0,0,0,0.15)",
+            border: "1px solid #333", background: "#2a2a2a", color: "#e0e0e0",
             fontSize: 14
           }}
           disabled={busy || resetting}
@@ -226,8 +226,8 @@ export function TrustpilotPhase5Panel() {
             borderRadius: 10,
             border: "none",
             cursor: (busy || resetting) ? "not-allowed" : "pointer",
-            backgroundColor: (busy || resetting) ? "#ccc" : "#007bff",
-            color: "white",
+            backgroundColor: (busy || resetting) ? "#333" : "#00ff41",
+            color: "#000",
             fontWeight: 600,
             fontSize: 14
           }}
@@ -240,10 +240,10 @@ export function TrustpilotPhase5Panel() {
           style={{
             padding: "10px 16px",
             borderRadius: 10,
-            border: "1px solid #dc3545",
+            border: "1px solid #ff6b00",
             cursor: (busy || resetting) ? "not-allowed" : "pointer",
             backgroundColor: resetting ? "#ccc" : "white",
-            color: "#dc3545",
+            color: "#ff6b00",
             fontWeight: 600,
             fontSize: 14
           }}
@@ -259,8 +259,8 @@ export function TrustpilotPhase5Panel() {
             marginTop: 10,
             padding: 10,
             borderRadius: 8,
-            backgroundColor: statusMsg.includes("✅") ? "rgba(34, 197, 94, 0.1)" : "rgba(59, 130, 246, 0.1)",
-            color: statusMsg.includes("✅") ? "#166534" : "#1e40af",
+            backgroundColor: statusMsg.includes("✅") ? "rgba(0, 255, 65, 0.1)" : "rgba(255, 107, 0, 0.1)",
+            color: statusMsg.includes("✅") ? "#00ff41" : "#ff6b00",
             fontSize: 13
           }}
         >
@@ -274,8 +274,8 @@ export function TrustpilotPhase5Panel() {
             marginTop: 10,
             padding: 10,
             borderRadius: 8,
-            backgroundColor: "rgba(220, 53, 69, 0.1)",
-            color: "crimson",
+            backgroundColor: "rgba(255, 68, 68, 0.1)",
+            color: "#ff4444",
             whiteSpace: "pre-wrap",
             fontSize: 13
           }}
@@ -284,7 +284,7 @@ export function TrustpilotPhase5Panel() {
         </div>
       )}
 
-      <div style={{ marginTop: 8, opacity: 0.7, fontSize: 13 }}>
+      <div style={{ marginTop: 12, opacity: 0.6, fontSize: 12, color: "#888" }}>
         <strong>Flow:</strong> Start job → Poll status → Download enriched CSV when ready.
         {busy && <div style={{ marginTop: 4, fontSize: 12, fontStyle: "italic" }}>⏱️ Large scrapes take 2-5 minutes. Keep this tab open.</div>}
         <div style={{ marginTop: 4, fontSize: 11 }}>
