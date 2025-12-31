@@ -48,6 +48,37 @@ def _clean(v) -> str:
     return s
 
 
+def _extract_reviewer(item: dict) -> str:
+    """
+    Extract reviewer/business name from nested structures.
+    Many Trustpilot datasets store the reviewer under nested objects.
+    """
+    # Try nested consumer/reviewer/author objects first
+    consumer = item.get("consumer") or item.get("reviewer") or item.get("author") or {}
+    if isinstance(consumer, dict):
+        v = consumer.get("displayName") or consumer.get("displayname") or consumer.get("name") or consumer.get("fullName")
+        vv = _clean(v)
+        if vv:
+            return vv
+
+    # Try nested user object
+    user = item.get("user") or {}
+    if isinstance(user, dict):
+        v = user.get("displayName") or user.get("name")
+        vv = _clean(v)
+        if vv:
+            return vv
+
+    # Flat fields (varies by actor build)
+    for k in ("name", "reviewerName", "reviewer_name", "reviewer", "author", "userName",
+              "username", "displayName", "display_name", "consumerName", "consumerDisplayName"):
+        vv = _clean(item.get(k))
+        if vv:
+            return vv
+
+    return ""
+
+
 def _stable_review_id(company_url: str, reviewer: str, date: str, rating: str, text: str) -> str:
     base = f"{company_url}|{reviewer}|{date}|{rating}|{text[:200]}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:24]
@@ -152,27 +183,10 @@ def _normalize_item(item: dict, company_url: str) -> dict:
             cur = cur.get(k)
         return cur
 
-    # Try many possible reviewer fields (actors differ)
-    # CRITICAL: item.get("name") FIRST — data_dino uses this field
-    reviewer = _clean(
-        item.get("name")
-        or item.get("reviewerName")
-        or item.get("reviewer_name")
-        or item.get("reviewer")
-        or item.get("author")
-        or item.get("userName")
-        or item.get("username")
-        or item.get("displayName")
-        or item.get("display_name")
-        or item.get("consumerName")
-        or _get(item, "consumer", "displayname")
-        or _get(item, "consumer", "displayName")
-        or _get(item, "user", "name")
-        or _get(item, "user", "displayName")
-        or _get(item, "author", "name")
-    )
+    # Extract reviewer/business name from nested structures using robust helper
+    reviewer = _extract_reviewer(item)
 
-    # DEBUG: Log the first few names to verify extraction
+    # DEBUG: Log the extracted name
     print(f"APIFY_NORMALIZE_DEBUG name={reviewer} from item.keys={list(item.keys())[:10]}")
 
     rating = _clean(item.get("rating") or item.get("stars") or item.get("score"))
