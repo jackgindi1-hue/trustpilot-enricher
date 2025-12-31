@@ -196,17 +196,25 @@ def phase5_finish_and_enrich(payload: dict):
         print("PHASE5_SCRAPED", {"job_id": job_id, "rows": len(rows)})
 
         # =====================================================================
-        # CRITICAL: Call the EXACT SAME function as CSV upload
-        # This is run_pipeline() via phase4_entrypoint.py
+        # Call run_phase4_exact — the EXACT SAME function as CSV upload
         # =====================================================================
+        print("PHASE5_BEFORE_PHASE4", {"rows": len(rows)})
+
         from tp_enrich.phase4_entrypoint import run_phase4_exact
+
+        print("PHASE5_CALLING_PHASE4", {"rows": len(rows)})
         enriched = run_phase4_exact(rows) or []
 
-        print("PHASE5_ENRICHED", {"job_id": job_id, "rows": len(enriched or [])})
+        print("PHASE5_PHASE4_RETURNED", {
+            "rows": len(enriched),
+            "keys": list(enriched[0].keys()) if enriched else []
+        })
 
         # Convert to CSV
         from tp_enrich.csv_utils import rows_to_csv_bytes
         csv_bytes = rows_to_csv_bytes(enriched or [])
+
+        print("PHASE5_EXPORTING_ENRICHED_CSV", {"rows": len(enriched), "bytes": len(csv_bytes)})
 
         store.set_done(job_id, {"rows_scraped": len(rows), "rows_out": len(enriched or [])})
         print("PHASE5_DONE", {"job_id": job_id, "scraped": len(rows), "out": len(enriched or []), "bytes": len(csv_bytes)})
@@ -375,37 +383,47 @@ def phase5_scrape_and_enrich_csv(payload: dict):
         print("PHASE5_APIFY_DONE", {"job_id": job_id, "rows": len(rows)})
 
         # =====================================================================
-        # CRITICAL: Call the EXACT SAME function as CSV upload
-        # This is run_pipeline() via phase4_entrypoint.py
-        # NO NEW LOGIC. NO FILTERING. SAME FUNCTION. SAME BEHAVIOR.
+        # STEP A) Log before calling Phase 4
+        # =====================================================================
+        print("PHASE5_BEFORE_PHASE4", {"rows": len(rows)})
+
+        # =====================================================================
+        # STEP C) Call run_phase4_exact — the EXACT SAME function as CSV upload
         # =====================================================================
         from tp_enrich.phase4_entrypoint import run_phase4_exact
-        enriched = run_phase4_exact(rows) or []
 
-        print("PHASE5_ENRICH_DONE", {"job_id": job_id, "enriched": len(enriched)})
+        print("PHASE5_CALLING_PHASE4", {"rows": len(rows)})
+        enriched_rows = run_phase4_exact(rows) or []
+
+        print("PHASE5_PHASE4_RETURNED", {
+            "rows": len(enriched_rows),
+            "keys": list(enriched_rows[0].keys()) if enriched_rows else []
+        })
 
         # =====================================================================
-        # BUSINESS ONLY FILTER — same logic as CSV upload would use
-        # Filters by name_classification field set by run_pipeline()
+        # Export enriched CSV (with business-only filter if needed)
         # =====================================================================
+        import pandas as pd
+
+        # Filter to business only (using name_classification from run_pipeline)
         business_only = [
-            r for r in enriched
+            r for r in enriched_rows
             if str((r or {}).get("name_classification") or "").strip().lower() == "business"
         ]
 
-        print("PHASE5_BUSINESS_FILTER", {"job_id": job_id, "total": len(enriched), "business": len(business_only)})
+        print("PHASE5_BUSINESS_FILTER", {"total": len(enriched_rows), "business": len(business_only)})
 
-        import pandas as pd
         df = pd.DataFrame(business_only)
         csv_bytes = df.to_csv(index=False).encode("utf-8")
 
+        print("PHASE5_EXPORTING_ENRICHED_CSV", {"rows": len(business_only), "bytes": len(csv_bytes)})
+
         store.set_done(job_id, {
             "scraped": len(rows),
-            "enriched": len(enriched),
+            "enriched": len(enriched_rows),
             "business": len(business_only),
             "bytes": len(csv_bytes)
         })
-        print("PHASE5_DONE", {"job_id": job_id, "scraped": len(rows), "enriched": len(enriched), "business": len(business_only), "bytes": len(csv_bytes)})
 
         return Response(
             content=csv_bytes,
