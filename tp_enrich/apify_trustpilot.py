@@ -127,52 +127,80 @@ class ApifyClient:
         )
 
 def _normalize_item(item: dict, company_url: str) -> dict:
+    # helper: safe dict-get for nested
+    def _get(d, *keys):
+        cur = d
+        for k in keys:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(k)
+        return cur
+
+    # Try many possible reviewer fields (actors differ)
     reviewer = _clean(
         item.get("reviewerName")
+        or item.get("reviewer_name")
         or item.get("reviewer")
         or item.get("author")
         or item.get("userName")
-        or (item.get("consumer") or {}).get("displayname")
-        or (item.get("consumer") or {}).get("displayName")
+        or item.get("username")
+        or item.get("displayName")
+        or item.get("display_name")
+        or item.get("consumerName")
+        or _get(item, "consumer", "displayname")
+        or _get(item, "consumer", "displayName")
+        or _get(item, "user", "name")
+        or _get(item, "user", "displayName")
+        or _get(item, "author", "name")
     )
 
     rating = _clean(item.get("rating") or item.get("stars") or item.get("score"))
-    date = _clean(item.get("date") or item.get("reviewDate") or item.get("publishedDate"))
-    text = _clean(item.get("text") or item.get("reviewText") or item.get("content"))
+    date = _clean(item.get("date") or item.get("reviewDate") or item.get("publishedDate") or item.get("published_at"))
+    text = _clean(item.get("text") or item.get("reviewText") or item.get("content") or item.get("body"))
 
     reviewed_company_name = _clean(
         item.get("companyName")
         or item.get("businessName")
         or item.get("company")
+        or item.get("reviewedCompany")
+        or item.get("domain")
     )
 
     review_id = _clean(item.get("reviewId") or item.get("id"))
     if not review_id:
         review_id = _stable_review_id(company_url, reviewer, date, rating, text)
 
-    # PHASE 5 FINAL FIX:
-    # These fields EXACTLY mirror the CSV-upload schema Phase 4 already works with
+    # CRITICAL: NEVER allow blank reviewer name into Phase 4
+    # If reviewer is missing, use a safe placeholder that Phase 4 will classify as PERSON and skip.
+    if not reviewer:
+        reviewer = "Anonymous"
+
+    # Output schema that matches CSV-upload expectations
     return {
         "source_platform": "trustpilot",
 
-        # Phase 4 INPUT FIELDS (DO NOT RENAME)
+        # Phase 4 expects candidate name here
         "name": reviewer,
         "raw_display_name": reviewer,
         "consumer.displayname": reviewer,
         "company_search_name": reviewer,
+
+        # CSV flow expects "date"
         "date": date,
+        "review_date": date,
+
+        # stable identifiers
         "row_id": review_id,
+        "review_id": review_id,
         "run_id": "phase5_apify",
 
-        # Reviewed company (reference only)
+        # reference only
         "reviewed_company_url": company_url,
         "reviewed_company_name": reviewed_company_name,
 
-        # Review fields
-        "review_date": date,
+        # review fields
         "review_rating": rating,
         "review_text": text,
-        "review_id": review_id,
     }
 
 
