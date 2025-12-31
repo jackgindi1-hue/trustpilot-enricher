@@ -132,22 +132,26 @@ export function TrustpilotPhase5Panel() {
       }
 
       // =====================================================================
-      // STEP 3: DOWNLOAD CSV (ONLY AFTER DONE)
+      // STEP 3: DOWNLOAD CSV (PURE GET - NO RE-TRIGGER)
       // =====================================================================
-      setStatusMsg("Downloading CSV...");
+      setStatusMsg("Downloading enriched CSV...");
 
-      const downloadRes = await fetch(`${API}/phase5/trustpilot/finish_and_enrich.csv`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: jobId }),
-      });
+      // STABILIZER FIX: Use pure GET download endpoint (no POST, no work re-trigger)
+      const dlUrl = `${API}/phase5/trustpilot/download/${jobId}`;
+      console.log("[PHASE5] Downloading from:", dlUrl);
 
-      if (!downloadRes.ok) {
-        const text = await downloadRes.text().catch(() => "");
-        throw new Error(`Download failed (${downloadRes.status}): ${text}`);
+      const dlRes = await fetch(dlUrl, { method: "GET", cache: "no-store" });
+
+      if (dlRes.status === 409) {
+        const text = await dlRes.text().catch(() => "");
+        throw new Error(`CSV not ready (409): ${text}`);
+      }
+      if (!dlRes.ok) {
+        const text = await dlRes.text().catch(() => "");
+        throw new Error(`Download failed (${dlRes.status}): ${text}`);
       }
 
-      const blob = await downloadRes.blob();
+      const blob = await dlRes.blob();
       const fname = `phase5_trustpilot_enriched_${Date.now()}.csv`;
 
       const a = document.createElement("a");

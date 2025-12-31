@@ -219,7 +219,12 @@ def phase5_finish_and_enrich(payload: dict):
         from tp_enrich.csv_utils import rows_to_csv_bytes
         csv_bytes = rows_to_csv_bytes(enriched or [])
 
-        store.set_done(job_id, {"rows_scraped": len(rows), "rows_out": len(enriched or [])})
+        # STABILIZER FIX: Store CSV content so download endpoint can retrieve it
+        store.set_done(job_id, {
+            "rows_scraped": len(rows),
+            "rows_out": len(enriched or []),
+            "csv_content": csv_bytes,  # Store for pure download endpoint
+        })
         print("PHASE5_DONE", {"job_id": job_id, "scraped": len(rows), "out": len(enriched or []), "bytes": len(csv_bytes)})
 
         return Response(
@@ -236,20 +241,100 @@ def phase5_finish_and_enrich(payload: dict):
 
 
 # ============================================================================
-# LEGACY DOWNLOAD ENDPOINT
+# PURE DOWNLOAD ENDPOINT (NO RE-TRIGGER)
 # ============================================================================
 
 @phase5_router.get("/trustpilot/download/{job_id}")
 def phase5_download(job_id: str):
-    """Download the enriched CSV (Postgres-backed)."""
+    """
+    Download the enriched CSV for a completed Phase 5 job.
+
+    STABILIZER FIX: This is a PURE download endpoint.
+    - Returns 404 if job not found
+    - Returns 409 if job not ready (status != DONE)
+    - Returns CSV bytes if job is DONE
+    - NEVER re-triggers Apify or enrichment
+    """
     store = _require_phase5_db()
 
     job = store.get_by_job_id(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Unknown job_id")
-    if job["status"] != "DONE":
-        raise HTTPException(status_code=409, detail=f"Job not ready (status={job['status']}). Use /finish_and_enrich.csv")
-    return Response(content="Use POST /phase5/trustpilot/finish_and_enrich.csv with {job_id} to get CSV", media_type="text/plain")
+
+    status = (job.get("status") or "").upper()
+
+    if status != "DONE":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job not ready (status={status}). Poll /status/{job_id} until DONE."
+        )
+
+    # Get stored CSV from job metadata (stored in meta dict by set_done)
+    meta = job.get("meta") or {}
+    csv_path = meta.get("csv_path") or meta.get("out_csv_path") or job.get("csv_path")
+
+    # CSV content is stored as string in meta (converted by set_done)
+    csv_content = meta.get("csv_content") or job.get("csv_content")
+
+    if csv_content:
+        # Return stored CSV content directly
+        if isinstance(csv_content, str):
+            csv_content = csv_content.encode("utf-8")
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="phase5_{job_id}.csv"'},
+        )
+
+    if csv_path:
+        import os
+        if os.path.exists(csv_path):
+            with open(csv_path, "rb") as f:
+                csv_bytes = f.read()
+            return Response(
+                content=csv_bytes,
+                media_type="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="phase5_{job_id}.csv"'},
+            )
+
+    # Fallback: Re-fetch from Apify dataset and enrich (only if no stored CSV)
+    # This should rarely happen if finish_and_enrich stored the result properly
+    apify_run_id = job.get("apify_run_id")
+    if not apify_run_id:
+        raise HTTPException(status_code=500, detail="Job marked DONE but no CSV or apify_run_id found")
+
+    try:
+        from tp_enrich.apify_trustpilot import ApifyClient, _normalize_item
+        from tp_enrich.phase4_entrypoint import run_phase4_exact
+
+        client = ApifyClient()
+        run_info = client.get_run(apify_run_id)
+        dataset_id = run_info.get("defaultDatasetId")
+
+        if not dataset_id:
+            raise HTTPException(status_code=500, detail="No dataset_id in completed run")
+
+        rows = []
+        for it in client.iter_dataset_items(dataset_id, limit=5000):
+            rows.append(_normalize_item(it, job.get("url", "")))
+
+        enriched = run_phase4_exact(rows) or []
+
+        import pandas as pd
+        df = pd.DataFrame(enriched)
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+
+        # Store for future downloads
+        store.update_job(job_id, {"csv_content": csv_bytes})
+
+        return Response(
+            content=csv_bytes,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="phase5_{job_id}.csv"'},
+        )
+    except Exception as e:
+        print(f"PHASE5_DOWNLOAD_FALLBACK_ERROR {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate CSV: {e}")
 
 
 # ============================================================================
@@ -427,10 +512,12 @@ def phase5_scrape_and_enrich_csv(payload: dict):
         csv_bytes = df.to_csv(index=False).encode("utf-8")
         print("PHASE5_EXPORTING_ENRICHED_CSV", {"rows": len(enriched_rows), "bytes": len(csv_bytes), "cols": list(df.columns)[:20]})
 
+        # STABILIZER FIX: Store CSV content so download endpoint can retrieve it
         store.set_done(job_id, {
             "scraped": len(rows),
             "enriched": len(enriched_rows),
-            "bytes": len(csv_bytes)
+            "bytes": len(csv_bytes),
+            "csv_content": csv_bytes,  # Store for pure download endpoint
         })
 
         return Response(

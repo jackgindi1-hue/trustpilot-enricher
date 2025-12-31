@@ -55,32 +55,44 @@ async function downloadArrayBufferAsCsv(buf, filename) {
   window.URL.revokeObjectURL(url);
 }
 
-async function safeDownloadCsv(url, filename) {
-  // Download CSV once (status polling ensures job is done before this is called)
-  const res = await fetch(url);
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-  
-  // Handle 409 - should not happen if status polling worked correctly
-  if (res.status === 409) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`CSV not ready (409): ${txt.slice(0, 200)}. Try again in a moment.`);
+async function safeDownloadCsv(url, filename, opts = {}) {
+  // STABILIZER FIX: Retry download on 409 until ready (race condition hardening)
+  const timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000; // 10 minutes
+  const intervalMs = opts.intervalMs ?? 1200;         // 1.2s
+  const start = Date.now();
+
+  while (true) {
+    const res = await fetch(url, { cache: "no-store" });
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+
+    if (res.status === 409) {
+      // NOT READY YET -> wait and retry (do NOT throw immediately)
+      const txt = await res.text().catch(() => "");
+      console.log(`[CSV] 409 not ready, retrying... elapsed=${Date.now() - start}ms`);
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`Download still not ready after timeout: ${txt.slice(0, 200)}`);
+      }
+      await new Promise(r => setTimeout(r, intervalMs));
+      continue;
+    }
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`Download failed: ${res.status} ${txt.slice(0, 200)}`);
+    }
+
+    // refuse JSON downloads
+    if (ct.includes("application/json")) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`Refusing JSON as CSV: ${txt.slice(0, 200)}`);
+    }
+
+    const buf = await res.arrayBuffer();
+    const head = new TextDecoder("utf-8").decode(buf.slice(0, 64)).trim();
+    if (looksLikeJsonText(head)) throw new Error(`Refusing JSON-looking content: ${head}`);
+    await downloadArrayBufferAsCsv(buf, filename);
+    return; // success
   }
-  
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Download failed: ${res.status} ${txt.slice(0, 200)}`);
-  }
-  
-  // refuse JSON downloads
-  if (ct.includes("application/json")) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Refusing JSON as CSV: ${txt.slice(0, 200)}`);
-  }
-  
-  const buf = await res.arrayBuffer();
-  const head = new TextDecoder("utf-8").decode(buf.slice(0, 64)).trim();
-  if (looksLikeJsonText(head)) throw new Error(`Refusing JSON-looking content: ${head}`);
-  await downloadArrayBufferAsCsv(buf, filename);
 }
 
 function App() {
@@ -429,13 +441,13 @@ function App() {
     <div className="app">
       <header className="app-header">
         <h1>Papaya.ui</h1>
-        
+
       </header>
 
       <main className="app-main">
         {/* PHASE 5: Trustpilot URL Scraper */}
         <TrustpilotPhase5Panel />
-        
+
         <div className="card">
           <form onSubmit={handleRunEnrichment}>
             <div className="form-group">

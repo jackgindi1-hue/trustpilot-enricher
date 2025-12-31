@@ -137,11 +137,20 @@ class Phase5JobStore:
     def set_done(self, job_id: str, meta: Dict[str, Any]) -> None:
         """Mark job as done with metadata."""
         now = _now()
+        meta = dict(meta or {})
+
+        # Handle csv_content specially - convert bytes to string for JSON storage
+        if "csv_content" in meta:
+            csv_val = meta["csv_content"]
+            if isinstance(csv_val, bytes):
+                csv_val = csv_val.decode("utf-8", errors="replace")
+            meta["csv_content"] = csv_val
+
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE phase5_jobs SET status=%s, updated_at=%s, meta_json=%s WHERE job_id=%s",
-                    ("DONE", now, json.dumps(meta or {}), job_id),
+                    ("DONE", now, json.dumps(meta), job_id),
                 )
             conn.commit()
 
@@ -153,5 +162,31 @@ class Phase5JobStore:
                 cur.execute(
                     "UPDATE phase5_jobs SET status=%s, updated_at=%s, error=%s WHERE job_id=%s",
                     ("ERROR", now, (error or "")[:2000], job_id),
+                )
+            conn.commit()
+
+    def update_job(self, job_id: str, updates: Dict[str, Any]) -> None:
+        """Update job metadata (merge into existing meta_json)."""
+        now = _now()
+        job = self.get_by_job_id(job_id)
+        if not job:
+            return
+
+        meta = job.get("meta") or {}
+
+        # Handle csv_content specially - convert bytes to string for JSON storage
+        if "csv_content" in updates:
+            csv_val = updates.pop("csv_content")
+            if isinstance(csv_val, bytes):
+                csv_val = csv_val.decode("utf-8", errors="replace")
+            meta["csv_content"] = csv_val
+
+        meta.update(updates)
+
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE phase5_jobs SET updated_at=%s, meta_json=%s WHERE job_id=%s",
+                    (now, json.dumps(meta), job_id),
                 )
             conn.commit()
