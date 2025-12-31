@@ -137,8 +137,10 @@ def _normalize_item(item: dict, company_url: str) -> dict:
         return cur
 
     # Try many possible reviewer fields (actors differ)
+    # CRITICAL: item.get("name") FIRST — data_dino uses this field
     reviewer = _clean(
-        item.get("reviewerName")
+        item.get("name")
+        or item.get("reviewerName")
         or item.get("reviewer_name")
         or item.get("reviewer")
         or item.get("author")
@@ -153,6 +155,9 @@ def _normalize_item(item: dict, company_url: str) -> dict:
         or _get(item, "user", "displayName")
         or _get(item, "author", "name")
     )
+
+    # DEBUG: Log the first few names to verify extraction
+    print(f"APIFY_NORMALIZE_DEBUG name={reviewer} from item.keys={list(item.keys())[:10]}")
 
     rating = _clean(item.get("rating") or item.get("stars") or item.get("score"))
     date = _clean(item.get("date") or item.get("reviewDate") or item.get("publishedDate") or item.get("published_at"))

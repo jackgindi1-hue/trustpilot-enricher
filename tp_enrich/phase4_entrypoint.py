@@ -1,73 +1,64 @@
 """
-PHASE 4 ENTRYPOINT — HARD-WIRED TO CSV UPLOAD PIPELINE
+PHASE 4 ENTRYPOINT — CALLS THE REAL CSV UPLOAD PIPELINE
 
-CSV Upload uses (api_server.py line 21, 164):
+CSV Upload (api_server.py line 21, 164) uses:
     from tp_enrich.pipeline import run_pipeline
-    run_pipeline(str(input_path), str(output_path), str(cache_path), config=config)
+    stats = run_pipeline(str(input_path), str(output_path), str(cache_path), config=config)
 
-This wrapper calls the EXACT SAME function for in-memory rows.
-NO NEW LOGIC. NO FILTERS. NO SCHEMA TRICKS.
+This wrapper calls the EXACT SAME function and returns the OUTPUT rows
+loaded from the pipeline's enriched.csv (not the input rows).
 """
+from typing import List, Dict, Any
 import os
 import tempfile
-from typing import List, Dict, Any
 import pandas as pd
 
-# =====================================================================
 # THE EXACT SAME IMPORT AS CSV UPLOAD (api_server.py line 21)
-# =====================================================================
 from tp_enrich.pipeline import run_pipeline
 
 
 def run_phase4_exact(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Call the EXACT SAME run_pipeline() function used by CSV upload.
-
-    CSV upload flow:
-    1. Write uploaded file to input_path
-    2. Call run_pipeline(input_path, output_path, cache_path, config)
-    3. Return output_path as FileResponse
-
-    This function does the same:
-    1. Write rows to temp input CSV
-    2. Call run_pipeline(input_path, output_path, cache_path, config)
-    3. Read output CSV back to rows
-
-    NO NEW LOGIC. SAME FUNCTION. SAME BEHAVIOR.
+    Calls the SAME Phase 4 pipeline used by CSV upload and returns the OUTPUT rows
+    loaded from the pipeline's enriched.csv (not the input rows).
     """
     if not rows:
+        print("PHASE4_ENTRYPOINT: No rows to process")
         return []
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.csv")
-        output_path = os.path.join(tmpdir, "enriched.csv")
-        cache_path = os.path.join(tmpdir, "cache.json")
+    tmpdir = tempfile.mkdtemp()
+    input_csv = os.path.join(tmpdir, "input.csv")
+    output_csv = os.path.join(tmpdir, "enriched.csv")
+    cache_json = os.path.join(tmpdir, "cache.json")
 
-        # Write rows to temp CSV (same as CSV upload writes file to disk)
-        df = pd.DataFrame(rows)
-        df.to_csv(input_path, index=False, encoding='utf-8')
+    # Write input rows to CSV
+    df_in = pd.DataFrame(rows)
+    df_in.to_csv(input_csv, index=False, encoding='utf-8')
 
-        print(f"PHASE4_ENTRYPOINT_INPUT rows={len(rows)} path={input_path}")
+    print(f"PHASE4_ENTRYPOINT_INPUT rows={len(rows)} path={input_csv}")
+    print(f"PHASE4_ENTRYPOINT_INPUT_COLS cols={list(df_in.columns)[:20]}")
 
-        # =====================================================================
-        # CALL THE EXACT SAME FUNCTION AS CSV UPLOAD (api_server.py line 164)
-        # =====================================================================
-        stats = run_pipeline(
-            str(input_path),
-            str(output_path),
-            str(cache_path),
-            config={}
-        )
+    # ======================================================================
+    # CALL THE EXACT SAME FUNCTION AS CSV UPLOAD (api_server.py line 164)
+    # ======================================================================
+    stats = run_pipeline(
+        str(input_csv),
+        str(output_csv),
+        str(cache_json),
+        config={}
+    )
 
-        print(f"PHASE4_ENTRYPOINT_PIPELINE_DONE stats={stats}")
+    print(f"PHASE4_ENTRYPOINT_PIPELINE_DONE stats={stats} output_csv={output_csv} exists={os.path.exists(output_csv)}")
 
-        # Read enriched CSV back to rows (same as what FileResponse returns)
-        if not os.path.exists(output_path):
-            raise RuntimeError("run_pipeline did not produce output file")
+    # ======================================================================
+    # CRITICAL: Read the OUTPUT enriched.csv (not the input rows!)
+    # ======================================================================
+    if not os.path.exists(output_csv):
+        raise RuntimeError(f"Phase4 pipeline did not write output_csv: {output_csv}")
 
-        enriched_df = pd.read_csv(output_path, encoding='utf-8')
-        enriched_rows = enriched_df.to_dict('records')
+    df_out = pd.read_csv(output_csv, encoding='utf-8')
+    out_rows = df_out.to_dict(orient="records")
 
-        print(f"PHASE4_ENTRYPOINT_OUTPUT rows={len(enriched_rows)}")
+    print(f"PHASE4_ENTRYPOINT_OUTPUT rows={len(out_rows)} cols={list(df_out.columns)[:40]}")
 
-        return enriched_rows
+    return out_rows
