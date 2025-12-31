@@ -55,38 +55,32 @@ async function downloadArrayBufferAsCsv(buf, filename) {
   window.URL.revokeObjectURL(url);
 }
 
-async function safeDownloadCsv(url, filename, maxRetries = 10) {
-  // Retry on 409 not_ready (race condition between status=done and file ready)
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const res = await fetch(url);
-    const ct = (res.headers.get("content-type") || "").toLowerCase();
-    
-    // Handle 409 not_ready - retry after delay
-    if (res.status === 409) {
-      const txt = await res.text().catch(() => "");
-      console.log(`[Download] 409 not_ready (attempt ${attempt}/${maxRetries}):`, txt);
-      if (attempt < maxRetries) {
-        await new Promise(r => setTimeout(r, 1500));
-        continue;
-      }
-      throw new Error(`Download not ready after ${maxRetries} attempts: ${txt.slice(0, 200)}`);
-    }
-    
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`Download failed: ${res.status} ${txt.slice(0, 200)}`);
-    }
-    // refuse JSON downloads
-    if (ct.includes("application/json")) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`Refusing JSON as CSV: ${txt.slice(0, 200)}`);
-    }
-    const buf = await res.arrayBuffer();
-    const head = new TextDecoder("utf-8").decode(buf.slice(0, 64)).trim();
-    if (looksLikeJsonText(head)) throw new Error(`Refusing JSON-looking content: ${head}`);
-    await downloadArrayBufferAsCsv(buf, filename);
-    return;
+async function safeDownloadCsv(url, filename) {
+  // Download CSV once (status polling ensures job is done before this is called)
+  const res = await fetch(url);
+  const ct = (res.headers.get("content-type") || "").toLowerCase();
+  
+  // Handle 409 - should not happen if status polling worked correctly
+  if (res.status === 409) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`CSV not ready (409): ${txt.slice(0, 200)}. Try again in a moment.`);
   }
+  
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Download failed: ${res.status} ${txt.slice(0, 200)}`);
+  }
+  
+  // refuse JSON downloads
+  if (ct.includes("application/json")) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Refusing JSON as CSV: ${txt.slice(0, 200)}`);
+  }
+  
+  const buf = await res.arrayBuffer();
+  const head = new TextDecoder("utf-8").decode(buf.slice(0, 64)).trim();
+  if (looksLikeJsonText(head)) throw new Error(`Refusing JSON-looking content: ${head}`);
+  await downloadArrayBufferAsCsv(buf, filename);
 }
 
 function App() {
