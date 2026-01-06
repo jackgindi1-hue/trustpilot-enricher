@@ -25,6 +25,8 @@ from tp_enrich import durable_jobs
 from tp_enrich.progress import set_job_status, set_job_progress, make_job_logger
 # PHASE 5: Trustpilot Apify scraper router
 from tp_enrich.routes_phase5 import phase5_router
+# PHASE 6: Classification override & training router
+from tp_enrich.routes_phase6 import phase6_router
 
 # Load environment variables
 load_dotenv()
@@ -64,6 +66,8 @@ app.add_middleware(
 
 # PHASE 5: Include Trustpilot Apify scraper router
 app.include_router(phase5_router)
+# PHASE 6: Include classification override & training router
+app.include_router(phase6_router)
 
 
 @app.get("/health")

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import config from './config'
 import './App.css'
 import { TrustpilotPhase5Panel } from './components/TrustpilotPhase5Panel'
+import Phase6TrainerPanel from './components/Phase6TrainerPanel'
 
 // PHASE 4.7.1 DEPLOY - UI Stuck "Running" Fix (Missing Job Reset)
 // BUILD TIMESTAMP: 2025-12-31 - Papaya.ui Matrix Theme
@@ -447,6 +448,9 @@ function App() {
       <main className="app-main">
         {/* PHASE 5: Trustpilot URL Scraper */}
         <TrustpilotPhase5Panel />
+
+        {/* PHASE 6: Classification Override Trainer */}
+        <Phase6TrainerPanel API_BASE={API_BASE} />
 
         <div className="card">
           <form onSubmit={handleRunEnrichment}>
