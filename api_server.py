@@ -19,6 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 from tp_enrich.pipeline import run_pipeline
+# PHASE 6 HOTFIX: Route ALL enrichment through shared entrypoint for Phase 6 prefill
+from tp_enrich.phase4_entrypoint import run_phase4_exact
 from tp_enrich.logging_utils import setup_logger
 # PHASE 4.5.2: Durable job storage imports
 from tp_enrich import durable_jobs
@@ -141,62 +143,48 @@ async def enrich_csv(
     # ============================================================
     logger.info(f"Running sync enrichment (rows={rows} <= {MAX_SYNC_ROWS})")
 
-    # Create temp directory for processing
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_dir_path = Path(temp_dir)
+    try:
+        # Parse CSV bytes into rows
+        import pandas as pd
+        df = pd.read_csv(io.BytesIO(csv_bytes), encoding='utf-8')
+        input_rows = df.to_dict(orient='records')
 
-        # Save uploaded file
-        input_path = temp_dir_path / "input.csv"
-        output_path = temp_dir_path / "enriched.csv"
-        cache_path = temp_dir_path / "cache.json"
+        logger.info(f"Parsed {len(input_rows)} rows from CSV")
 
-        try:
-            # Write uploaded file to disk
-            with open(input_path, 'wb') as f:
-                f.write(csv_bytes)
+        # Prepare config
+        config = {}
+        if lender_name_override:
+            config['lender_name_override'] = lender_name_override
+            logger.info(f"Using lender name override: {lender_name_override}")
 
-            logger.info(f"Saved input file: {input_path}")
+        # PHASE 6 HOTFIX: Route through shared entrypoint for Phase 6 prefill
+        logger.info("Starting enrichment via run_phase4_exact...")
+        print("CSV_FLOW_CALLS_RUN_PHASE4_EXACT", {"rows_in": len(input_rows), "mode": "sync"})
+        enriched_rows = run_phase4_exact(input_rows, config=config)
+        print("CSV_FLOW_RUN_PHASE4_EXACT_DONE", {"rows_out": len(enriched_rows)})
 
-            # Prepare config
-            config = {}
-            if lender_name_override:
-                config['lender_name_override'] = lender_name_override
-                logger.info(f"Using lender name override: {lender_name_override}")
+        logger.info(f"Enrichment complete: {len(enriched_rows)} rows")
 
-            # Run enrichment pipeline
-            logger.info("Starting enrichment pipeline...")
-            stats = run_pipeline(
-                str(input_path),
-                str(output_path),
-                str(cache_path),
-                config=config
-            )
+        if not enriched_rows:
+            raise HTTPException(status_code=500, detail="Enrichment failed to produce output")
 
-            logger.info(f"Enrichment complete: {stats}")
+        # Write enriched rows to temp file
+        persistent_temp = Path(tempfile.gettempdir()) / f"enriched_{os.getpid()}.csv"
+        df_out = pd.DataFrame(enriched_rows)
+        df_out.to_csv(str(persistent_temp), index=False, encoding='utf-8')
 
-            # Check if output file was created
-            if not output_path.exists():
-                raise HTTPException(status_code=500, detail="Enrichment failed to produce output file")
+        logger.info(f"Returning enriched CSV: {persistent_temp} ({persistent_temp.stat().st_size} bytes)")
 
-            logger.info(f"Enrichment complete, output file size: {output_path.stat().st_size} bytes")
+        # Return enriched CSV as FileResponse
+        return FileResponse(
+            path=str(persistent_temp),
+            media_type='text/csv',
+            filename='enriched.csv'
+        )
 
-            # Copy to a persistent temp location (FileResponse requires file to exist during send)
-            persistent_temp = Path(tempfile.gettempdir()) / f"enriched_{os.getpid()}.csv"
-            import shutil
-            shutil.copy2(output_path, persistent_temp)
-
-            logger.info(f"Returning enriched CSV: {persistent_temp}")
-
-            # Return enriched CSV as FileResponse
-            return FileResponse(
-                path=str(persistent_temp),
-                media_type='text/csv',
-                filename='enriched.csv'
-            )
-
-        except Exception as e:
-            logger.error(f"Enrichment error: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Enrichment failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Enrichment error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Enrichment failed: {str(e)}")
 
 
 # ============================================================
@@ -205,6 +193,8 @@ async def enrich_csv(
 
 def _run_job_thread(job_id: str, csv_bytes: bytes, config: dict):
     """Background thread for async job processing"""
+    import pandas as pd
+
     paths = durable_jobs.get_csv_paths(job_id)
     out_path = paths["out_csv"]
     log = make_job_logger(job_id)
@@ -213,15 +203,10 @@ def _run_job_thread(job_id: str, csv_bytes: bytes, config: dict):
         set_job_status(job_id, "running", {"stage": "start"})
         log(f"JOB {job_id} START")
 
-        # Write input CSV to temp file
-        in_path = out_path.replace(".enriched.csv", ".input.csv")
-        with open(in_path, "wb") as f:
-            f.write(csv_bytes)
-
-        # Count rows to track progress
-        import csv as csv_module
-        with open(in_path, 'r', encoding='utf-8') as f:
-            total_rows = max(0, len(list(csv_module.reader(f))) - 1)  # minus header
+        # Parse CSV bytes into rows
+        df = pd.read_csv(io.BytesIO(csv_bytes), encoding='utf-8')
+        input_rows = df.to_dict(orient='records')
+        total_rows = len(input_rows)
 
         log(f"Processing {total_rows} rows...")
 
@@ -234,23 +219,23 @@ def _run_job_thread(job_id: str, csv_bytes: bytes, config: dict):
             if current % 5 == 0 or current == total:  # Log every 5 rows
                 log(f"Progress: {current}/{total} rows ({int(current/total*100) if total > 0 else 0}%)")
 
-        # Run pipeline with progress tracking
-        cache_path = out_path.replace(".enriched.csv", ".cache.json")
+        # PHASE 6 HOTFIX: Route through shared entrypoint for Phase 6 prefill
         config_with_progress = dict(config or {})
         config_with_progress['progress_callback'] = progress_callback
         config_with_progress['job_id'] = job_id
 
-        stats = run_pipeline(
-            input_csv_path=in_path,
-            output_csv_path=out_path,
-            cache_file=cache_path,
-            config=config_with_progress
-        )
+        print("CSV_FLOW_CALLS_RUN_PHASE4_EXACT", {"job_id": job_id, "rows_in": len(input_rows), "mode": "async"})
+        enriched_rows = run_phase4_exact(input_rows, config=config_with_progress)
+        print("CSV_FLOW_RUN_PHASE4_EXACT_DONE", {"job_id": job_id, "rows_out": len(enriched_rows)})
+
+        # Write enriched rows to output file (download endpoint expects this path)
+        df_out = pd.DataFrame(enriched_rows)
+        df_out.to_csv(out_path, index=False, encoding='utf-8')
 
         # Progress: complete
         set_job_progress(job_id, total_rows, total_rows, stage="done")
-        set_job_status(job_id, "done", {"output": out_path, "stats": stats, "out_csv_path": out_path})
-        log(f"JOB {job_id} DONE | output={out_path} | stats={stats}")
+        set_job_status(job_id, "done", {"output": out_path, "stats": {"rows": len(enriched_rows)}, "out_csv_path": out_path})
+        log(f"JOB {job_id} DONE | output={out_path} | rows={len(enriched_rows)}")
 
     except Exception as e:
         set_job_status(job_id, "error", {"error": repr(e)})

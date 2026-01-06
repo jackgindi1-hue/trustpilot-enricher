@@ -196,11 +196,15 @@ def _postcheck_pipeline_overwrite(out_rows: List[Dict[str, Any]]) -> None:
     })
 
 
-def run_phase4_exact(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def run_phase4_exact(rows: List[Dict[str, Any]], config: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     """
     SINGLE SHARED ENTRYPOINT:
     - CSV upload flow AND URL->Apify flow call THIS.
     - Calls EXACT pipeline: tp_enrich.pipeline.run_pipeline(input_csv, output_csv, cache_json, config={})
+
+    Args:
+        rows: List of row dicts to enrich
+        config: Optional config dict to pass to run_pipeline (e.g., lender_name_override, progress_callback)
 
     Returns:
         List of enriched rows from the pipeline output CSV
@@ -225,12 +229,14 @@ def run_phase4_exact(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         # ======================================================================
         # CALL THE EXACT SAME FUNCTION AS CSV UPLOAD (api_server.py line 164)
+        # Pass through config if provided
         # ======================================================================
+        pipeline_config = dict(config or {})
         stats = run_pipeline(
             str(input_csv),
             str(output_csv),
             str(cache_json),
-            config={}
+            config=pipeline_config
         )
 
         print("PHASE4_ENTRYPOINT_STATS", stats if isinstance(stats, dict) else {"stats": str(stats)[:500]})
